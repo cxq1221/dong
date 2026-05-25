@@ -1,10 +1,9 @@
-"""Tests for the edit tool in dong/tools.py."""
-import pytest
-from dong.tools import execute, _validate_path, ToolResult, EditInput
+"""edit 工具测试：覆盖唯一替换、歧义匹配和安全错误。"""
+from dong.tools import execute
 
 
 def _execute_edit(cwd, filepath, old_string, new_string):
-    """Helper to call execute('edit', ...) and return ToolResult."""
+    """调用 execute('edit', ...) 并返回 ToolResult 的测试辅助函数。"""
     return execute(
         "edit",
         {"filepath": filepath, "old_string": old_string, "new_string": new_string},
@@ -13,10 +12,10 @@ def _execute_edit(cwd, filepath, old_string, new_string):
 
 
 class TestEditSuccess:
-    """Happy-path tests for the edit tool."""
+    """edit 工具的成功路径测试。"""
 
     def test_replace_single_occurrence(self, tmp_path):
-        """Replacing a single unique occurrence in a file works."""
+        """文件中唯一出现的字符串应能被替换。"""
         f = tmp_path / "hello.txt"
         f.write_text("Hello, world!")
         result = _execute_edit(str(tmp_path), "hello.txt", "world", "there")
@@ -24,7 +23,7 @@ class TestEditSuccess:
         assert f.read_text(encoding="utf-8") == "Hello, there!"
 
     def test_replace_at_beginning(self, tmp_path):
-        """Replacing text at the start of the file."""
+        """文件开头的文本应能被替换。"""
         f = tmp_path / "begin.txt"
         f.write_text("start middle end")
         result = _execute_edit(str(tmp_path), "begin.txt", "start", "BEGIN")
@@ -32,7 +31,7 @@ class TestEditSuccess:
         assert f.read_text(encoding="utf-8") == "BEGIN middle end"
 
     def test_replace_at_end(self, tmp_path):
-        """Replacing text at the end of the file."""
+        """文件末尾的文本应能被替换。"""
         f = tmp_path / "end.txt"
         f.write_text("start middle end")
         result = _execute_edit(str(tmp_path), "end.txt", "end", "END")
@@ -40,7 +39,7 @@ class TestEditSuccess:
         assert f.read_text(encoding="utf-8") == "start middle END"
 
     def test_replace_with_empty_new_string(self, tmp_path):
-        """Replacing with an empty string removes the old text."""
+        """用空字符串替换时应删除旧文本。"""
         f = tmp_path / "remove.txt"
         f.write_text("remove this word")
         result = _execute_edit(str(tmp_path), "remove.txt", " this", "")
@@ -48,18 +47,17 @@ class TestEditSuccess:
         assert f.read_text(encoding="utf-8") == "remove word"
 
     def test_replace_empty_old_string_with_new(self, tmp_path):
-        """Replacing an empty old_string with text — edge case."""
+        """空 old_string 是边界情况，应被判定为歧义匹配。"""
         f = tmp_path / "insert.txt"
         f.write_text("hello")
         result = _execute_edit(str(tmp_path), "insert.txt", "", "prefix")
-        # Empty string will always be 'found' — but if the content has no empty string...
-        # Actually, '' is in every string, so content.count('') returns len(content)+1
-        # This should hit the ambiguous case. Let's verify it's ambiguous.
+        # 空字符串存在于任意字符串的多个位置，content.count('') 会返回 len(content)+1。
+        # 因此它必须走 Ambiguous 分支，避免插入到不确定位置。
         assert result.success is False
         assert "Ambiguous" in result.error
 
     def test_replace_unicode_content(self, tmp_path):
-        """Unicode characters in replacement work correctly."""
+        """包含 Unicode 字符的替换应正常工作。"""
         f = tmp_path / "unicode.txt"
         f.write_text("héllo wörld")
         result = _execute_edit(str(tmp_path), "unicode.txt", "wörld", "värld")
@@ -67,7 +65,7 @@ class TestEditSuccess:
         assert f.read_text(encoding="utf-8") == "héllo värld"
 
     def test_replace_with_same_string(self, tmp_path):
-        """Replacing a string with itself is a no-op."""
+        """把字符串替换成自身时应保持内容不变。"""
         f = tmp_path / "same.txt"
         f.write_text("unchanged content")
         result = _execute_edit(str(tmp_path), "same.txt", "unchanged", "unchanged")
@@ -76,10 +74,10 @@ class TestEditSuccess:
 
 
 class TestEditErrors:
-    """Error-case tests for the edit tool."""
+    """edit 工具的错误路径测试。"""
 
     def test_old_string_not_found(self, tmp_path):
-        """When old_string is not in the file, returns failure."""
+        """old_string 不存在时应返回失败。"""
         f = tmp_path / "notfound.txt"
         f.write_text("some content here")
         result = _execute_edit(str(tmp_path), "notfound.txt", "nonexistent", "replacement")
@@ -87,29 +85,29 @@ class TestEditErrors:
         assert "not found" in result.error
 
     def test_old_string_ambiguous(self, tmp_path):
-        """When old_string appears multiple times, returns failure."""
+        """old_string 出现多次时应返回歧义错误。"""
         f = tmp_path / "ambiguous.txt"
         f.write_text("repeat repeat repeat")
         result = _execute_edit(str(tmp_path), "ambiguous.txt", "repeat", "once")
         assert result.success is False
         assert "Ambiguous" in result.error
-        # File should be unchanged
+        # 歧义替换失败后，文件内容必须保持不变。
         assert f.read_text(encoding="utf-8") == "repeat repeat repeat"
 
     def test_path_traversal_denied(self, tmp_path):
-        """Path with ../ escapes is rejected before any edits."""
+        """带 ../ 的逃逸路径应在编辑前被拒绝。"""
         result = _execute_edit(str(tmp_path), "../outside.txt", "old", "new")
         assert result.success is False
         assert "Permission denied" in result.error or "Path traversal" in result.error
 
     def test_file_not_found(self, tmp_path):
-        """Edit on a non-existent file returns failure."""
+        """编辑不存在的文件应返回失败。"""
         result = _execute_edit(str(tmp_path), "nonexistent.txt", "old", "new")
         assert result.success is False
         assert "not found" in result.error or "No such file" in result.error
 
     def test_invalid_input_type(self, tmp_path):
-        """Passing invalid types for filepath returns invalid input error."""
+        """filepath 类型非法时应返回输入校验错误。"""
         result = execute(
             "edit",
             {"filepath": 123, "old_string": "old", "new_string": "new"},

@@ -1,4 +1,4 @@
-"""Tests for skill discovery and loading in dong/cli.py."""
+"""CLI skill 发现和加载测试：覆盖本地/全局来源、解析和错误提示。"""
 import pytest
 
 from dong.cli import (
@@ -14,11 +14,13 @@ from dong.cli import (
 
 
 def _write(path, content):
+    """写入测试文件，并自动创建父目录。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
 
 def test_list_skills_merges_local_and_codex_sources(tmp_path, monkeypatch):
+    """同名 skill 应合并来源，列表按名称稳定排序。"""
     codex_home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     _write(tmp_path / ".dong" / "skills" / "python-test.md", "# python-test")
@@ -36,6 +38,7 @@ def test_list_skills_merges_local_and_codex_sources(tmp_path, monkeypatch):
 
 
 def test_load_skill_prefers_local_over_codex(tmp_path, monkeypatch):
+    """本地 skill 和全局 skill 同名时应优先加载本地版本。"""
     codex_home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     _write(tmp_path / ".dong" / "skills" / "code-review.md", "# local review")
@@ -49,6 +52,7 @@ def test_load_skill_prefers_local_over_codex(tmp_path, monkeypatch):
 
 
 def test_load_skill_falls_back_to_codex_skill_md_raw(tmp_path, monkeypatch):
+    """没有本地版本时，应原样读取全局 SKILL.md 内容。"""
     codex_home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     skill_content = """---
@@ -68,6 +72,7 @@ description: Test skill
 
 
 def test_codex_skill_symlink_targets_are_allowed(tmp_path, monkeypatch):
+    """全局 skill 目录允许符号链接目标，兼容外部同步的 skillshare。"""
     codex_home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     target = tmp_path / "skillshare" / "linked-skill"
@@ -83,6 +88,7 @@ def test_codex_skill_symlink_targets_are_allowed(tmp_path, monkeypatch):
 
 
 def test_build_messages_injects_selected_skill_source(tmp_path, monkeypatch):
+    """构建系统消息时应注入已选 skill 的来源和内容。"""
     codex_home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     _write(codex_home / "skills" / "global-only" / "SKILL.md", "# Global Only")
@@ -96,6 +102,7 @@ def test_build_messages_injects_selected_skill_source(tmp_path, monkeypatch):
 
 
 def test_describe_loaded_skills_reports_current_source(tmp_path, monkeypatch):
+    """已加载 skill 状态应展示当前来源，缺失项标记为 missing。"""
     codex_home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     _write(tmp_path / ".dong" / "skills" / "local-only.md", "# local")
@@ -112,6 +119,7 @@ def test_describe_loaded_skills_reports_current_source(tmp_path, monkeypatch):
 
 
 def test_parse_skill_invocation_loads_slash_skill_prompt(tmp_path, monkeypatch):
+    """`/skill prompt` 快捷语法应解析出 skill 名和后续 prompt。"""
     codex_home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     _write(codex_home / "skills" / "agent-browser" / "SKILL.md", "# Browser")
@@ -125,6 +133,7 @@ def test_parse_skill_invocation_loads_slash_skill_prompt(tmp_path, monkeypatch):
 
 
 def test_parse_skill_invocation_supports_load_only(tmp_path, monkeypatch):
+    """只输入 `/skill` 时应解析为加载 skill，但 prompt 为空。"""
     codex_home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     _write(codex_home / "skills" / "agent-browser" / "SKILL.md", "# Browser")
@@ -137,6 +146,7 @@ def test_parse_skill_invocation_supports_load_only(tmp_path, monkeypatch):
 
 
 def test_parse_skill_invocation_ignores_non_slash_input(tmp_path, monkeypatch):
+    """非 slash 普通输入不应被解析为 skill 调用。"""
     codex_home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
@@ -144,6 +154,7 @@ def test_parse_skill_invocation_ignores_non_slash_input(tmp_path, monkeypatch):
 
 
 def test_print_skill_status_lists_available_and_loaded(tmp_path, monkeypatch, capsys):
+    """状态输出应同时包含可用 skill 和已加载 skill。"""
     codex_home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     _write(tmp_path / ".dong" / "skills" / "python-test.md", "# local")
@@ -159,6 +170,7 @@ def test_print_skill_status_lists_available_and_loaded(tmp_path, monkeypatch, ca
 
 
 def test_missing_skill_error_lists_local_and_codex_sources(tmp_path, monkeypatch):
+    """skill 缺失错误应给出当前可用的本地和全局候选。"""
     codex_home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     _write(tmp_path / ".dong" / "skills" / "python-test.md", "# python-test")
@@ -174,6 +186,7 @@ def test_missing_skill_error_lists_local_and_codex_sources(tmp_path, monkeypatch
 
 
 def test_invalid_skill_name_is_rejected(tmp_path, monkeypatch):
+    """非法 skill 名应被拒绝，防止路径穿越。"""
     codex_home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
 

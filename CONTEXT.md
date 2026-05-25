@@ -28,6 +28,10 @@ _Avoid_: live token HUD, fullscreen layout, interactive folding, streaming Markd
 Tests that prove existing CLI commands, tool execution semantics, and entry modes still work while asserting only stable UI text or return behavior instead of exact ANSI snapshots.
 _Avoid_: brittle ANSI snapshot
 
+**Operational File Logging**:
+The runtime diagnostic stream written by dong into `logs/dong.log`, with `dong logs` support for level, event, logger, and text filtering over stable event names and JSON field payloads.
+_Avoid_: ad hoc print debugging, prompt dumps
+
 **First-Phase UI Dependencies**:
 The first UI phase may add Rich and prompt_toolkit while keeping argparse and deferring Typer or fullscreen frameworks.
 _Avoid_: Typer migration, Textual dependency
@@ -38,6 +42,7 @@ _Avoid_: Typer migration, Textual dependency
 - The **Inline REPL** can improve input and rendering without changing tool execution semantics.
 - A **Terminal UI Module** adapts Rich and prompt_toolkit behind a small interface.
 - The agent loop calls the **Terminal UI Module** but still owns turn ordering and tool execution.
+- **Operational File Logging** records the agent loop, LLM adapter, skill loading, and tool execution paths without changing user-visible terminal output, then exposes filtered local inspection through `dong logs`.
 - **First-Phase Prompt Input** belongs inside the **Terminal UI Module**.
 - **First-Phase Rich Rendering** belongs inside the **Terminal UI Module**.
 - **Behavior Compatibility Tests** verify a **Behavior-Compatible UI Phase**.

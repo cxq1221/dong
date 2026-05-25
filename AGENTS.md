@@ -6,6 +6,7 @@
 3. ⚠️改代码时只动必须改的地方，严禁顺手重构未损坏的代码。
 4. ⚠️将任务描述为可验证的目标（如“写端到端测试并执行”，而非“添加验证”）
 5. ⚠️任务完成后，需要使用skill：redundancy-gates 检查代码
+6. ⚠️所有代码都要增加中文注释，主要介绍流程和定义，每个类/文件开头要说明定义
 ## 注意事项
 - Code style: Python 3.11+, f-strings over %, type hints everywhere
 - Tools use `@registry.register()` decorator pattern

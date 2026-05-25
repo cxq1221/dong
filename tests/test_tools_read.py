@@ -1,14 +1,13 @@
-"""Tests for the read tool in dong/tools.py."""
-import os
+"""read 工具测试：覆盖路径校验、成功读取和错误返回。"""
 import pytest
-from dong.tools import execute, _validate_path, ToolResult, ReadInput
+from dong.tools import execute, _validate_path
 
 
 class TestValidatePath:
-    """Tests for the internal _validate_path helper."""
+    """内部 _validate_path 辅助函数的路径安全测试。"""
 
     def test_valid_path(self, tmp_path):
-        """A normal filepath within cwd resolves correctly."""
+        """cwd 内的普通相对路径应能正确解析。"""
         child = tmp_path / "sub" / "file.txt"
         child.parent.mkdir(parents=True)
         child.write_text("hello")
@@ -16,24 +15,23 @@ class TestValidatePath:
         assert resolved == str(child.resolve())
 
     def test_path_traversal_denied(self, tmp_path):
-        """Raises PermissionError when path escapes cwd."""
+        """路径逃逸 cwd 时应抛出 PermissionError。"""
         with pytest.raises(PermissionError, match="Path traversal denied"):
             _validate_path(str(tmp_path), "../etc/passwd")
 
     def test_absolute_outside_cwd_denied(self, tmp_path):
-        """An absolute path outside cwd is rejected."""
+        """cwd 外部的绝对路径应被拒绝。"""
         with pytest.raises(PermissionError, match="Path traversal denied"):
             _validate_path(str(tmp_path), "/etc/passwd")
 
     def test_symlink_traversal_denied(self, tmp_path):
-        """Symlink pointing outside cwd is rejected."""
+        """指向 cwd 外部的符号链接应被拒绝。"""
         target = tmp_path / "outside_target.txt"
         target.write_text("secret")
         link = tmp_path / "link.txt"
         link.symlink_to(target, target_is_directory=False)
-        # The link resolves to a path outside tmp_path/scope — actually
-        # in this case it's still inside tmp_path, so it should be fine.
-        # Let's test a symlink that points to a *sibling* outside.
+        # 这个 link 实际仍解析到 tmp_path 内部，所以应当允许。
+        # 真正要验证的是指向兄弟目录的坏链接。
         outside = tmp_path.parent / "outside.txt"
         outside.write_text("out")
         link2 = tmp_path / "bad_link.txt"
@@ -43,15 +41,15 @@ class TestValidatePath:
 
 
 def _execute_read(cwd, filepath):
-    """Helper to call execute('read', ...) and return ToolResult."""
+    """调用 execute('read', ...) 并返回 ToolResult 的测试辅助函数。"""
     return execute("read", {"filepath": filepath}, cwd)
 
 
 class TestReadSuccess:
-    """Happy-path tests for the read tool."""
+    """read 工具的成功路径测试。"""
 
     def test_read_existing_file(self, tmp_path):
-        """Reads a file and returns line-numbered content."""
+        """读取已有文件，并返回带行号的内容。"""
         f = tmp_path / "hello.txt"
         f.write_text("line one\nline two\nline three\n")
         result = _execute_read(str(tmp_path), "hello.txt")
@@ -63,7 +61,7 @@ class TestReadSuccess:
         assert " 3|line three" in result.detail
 
     def test_read_single_line_file(self, tmp_path):
-        """Reads a one-line file (no trailing newline)."""
+        """读取无结尾换行的单行文件。"""
         f = tmp_path / "single.txt"
         f.write_text("just one line")
         result = _execute_read(str(tmp_path), "single.txt")
@@ -72,7 +70,7 @@ class TestReadSuccess:
         assert " 1|just one line" in result.detail
 
     def test_read_empty_file(self, tmp_path):
-        """Reading an empty file returns success with 0 lines."""
+        """读取空文件时应成功，并显示 0 行。"""
         f = tmp_path / "empty.txt"
         f.write_text("")
         result = _execute_read(str(tmp_path), "empty.txt")
@@ -81,7 +79,7 @@ class TestReadSuccess:
         assert result.detail == ""
 
     def test_read_file_with_unicode(self, tmp_path):
-        """Unicode (non-ASCII) characters are preserved."""
+        """读取时应保留 Unicode 字符。"""
         content = "héllo wörld\n😊 emoji\n"
         f = tmp_path / "unicode.txt"
         f.write_text(content, encoding="utf-8")
@@ -92,47 +90,47 @@ class TestReadSuccess:
 
 
 class TestReadErrors:
-    """Error-case tests for the read tool."""
+    """read 工具的错误路径测试。"""
 
     def test_file_not_found(self, tmp_path):
-        """Non-existent file returns failure with FileNotFound message."""
+        """不存在的文件应返回失败和未找到错误。"""
         result = _execute_read(str(tmp_path), "nonexistent.txt")
         assert result.success is False
         assert "File not found" in result.error or "not found" in result.error
 
     def test_path_traversal(self, tmp_path):
-        """Attempting ../ returns PermissionError."""
+        """尝试使用 ../ 逃逸目录时应返回权限错误。"""
         result = _execute_read(str(tmp_path), "../etc/passwd")
         assert result.success is False
         assert "Permission denied" in result.error or "Path traversal" in result.error
 
     def test_absolute_path_outside_cwd(self, tmp_path):
-        """Absolute path outside cwd is rejected."""
+        """cwd 外部的绝对路径应被拒绝。"""
         result = _execute_read(str(tmp_path), "/etc/passwd")
         assert result.success is False
         assert "Permission denied" in result.error or "Path traversal" in result.error
 
     def test_invalid_input_type(self, tmp_path):
-        """Passing non-string filepath returns invalid input error."""
+        """非字符串 filepath 应返回输入校验错误。"""
         result = execute("read", {"filepath": 123}, str(tmp_path))
         assert result.success is False
         assert "Invalid input" in result.error
 
     def test_read_directory(self, tmp_path):
-        """Reading a directory returns an error (not a file)."""
+        """读取目录时应返回错误，因为目标不是普通文件。"""
         d = tmp_path / "adir"
         d.mkdir()
         result = _execute_read(str(tmp_path), "adir")
         assert result.success is False
-        # It could be PermissionError or FileNotFoundError depending on OS
+        # 不同系统可能返回 PermissionError 或 FileNotFoundError，这里只要求有错误。
         assert result.error != ""
 
 
 class TestReadSubdirectory:
-    """Tests for reading files in nested directories."""
+    """读取嵌套目录中文件的测试。"""
 
     def test_read_file_in_subdirectory(self, tmp_path):
-        """Read a file in a subdirectory."""
+        """应能读取子目录中的文件。"""
         nested = tmp_path / "sub" / "dir"
         nested.mkdir(parents=True)
         f = nested / "nested.txt"

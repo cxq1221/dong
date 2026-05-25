@@ -1,1 +1,1 @@
-"""dong — minimal CLI coding agent."""
+"""dong 包入口：提供一个最小化的 CLI 编码代理。"""
