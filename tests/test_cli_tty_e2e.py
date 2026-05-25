@@ -63,6 +63,7 @@ def _read_available(fd: int, *, duration: float = 0.5) -> str:
 def test_interactive_tty_repl_shows_slash_skill_menu_and_runs_commands(tmp_path) -> None:
     """真实 TTY 下输入 / 应显示 skill 候选，并可继续执行 REPL 命令。"""
     _write(tmp_path / ".dong" / "skills" / "review.md", "# Review")
+    _write(tmp_path / ".dong" / "skills" / "python-test.md", "# Python test")
 
     master_fd, slave_fd = pty.openpty()
     os.set_blocking(master_fd, False)
@@ -88,9 +89,15 @@ def test_interactive_tty_repl_shows_slash_skill_menu_and_runs_commands(tmp_path)
         assert "dong" in output
 
         os.write(master_fd, b"/")
-        menu_output = _read_until(master_fd, "/review")
+        menu_output = _read_until(master_fd, "/python-test")
         assert "/skill" in menu_output
+        assert "/python-test" in menu_output
         assert "/review" in menu_output
+
+        _read_available(master_fd, duration=0.2)
+        os.write(master_fd, b"re")
+        filtered_output = _read_until(master_fd, "/review")
+        assert "/review" in filtered_output
 
         # Clear the partially typed slash command, then exercise real REPL commands.
         os.write(master_fd, b"\x15/skill review\r")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import textwrap
 from collections.abc import Callable, Iterable
 from typing import TextIO
 
@@ -11,6 +12,7 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -172,6 +174,16 @@ class TerminalUI:
             if event.current_buffer.document.text_before_cursor == "/":
                 event.current_buffer.start_completion(select_first=False)
 
+        @key_bindings.add(Keys.Any)
+        def _(event) -> None:  # type: ignore[no-untyped-def]
+            data = event.data
+            if not data or not data.isprintable():
+                return
+
+            event.current_buffer.insert_text(data)
+            if event.current_buffer.document.text_before_cursor.startswith("/"):
+                event.current_buffer.start_completion(select_first=False)
+
         return self._session.prompt(
             "\ndong ",
             completer=completer,
@@ -272,7 +284,23 @@ class TerminalUI:
 
     def show_assistant_message(self, text: str) -> None:
         """把模型最终文本按 Markdown 渲染到 stdout。"""
-        self.console.print(Markdown(text))
+        normalized = _normalize_model_text(text)
+        if normalized:
+            self.console.print(Markdown(normalized))
+
+    def show_reasoning_message(self, text: str) -> None:
+        """把模型返回的 reasoning_content 作为低调的 thinking 区块展示。"""
+        normalized = _normalize_model_text(text)
+        if not normalized:
+            return
+
+        self.err_console.print(
+            Panel(
+                Markdown(normalized),
+                title="thinking",
+                border_style="bright_black",
+            )
+        )
 
     def show_warning(self, message: str) -> None:
         """渲染黄色警告面板。"""
@@ -290,3 +318,8 @@ class TerminalUI:
     def _display_args(args_raw: str, limit: int = 60) -> str:
         """截断过长工具参数，避免状态行过宽。"""
         return args_raw[:limit] + ("..." if len(args_raw) > limit else "")
+
+
+def _normalize_model_text(text: str) -> str:
+    """归一化模型文本，避免整体缩进被 Markdown 误判为代码块。"""
+    return textwrap.dedent(text).strip()

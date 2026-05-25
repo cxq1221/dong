@@ -21,6 +21,26 @@ if _env_path.exists():
 
 _client = None
 
+
+def _deepseek_request_options() -> dict:
+    """读取 DeepSeek V4 可选高级参数，未配置时保持基础请求形状。"""
+    options = {}
+
+    thinking = os.getenv("DONG_THINKING", "").strip().lower()
+    if thinking in {"enabled", "disabled"}:
+        options["extra_body"] = {"thinking": {"type": thinking}}
+
+    reasoning_effort = os.getenv("DONG_REASONING_EFFORT", "").strip().lower()
+    if reasoning_effort in {"high", "max"}:
+        options["reasoning_effort"] = reasoning_effort
+
+    response_format = os.getenv("DONG_RESPONSE_FORMAT", "").strip().lower()
+    if response_format == "json_object":
+        options["response_format"] = {"type": "json_object"}
+
+    return options
+
+
 def _get_client():
     """懒加载 OpenAI 客户端，避免导入模块时就读取环境或发起初始化。"""
     global _client
@@ -52,11 +72,13 @@ def chat(messages, tools, model=None):
         tools=len(tools),
     )
     try:
+        request_options = _deepseek_request_options()
         message = _get_client().chat.completions.create(
             model=selected_model,
             messages=messages,
             tools=tools,
             temperature=0,
+            **request_options,
         ).choices[0].message
     except Exception as e:
         duration_ms = int((time.monotonic() - started) * 1000)

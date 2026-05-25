@@ -9,6 +9,11 @@
 export DONG_API_KEY=sk-xxx
 # 可选：切换模型
 export DONG_MODEL=gpt-4o
+# 可选：DeepSeek V4 thinking/tool 高级参数
+export DONG_THINKING=enabled          # enabled / disabled
+export DONG_REASONING_EFFORT=high     # high / max
+export DONG_TOOL_STRICT=0             # 1 时给 function tools 加 strict=true
+export DONG_RESPONSE_FORMAT=text      # text / json_object
 
 # 单次模式
 dong "add a fibonacci function to fib.py"
@@ -58,6 +63,17 @@ dong 默认把运行诊断日志写入当前工作目录的 `logs/dong.log`。�
 
 事件命名使用小写蛇形，例如 `cli_started`、`llm_request_finished`、`tool_executed`、`file_read`。默认日志不改变终端输出，也不记录完整 prompt、工具参数或工具结果正文。
 
+## DeepSeek V4 参数
+
+dong 通过 OpenAI ChatCompletions 兼容接口调用模型，并支持以下可选环境变量：
+
+- `DONG_THINKING=enabled|disabled` — 传入 `extra_body={"thinking": {"type": ...}}`
+- `DONG_REASONING_EFFORT=high|max` — 控制 thinking effort
+- `DONG_TOOL_STRICT=1` — 为 function tool schema 加 `strict: true`
+- `DONG_RESPONSE_FORMAT=json_object` — 启用 JSON Output；使用时 prompt 里也要明确要求 JSON
+
+模型返回 `reasoning_content` 时，CLI 会以 `thinking` 区块展示；工具调用轮次也会继续保留该字段，确保 DeepSeek V4 thinking + tool-use 的后续请求仍能接上模型推理上下文。
+
 查看和过滤日志：
 
 ```bash
@@ -90,13 +106,19 @@ dong 支持两类 skill：
 ```
 dong/
 ├── dong/
-│   ├── __init__.py
-│   ├── __main__.py     # python -m dong
-│   ├── cli.py          # CLI + agent 主循环 (~120行)
-│   ├── llm.py          # LLM API 封装 (~30行)
-│   └── tools.py        # 工具定义+执行 (~120行)
+│   ├── __init__.py         # 空 Module
+│   ├── __main__.py         # python -m dong 入口
+│   ├── cli.py              # CLI 主入口 + Agent 循环 + Skill 管理 (~450L)
+│   ├── llm.py              # OpenAI ChatCompletions 封装 (~130L)
+│   ├── tools.py            # 内置工具实现 (read/write/edit/bash/grep/fetch) (~450L)
+│   ├── tool.py             # 工具框架：注册/校验/执行/结构化结果 (~150L)
+│   ├── ui.py               # 终端 UI 适配层 (Rich + prompt_toolkit) (~325L)
+│   ├── logging_config.py   # 文件日志配置 + 结构化事件 (~200L)
+│   └── log_viewer.py       # dong logs 子命令实现 (~185L)
+├── docs/
+│   └── adr/                # 架构决策记录
 ├── pyproject.toml
 └── .env.example
 ```
 
-核心 ~300 行代码，一个 main loop 搞定读→改→验。
+核心约 2000 行，按职责拆分为 9 个 Module。详细架构决策见 [ADR](docs/adr/)。

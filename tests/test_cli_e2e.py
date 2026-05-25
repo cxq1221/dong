@@ -12,9 +12,24 @@ import pytest
 from dong import cli
 
 
-def _assistant_message(content: str = "", tool_calls: list | None = None):
+def test_system_prompt_is_clear_and_json_mode_aware() -> None:
+    """系统提示词应避免拼写错误、重复规则，并说明 JSON Output 行为。"""
+    assert cli.SYSTEM_PROMPT.startswith("You are dong")
+    assert cli.SYSTEM_PROMPT.splitlines()[0] != "ou are dong, a coding agent assistant."
+    assert cli.SYSTEM_PROMPT.count("Tool results are structured as JSON") == 1
+    assert "When JSON Output is enabled" in cli.SYSTEM_PROMPT
+
+
+def _assistant_message(
+    content: str = "",
+    tool_calls: list | None = None,
+    reasoning_content: str | None = None,
+):
     """构造模拟的 assistant 消息，避免测试依赖真实 LLM。"""
-    return SimpleNamespace(content=content, tool_calls=tool_calls or [])
+    message = SimpleNamespace(content=content, tool_calls=tool_calls or [])
+    if reasoning_content is not None:
+        message.reasoning_content = reasoning_content
+    return message
 
 
 def _tool_call(call_id: str, name: str, arguments: str):
@@ -53,6 +68,70 @@ def test_single_prompt_mode_runs_through_tool_call_and_final_answer(
     assert "read(" in captured.err
     assert "note.txt" in captured.err
     assert "Read complete." in captured.out
+
+
+def test_run_loop_preserves_reasoning_content_after_tool_call(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """工具调用后的下一轮请求应保留 DeepSeek thinking 的 reasoning_content。"""
+    (tmp_path / "note.txt").write_text("hello\n", encoding="utf-8")
+    first_message = _assistant_message(tool_calls=[
+        _tool_call("call-1", "read", '{"filepath": "note.txt"}')
+    ])
+    first_message.reasoning_content = "I should inspect the file before answering."
+    responses = iter([
+        first_message,
+        _assistant_message(content="Read complete."),
+    ])
+    seen_messages: list[list] = []
+
+    def fake_chat(messages, _tools):
+        seen_messages.append(list(messages))
+        return next(responses)
+
+    monkeypatch.setattr(cli, "chat", fake_chat)
+
+    cli.run_loop(
+        [{"role": "system", "content": "system"}],
+        [{"role": "user", "content": "inspect note"}],
+        str(tmp_path),
+        max_turns=3,
+    )
+
+    second_request = seen_messages[1]
+    assert any(
+        getattr(message, "reasoning_content", None) == first_message.reasoning_content
+        for message in second_request
+    )
+
+
+def test_run_loop_displays_reasoning_content(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """模型返回 reasoning_content 时，CLI 应展示 thinking 区块。"""
+    responses = iter([
+        _assistant_message(
+            content="Final answer.",
+            reasoning_content="I should explain the tradeoff first.",
+        )
+    ])
+
+    monkeypatch.setattr(cli, "chat", lambda _messages, _tools: next(responses))
+
+    cli.run_loop(
+        [{"role": "system", "content": "system"}],
+        [{"role": "user", "content": "answer"}],
+        str(tmp_path),
+        max_turns=1,
+    )
+
+    captured = capsys.readouterr()
+    assert "thinking" in captured.err
+    assert "I should explain the tradeoff first." in captured.err
+    assert "Final answer." in captured.out
 
 
 def test_repl_mode_preserves_clear_skill_and_exit_commands(

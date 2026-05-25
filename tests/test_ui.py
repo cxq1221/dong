@@ -58,6 +58,30 @@ def test_assistant_message_renders_markdown_text() -> None:
     assert "item" in rendered
 
 
+def test_assistant_message_dedents_accidental_leading_spaces() -> None:
+    """模型整段文本带缩进时，不应被 Markdown 误渲染成代码块。"""
+    out = StringIO()
+    ui = TerminalUI(stdout=out)
+
+    ui.show_assistant_message("    **{name}** answer")
+
+    rendered = out.getvalue()
+    assert "{name} answer" in rendered
+    assert "**{name}**" not in rendered
+
+
+def test_reasoning_message_renders_thinking_panel() -> None:
+    """reasoning_content 应作为 thinking 区块输出到 stderr。"""
+    err = StringIO()
+    ui = TerminalUI(stderr=err)
+
+    ui.show_reasoning_message("I should inspect the file first.")
+
+    rendered = err.getvalue()
+    assert "thinking" in rendered
+    assert "I should inspect the file first." in rendered
+
+
 def test_confirm_dangerous_command_respects_default_no() -> None:
     """危险命令确认默认拒绝时，空输入应返回 False。"""
     err = StringIO()
@@ -111,3 +135,34 @@ def test_slash_completer_completes_skill_names_after_skill_command() -> None:
     assert "review" in completions
     assert "python-test" in completions
     assert "/skill review" not in completions
+
+
+def test_slash_completer_filters_skill_shortcuts_as_user_types() -> None:
+    """slash 菜单打开后继续输入文本，应按当前前缀过滤可见 skill 选项。"""
+    completer = _SlashAwareCompleter([
+        "/skill",
+        "/unskill",
+        "/review",
+        "/python-test",
+        "/run-tests",
+        "/skill review",
+    ])
+
+    completions = _completion_texts(completer, "/re")
+
+    assert completions == ["/review"]
+
+
+def test_slash_completer_filters_skill_names_after_skill_command() -> None:
+    """/skill 菜单打开后继续输入名称，也应只保留匹配 skill。"""
+    completer = _SlashAwareCompleter([
+        "/skill",
+        "/unskill",
+        "/skill review",
+        "/skill python-test",
+        "/skill run-tests",
+    ])
+
+    completions = _completion_texts(completer, "/skill re")
+
+    assert completions == ["review"]

@@ -1,0 +1,301 @@
+# dong 核心架构决策
+
+本文档记录 dong CLI coding agent 的整体架构决策，涵盖 Module 划分、数据流、工具框架、日志、UI、Skills 等方面的设计选择。
+
+---
+
+## 1. Module 划分
+
+### 决策：按职责拆分 9 个 Module，每个文件单一职责
+
+```
+dong/
+├── __init__.py          # 空 Module，暴露公共 API
+├── __main__.py          # python -m dong 入口，薄转发到 cli.main()
+├── cli.py               # CLI 主入口 + Agent 循环 + Skill 管理 (~450L)
+├── llm.py               # OpenAI ChatCompletions 封装 (~130L)
+├── tools.py             # 内置工具实现（read/write/edit/bash/grep/fetch）(~450L)
+├── tool.py              # 工具框架：注册/校验/执行/结构化结果 (~150L)
+├── ui.py                # 终端 UI 适配层（Rich + prompt_toolkit）(~325L)
+├── logging_config.py    # 文件日志配置 / 结构化事件 (~200L)
+└── log_viewer.py        # dong logs 子命令实现 (~185L)
+```
+
+**理由**：
+- `tools.py` 已膨胀到 450 行，抽出 `tool.py` 作为框架层，实现工具注册与执行解耦，方便单独测试
+- `ui.py` 隔离所有 Rich/prompt_toolkit 依赖，允许未来切换 Textual 或其他渲染引擎
+- `logging_config.py` 和 `log_viewer.py` 独立于主循环，通过子命令 `dong logs` 串联
+- `cli.py` 承担 Agent 循环和 Skill 加载，暂未进一步拆分以保持迭代速度
+
+### 后果
+- 各 Module 通过明确的 import 边界交互：`cli → llm + tools + ui + tool`，`tools → tool`，`cli → logging_config`
+- 每个 Module 可独立测试；ui、logging_config、log_viewer 不依赖其他业务 Module
+
+---
+
+## 2. Agent 主循环设计
+
+### 决策：同步 while 循环 + 固定工具调用轮次上限
+
+`cli.py` 中的 `run_loop()` 是核心 Agent 循环：
+
+1. 拼接 system prompt：内置 system + AGENTS.md（若存在）+ 已加载 Skills
+2. while 循环（最多 20 轮工具调用）：
+   - 调用 `llm.chat()` 传入 messages 和 tool definitions
+   - 模型返回 tool_calls → 逐个执行 → 追加 tool result 消息
+   - 模型返回空 tool_calls → 输出文本 → 循环结束
+3. 循环结束后将最后一轮 assistant 消息添加到历史
+
+**理由**：
+- 同步模型匹配 OpenAI Python SDK 的同步调用模式，简单可靠
+- 20 轮上限防止无限工具调用循环导致 token 耗尽
+- 工具结果以 `ToolResult.to_message()` 统一封装后追加到消息历史
+
+### 后果
+- 非流式：每次请求等待完整响应后才展示工具调用和最终文本
+- 不支持中断工具链后继续对话（未来可加）
+
+---
+
+## 3. 工具框架（tool.py）
+
+### 决策：Pydantic 驱动的工具注册 + 结构化结果
+
+```python
+class ToolResult(BaseModel):
+    success: bool
+    summary: str = ""
+    detail: str = ""
+    error: str = ""
+
+class ToolRegistry:
+    def register(self, name, description) -> decorator
+    def execute(self, name, raw_args, cwd) -> ToolResult
+```
+
+- 每个工具函数第一个参数 `args: SomeInputModel` 必须是 Pydantic BaseModel
+- `ToolRegistry` 自动从 type hints 推导 schema，生成 OpenAI function-calling JSON Schema
+- `execute()` 统一完成 JSON 解析、参数校验、异常捕获和日志记录
+
+**理由**：
+- Pydantic model_json_schema() 直接输出 OpenAI 兼容 schema，避免手写
+- 参数校验在入口处完成，工具实现函数拿到的已经是校验后的对象
+- `ToolResult` 统一封装成功/失败/摘要，UI 和日志层可一致消费
+
+### 可选 strict mode
+- 环境变量 `DONG_TOOL_STRICT=1` 时在 function schema 中加 `strict: true`
+- 默认关闭以保持兼容
+
+### 后果
+- 新增工具只需定义 Pydantic 入参 + 实现函数 + `@registry.register()` 装饰
+- 工具执行的所有错误都会被 `ToolResult.error` 捕获，不会中断 Agent 循环
+
+---
+
+## 4. 内置工具设计（tools.py）
+
+### 5 个核心工具
+
+| 工具 | 功能 | 安全考虑 |
+|------|------|----------|
+| `read` | 读文件，返回带行号的文本 | 纯读，无副作用 |
+| `write` | 覆盖写入文件 | 无条件覆盖，由模型判断 |
+| `edit` | 唯一匹配的字符串替换 | 避免误替换；匹配不到时失败 |
+| `bash` | 执行 shell 命令，3s 超时 | 危险命令需用户确认；在 cwd 下执行 |
+| `grep` | 正则搜索文件内容 | 纯读，无副作用 |
+
+另有 `fetch` 工具（HTTP GET）用于获取 URL 内容，15s 超时。
+
+### 决策：cwd 作为工具共享上下文
+
+每个工具函数签名为 `(args: InputModel, cwd: str) -> ToolResult`，`cwd` 由 Agent 循环传入当前工作目录。工具所有文件/命令操作均在 `cwd` 下进行。
+
+**理由**：
+- 支持 `dir=<path>` 动态切换工作目录
+- 避免工具函数自行推断 cwd 导致不一致
+
+### bash 危险命令确认
+- `cli.py` 中维护危险命令列表（如 `rm -rf /`）
+- 执行前通过 `ui.confirm_dangerous_command()` 请求用户确认，默认拒绝
+
+---
+
+## 5. LLM 层（llm.py）
+
+### 决策：OpenAI ChatCompletions 单次请求，非流式
+
+```python
+def chat(messages, *, model, tools=None, ...) -> ChatCompletionMessage
+```
+
+- 基 URL 由 `DONG_BASE_URL` 环境变量控制，方便接入兼容 API
+- API Key 从 `DONG_API_KEY` 或 `OPENAI_API_KEY` 读取
+- 支持 `extra_body` 透传 DeepSeek V4 特有参数（thinking、reasoning_effort）
+- 返回完整 `ChatCompletionMessage`（含 content、tool_calls、reasoning_content）
+
+### 后果
+- 无流式输出：用户需等待完整响应
+- reasoning_content 由 UI 层单独渲染为 thinking 面板
+
+---
+
+## 6. UI 层（ui.py）
+
+### 决策：Rich + prompt_toolkit，非全屏
+
+参见 [ADR-0001](./0001-rich-prompt-toolkit-inline-repl.md)。
+
+`TerminalUI` 类封装：
+- `show_startup()` — 启动面板（模型、工作目录、工具列表）
+- `show_assistant_message()` — Markdown 渲染到 stdout
+- `show_reasoning_message()` — thinking 面板渲染到 stderr
+- `show_tool_result()` — 工具调用结果状态行到 stderr
+- `show_tool_cancelled()` — 工具取消状态行
+- `read_prompt()` — 带补全和历史的 REPL 输入
+- `confirm_dangerous_command()` — 危险命令确认
+- Skill 相关方法：`show_loaded_skill()`、`show_skill_error()` 等
+
+### 补全设计（_SlashAwareCompleter）
+- `/` 开头弹出 slash 命令（/skill, /unskill）和已加载 skill 快捷项
+- `/skill <name>` 子补全：列出所有可用 skill 名
+- `/unskill <name>` 子补全：列出当前已加载 skill 名
+- 非 `/` 开头补全普通命令（exit、clear）
+
+### 后果
+- 所有终端渲染集中在 ui.py，CLI 循环只调用 TerminalUI 方法
+- 未来可添加 `--tui` 模式切换到 Textual 全屏 UI
+
+---
+
+## 7. 日志系统（logging_config.py）
+
+### 决策：结构化单行 JSON 事件日志
+
+- 日志写入 `<workdir>/logs/dong.log`（可通过环境变量调整）
+- 格式：`时间 级别 pid=xxx logger名称 event=事件名 fields={JSON}`
+- 默认不记录 prompt/工具参数正文，需 `DONG_LOG_PAYLOADS=1` 显式启用
+- 日志目录/文件强制限制在 workdir 内，防止路径穿越
+
+### 可控环境变量
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DONG_LOG_ENABLED` | 1 | 关闭=0 |
+| `DONG_LOG_LEVEL` | INFO | DEBUG/INFO/WARNING/ERROR |
+| `DONG_LOG_DIR` | logs | 日志目录 |
+| `DONG_LOG_FILE` | dong.log | 日志文件名 |
+| `DONG_LOG_PAYLOADS` | 0 | 是否记录正文 |
+
+### log_event() 辅助函数
+```python
+log_event(logger, logging.INFO, "event_name", key=value, ...)
+```
+- 自动序列化所有 kw 字段为 JSON
+- 通过 `dong_event` extra 字段传递事件名
+
+### 后果
+- 可通过 `dong logs` 子命令按事件名/级别/logger 过滤
+- 排查问题时开启 `DONG_LOG_LEVEL=DEBUG DONG_LOG_PAYLOADS=1` 获取完整上下文
+
+---
+
+## 8. 日志查看器（log_viewer.py）
+
+### 决策：本地解析 + 过滤 + 可选 --follow 模式
+
+`dong logs` 子命令实现：
+- 解析 dong 日志格式为 `ParsedLogLine` 数据结构
+- 支持过滤：`--level`、`--event`、`--logger`、`--contains`
+- `--limit N` 控制返回行数
+- `--json` 输出 JSON 行
+- `--follow` 持续轮询新日志（类似 `tail -f`）
+
+### 后果
+- 无需外部依赖（如 jq），纯 Python 实现
+- 日志解析正则只匹配 dong 特定格式，非该格式行作为原始字符串保留
+
+---
+
+## 9. Skills 系统
+
+### 决策：本地 + Codex 全局双源，同名时本地优先
+
+加载顺序：
+1. `.dong/skills/<name>.md`（本地）
+2. `${CODEX_HOME:-~/.codex}/skills/<name>/SKILL.md`（Codex 全局）
+
+加载时原样注入 SKILL.md 内容到 system prompt，不解析 frontmatter。
+
+### CLI 集成
+- `/skill` — 列出所有可用 skills
+- `/skill <name>` — 加载 skill 到当前会话
+- `/<name> <prompt>` — 加载对应 skill 并用 prompt 执行一轮对话
+- `/unskill <name>` — 卸载 skill
+- `--skill <name>` — CLI 参数，单次模式加载指定 skill
+
+### 后果
+- Skill 本质是追加到 system prompt 的指令文本
+- 同名冲突时本地 `.dong/skills/` 优先，允许项目级覆盖
+
+---
+
+## 10. 对话历史与上下文管理
+
+### 决策：在 cli.py 中以 messages 列表管理
+
+- REPL 模式：跨轮对话保持 messages 列表（单次模式不保持）
+- `clear` 命令重置 messages 为初始 system prompt
+- `--keep` 标志允许单次模式保留上下文
+- 工具调用结果消息追加到 messages，模型可看到完整工具链
+
+### json_output 模式
+- `DONG_RESPONSE_FORMAT=json_object` 时，在 request 中设置 `response_format={"type": "json_object"}`
+- 用户 prompt 中需包含 "json" 字样以满足 OpenAI API 要求
+
+### 后果
+- messages 列表无持久化，进程退出后历史丢失
+- 无 token 计数和上下文窗口管理
+
+---
+
+## 11. CLI 入口设计（cli.py）
+
+### 决策：单一入口函数 `main()` 处理所有子命令
+
+```
+dong <prompt>             # 单次模式
+dong --skill <name> ...   # 单次加载 skill
+dong                      # REPL 交互模式
+dong logs [选项]          # 日志查看
+```
+
+### 参数解析
+- 使用 `argparse`（非第三方库）
+- 支持 `--model`、`--skill`、`--keep`、`--yes`（跳过危险确认）
+
+### 后果
+- 无插件系统，所有子命令硬编码在 cli.py 的 `main()` 中解析
+
+---
+
+## 12. 依赖策略
+
+### 运行时依赖
+- `openai` — LLM API 调用
+- `playwright` — fetch 工具使用（HTTP GET，通过 playwright 的 sync_api）
+- `prompt-toolkit` — REPL 输入补全与历史
+- `pydantic` — 工具参数校验和 schema 生成
+- `rich` — 终端 Markdown 渲染和面板
+
+### 开发依赖
+- `pytest` — 测试
+- `ruff` — Lint / 格式化
+
+### 决策：最小化依赖，只用成熟库
+
+- 不用 LangChain/AutoGen 等重型 Agent 框架
+- 不用 Typer/Click 等 CLI 框架（argparse 足够）
+- 不用 Textual 等全屏 TUI（Phase 1 保持 inline REPL）
+
+### 后果
+- 总依赖数 ~5 个运行时库，安装体积小
+- 所有核心逻辑（Agent 循环、工具执行、补全）均为自研，可控性强

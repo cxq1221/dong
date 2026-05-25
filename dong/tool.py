@@ -1,6 +1,7 @@
 """工具框架：负责工具注册、参数校验和结构化结果封装。"""
 import json
 import logging
+import os
 import time
 from typing import Dict, get_type_hints
 
@@ -9,6 +10,11 @@ from pydantic import BaseModel
 from dong.logging_config import get_logger, log_event
 
 LOGGER = get_logger(__name__)
+
+
+def _tool_strict_enabled() -> bool:
+    """读取工具 strict mode 开关；默认关闭以保持现有兼容性。"""
+    return os.getenv("DONG_TOOL_STRICT", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class ToolResult(BaseModel):
@@ -42,13 +48,16 @@ class Tool:
     @property
     def schema(self) -> dict:
         """根据 Pydantic 入参模型生成 OpenAI function-calling schema。"""
+        function = {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.input_model.model_json_schema(),
+        }
+        if _tool_strict_enabled():
+            function["strict"] = True
         return {
             "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.input_model.model_json_schema(),
-            }
+            "function": function,
         }
 
 

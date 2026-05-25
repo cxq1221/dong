@@ -105,6 +105,28 @@ def test_slash_skill_invocation_returns_prompt(tmp_path) -> None:
     assert loaded == ["review"]
 
 
+def test_bare_skill_invocation_supports_frontmatter_alias(tmp_path) -> None:
+    """裸 skill 调用应支持文件名别名，并按 frontmatter 名称记录已加载项。"""
+    _write(
+        tmp_path / ".dong" / "skills" / "review.md",
+        "---\nname: code-review\n---\n\n# Review",
+    )
+    ui, _err = _ui()
+    loaded: list[str] = []
+
+    action = handle_repl_command(
+        "review inspect cli.py",
+        workdir=str(tmp_path),
+        loaded_skills=loaded,
+        working=[],
+        ui=ui,
+    )
+
+    assert action.handled is True
+    assert action.prompt == "inspect cli.py"
+    assert loaded == ["code-review"]
+
+
 def test_repl_completions_include_commands_and_skills(tmp_path) -> None:
     """REPL 自动补全应包含固定命令、skill 加载和卸载候选。"""
     _write(tmp_path / ".dong" / "skills" / "review.md", "# Review")
@@ -115,3 +137,28 @@ def test_repl_completions_include_commands_and_skills(tmp_path) -> None:
     assert "/skill review" in completions
     assert "/review" in completions
     assert "/unskill review" in completions
+
+
+def test_repl_completions_include_local_skill_directories(tmp_path) -> None:
+    """REPL 自动补全应包含 .dong/skills/<name>/SKILL.md 目录型 skill。"""
+    _write(tmp_path / ".dong" / "skills" / "zoom-out" / "SKILL.md", "# Zoom Out")
+
+    completions = repl_completions(str(tmp_path), [])
+
+    assert "/skill zoom-out" in completions
+    assert "/zoom-out" in completions
+    assert "zoom-out" in completions
+
+
+def test_repl_completions_include_frontmatter_name_and_entry_alias(tmp_path) -> None:
+    """REPL 自动补全应包含规范 skill 名和路径别名快捷项。"""
+    _write(
+        tmp_path / ".dong" / "skills" / "review.md",
+        "---\nname: code-review\n---\n\n# Review",
+    )
+
+    completions = repl_completions(str(tmp_path), ["code-review"])
+
+    assert "/skill code-review" in completions
+    assert "/code-review" in completions
+    assert "/review" in completions
