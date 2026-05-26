@@ -316,6 +316,10 @@ class TerminalUI:
         suffix = f" ({pending} pending)" if pending > 1 else ""
         self.err_console.print(f"  [#57606a]queued input{suffix}[/]")
 
+    def show_user_message(self, text: str) -> None:
+        """在 stderr 回显用户本轮提示，让 REPL 历史更易追溯。"""
+        self.err_console.print(f"  [bold]# user[/] {text}")
+
     def show_tool_cancelled(self, name: str, args_raw: str) -> None:
         """展示工具调用被取消的结果。"""
         display_args = self._display_args(args_raw)

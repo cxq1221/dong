@@ -1052,6 +1052,7 @@ def _process_repl_input(
         )
 
     working.append({"role": "user", "content": prompt})
+    ui.show_user_message(prompt)
     base_sys = build_agent_prompt(_skills_for_turn(loaded_skills, auto_decision), workdir)
     run_loop(base_sys, working, workdir, max_turns=max_turns, ui=ui, enable_mcp=enable_mcp)
     working[:] = trim_context(working, workdir=workdir)
@@ -1377,6 +1378,7 @@ def main():
             ui=ui,
         )
         working.append({"role": "user", "content": user_prompt})
+        ui.show_user_message(user_prompt)
         base_sys = build_agent_prompt(_skills_for_turn(loaded_skills, auto_decision), workdir)
         run_loop(base_sys, working, workdir, max_turns=args.max_turns, ui=ui, enable_mcp=args.mcp)
     else:

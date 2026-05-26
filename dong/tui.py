@@ -315,6 +315,14 @@ class TuiApp:
         if self._running:
             self.application.invalidate()
 
+    def get_last_assistant_raw(self) -> str | None:
+        """Return raw text of the last assistant transcript item."""
+        with self._lock:
+            for item in reversed(self._transcript):
+                if item.kind == "assistant" and item.raw.strip():
+                    return item.raw
+        return None
+
     def scroll_transcript(self, lines: int) -> None:
         """Scroll transcript history; positive lines move to older output."""
         if lines == 0:
@@ -476,6 +484,14 @@ class TuiApp:
         def _(event) -> None:  # type: ignore[no-untyped-def]
             event.app.exit()
 
+        @bindings.add("c-y")
+        def _(event) -> None:  # type: ignore[no-untyped-def]
+            if self._confirmation is not None:
+                return
+            raw = self.get_last_assistant_raw()
+            if raw is not None:
+                event.app.current_buffer.insert_text(raw)
+
         @bindings.add("escape")
         def _(event) -> None:  # type: ignore[no-untyped-def]
             if self._confirmation is not None:
@@ -593,6 +609,14 @@ class TuiUI:
 
     def show_input_queued(self, *, pending: int) -> None:
         self.show_system_message(f"queued input ({pending} pending)")
+
+    def show_user_message(self, text: str) -> None:
+        self.app.append_item(
+            "user",
+            "user",
+            render_text("user", text, width=self.app.render_width),
+            raw=text,
+        )
 
     def confirm_dangerous_command(self, command: str, default: str = "n") -> bool:
         self.app.append_item(
