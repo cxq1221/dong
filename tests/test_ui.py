@@ -7,7 +7,7 @@ from io import StringIO
 from prompt_toolkit.document import Document
 
 from dong.tool import ToolResult
-from dong.ui import TerminalUI, _SlashAwareCompleter
+from dong.ui import TerminalUI, _SlashAwareCompleter, _format_working_message, _markdown
 
 
 def test_startup_rendering_includes_stable_fields() -> None:
@@ -27,6 +27,8 @@ def test_startup_rendering_includes_stable_fields() -> None:
     assert "gpt-test" in rendered
     assert "/tmp/project" in rendered
     assert "read, bash" in rendered
+    assert "╭" not in rendered
+    assert "│" not in rendered
 
 
 def test_tool_result_rendering_includes_status_name_and_summary() -> None:
@@ -46,6 +48,75 @@ def test_tool_result_rendering_includes_status_name_and_summary() -> None:
     assert "README.md (3 lines)" in rendered
 
 
+def test_update_plan_tool_result_renders_full_detail() -> None:
+    """update_plan 的完整计划在 detail 中，应展示给用户而不只展示摘要。"""
+    err = StringIO()
+    ui = TerminalUI(stderr=err)
+
+    ui.show_tool_result(
+        "update_plan",
+        '{"plan": []}',
+        ToolResult(
+            success=True,
+            summary="Updated plan (3 steps)",
+            detail=(
+                "Need a short implementation path.\n\n"
+                "1. [completed] Inspect tool registry\n"
+                "2. [in_progress] Add plan tool\n"
+                "3. [pending] Run focused tests"
+            ),
+        ),
+    )
+
+    rendered = err.getvalue()
+    assert "Updated plan (3 steps)" in rendered
+    assert "Need a short implementation path." in rendered
+    assert "Inspect tool registry" in rendered
+    assert "Add plan tool" in rendered
+    assert "Run focused tests" in rendered
+
+
+def test_failed_tool_result_renders_error_detail() -> None:
+    """失败工具应展示 detail/error，避免只看到 exit code 摘要。"""
+    err = StringIO()
+    ui = TerminalUI(stderr=err)
+
+    ui.show_tool_result(
+        "bash",
+        '{"command": "bad"}',
+        ToolResult(
+            success=False,
+            summary="exit code 127",
+            detail="bad: command not found",
+        ),
+    )
+
+    rendered = err.getvalue()
+    assert "failed" in rendered
+    assert "exit code 127" in rendered
+    assert "bad: command not found" in rendered
+
+
+def test_working_message_shows_elapsed_timeout_and_cancel_hint() -> None:
+    """运行中状态应展示耗时、超时阈值和取消提示。"""
+    running = _format_working_message(
+        "正在执行工具：bash",
+        elapsed_seconds=12,
+        timeout_seconds=30,
+        cancel_hint="Ctrl-C 取消当前任务",
+    )
+    timed_out = _format_working_message(
+        "正在执行工具：bash",
+        elapsed_seconds=31,
+        timeout_seconds=30,
+        cancel_hint="Ctrl-C 取消当前任务",
+    )
+
+    assert "12s/30s" in running
+    assert "Ctrl-C 取消当前任务" in running
+    assert "已超过超时阈值" in timed_out
+
+
 def test_assistant_message_renders_markdown_text() -> None:
     """assistant 文本应按 Markdown 渲染到 stdout。"""
     out = StringIO()
@@ -54,8 +125,24 @@ def test_assistant_message_renders_markdown_text() -> None:
     ui.show_assistant_message("# Done\n\n- item")
 
     rendered = out.getvalue()
+    assert "assistant" in rendered
     assert "Done" in rendered
     assert "item" in rendered
+    assert "╭" not in rendered
+    assert "│" not in rendered
+
+
+def test_markdown_uses_light_code_style_without_background() -> None:
+    """Markdown code 样式应接近 light VS Code，避免默认黑底高反差。"""
+    ui = TerminalUI(stdout=StringIO())
+    code_style = ui.console.get_style("markdown.code")
+    block_style = ui.console.get_style("markdown.code_block")
+    markdown = _markdown("`cli.py`\n\n```python\nprint('x')\n```")
+
+    assert code_style.bgcolor is None
+    assert block_style.bgcolor is None
+    assert markdown.code_theme == "ansi_light"
+    assert markdown.inline_code_theme == "ansi_light"
 
 
 def test_assistant_message_dedents_accidental_leading_spaces() -> None:
@@ -68,6 +155,23 @@ def test_assistant_message_dedents_accidental_leading_spaces() -> None:
     rendered = out.getvalue()
     assert "{name} answer" in rendered
     assert "**{name}**" not in rendered
+
+
+def test_assistant_message_unwraps_json_output_content() -> None:
+    """JSON Output 包装的最终回答应只渲染 content，而不是原始 JSON。"""
+    out = StringIO()
+    ui = TerminalUI(stdout=out)
+
+    ui.show_assistant_message(
+        '{"content": "# 产品文档\\n\\n- 中文内容", "format": "markdown"}'
+    )
+
+    rendered = out.getvalue()
+    assert "assistant" in rendered
+    assert "产品文档" in rendered
+    assert "中文内容" in rendered
+    assert '"content"' not in rendered
+    assert '"format"' not in rendered
 
 
 def test_reasoning_message_renders_thinking_panel() -> None:

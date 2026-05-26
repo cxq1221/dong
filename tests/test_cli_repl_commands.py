@@ -57,6 +57,26 @@ def test_dir_command_returns_new_absolute_workdir(tmp_path) -> None:
     assert tmp_path.name in err.getvalue()
 
 
+def test_dir_command_rejects_missing_workdir(tmp_path) -> None:
+    """dir= 不应把 REPL 状态切到不存在的目录。"""
+    ui, err = _ui()
+    missing = tmp_path / "missing"
+
+    action = handle_repl_command(
+        f"dir={missing}",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=[],
+        ui=ui,
+    )
+
+    assert action.handled is True
+    assert action.workdir is None
+    rendered = err.getvalue()
+    assert "Error" in rendered
+    assert missing.name in rendered
+
+
 def test_skill_load_and_unskill_preserve_loaded_skill_list(tmp_path) -> None:
     """skill 加载和移除应正确维护 loaded_skills 列表。"""
     _write(tmp_path / ".dong" / "skills" / "review.md", "# Review")

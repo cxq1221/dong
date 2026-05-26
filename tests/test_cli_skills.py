@@ -170,10 +170,31 @@ def test_build_messages_injects_selected_skill_source(tmp_path, monkeypatch):
 
     messages = build_messages(["global-only"], str(tmp_path))
 
-    assert messages[-1] == {
-        "role": "system",
-        "content": "--- Skill: global-only (codex) ---\n# Global Only",
-    }
+    assert messages[-1]["role"] == "system"
+    content = messages[-1]["content"]
+    assert content.startswith("--- Skill: global-only (codex) ---")
+    assert f"Skill path: {codex_home / 'skills' / 'global-only' / 'SKILL.md'}" in content
+    assert f"Skill dir: {codex_home / 'skills' / 'global-only'}" in content
+    assert "`scripts/...`" in content
+    assert content.endswith("# Global Only")
+
+
+def test_build_messages_resolves_skill_relative_script_paths(tmp_path, monkeypatch):
+    """skill 注入应告诉模型把 scripts 等相对路径按 skill 目录解析。"""
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _write(
+        tmp_path / ".dong" / "skills" / "chrome-cdp" / "SKILL.md",
+        "# Chrome CDP\n\nUse `scripts/cdp.mjs list`.\n",
+    )
+
+    messages = build_messages(["chrome-cdp"], str(tmp_path))
+
+    content = messages[-1]["content"]
+    skill_dir = tmp_path / ".dong" / "skills" / "chrome-cdp"
+    assert f"Skill dir: {skill_dir}" in content
+    assert "relative to Skill dir" in content
+    assert "Use `scripts/cdp.mjs list`." in content
 
 
 def test_build_messages_uses_frontmatter_name_for_alias(tmp_path, monkeypatch):

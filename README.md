@@ -1,124 +1,352 @@
-# 🐉 dong
+# 🐉 dong —— 极简终端编码代理
 
-极简 CLI coding agent。核心就三个文件 + 一个主循环。
+**dong** 是一个开源的终端编码代理（CLI Coding Agent），由 LS 主导开发。你只需要用自然语言描述需求，它就能自动读取文件、编写代码、搜索项目、执行命令，直到任务完成。
 
-## 快速开始
+**设计哲学**：不到 4000 行 Python，只做一件事——把你说的话变成可执行的编码动作。不做代码库索引、不做记忆系统、不做项目地图。
 
-```bash
-# 设置 API Key
-export DONG_API_KEY=sk-xxx
-# 可选：切换模型
-export DONG_MODEL=gpt-4o
-# 可选：DeepSeek V4 thinking/tool 高级参数
-export DONG_THINKING=enabled          # enabled / disabled
-export DONG_REASONING_EFFORT=high     # high / max
-export DONG_TOOL_STRICT=0             # 1 时给 function tools 加 strict=true
-export DONG_RESPONSE_FORMAT=text      # text / json_object
+---
 
-# 单次模式
-dong "add a fibonacci function to fib.py"
-
-# 单次模式加载 skill
-dong --skill python-test "add tests for fib.py"
-
-# 交互模式（不用引号）
-dong
-```
-
-## 内置工具
-
-| 工具 | 作用 |
-|------|------|
-| `read` | 读文件（带行号） |
-| `write` | 写文件（覆盖） |
-| `edit` | 查找替换 |
-| `bash` | 执行 shell 命令 |
-| `grep` | 搜索文本 |
-
-## 交互模式命令
-
-- `exit` / `quit` — 退出
-- `clear` — 清空对话上下文
-- `dir=/some/path` — 切换工作目录
-- `/skill` / `/skills` — 列出本地和 Codex 全局 skills
-- `/skill <name>` — 加载 skill（本地优先，其次 Codex 全局）
-- `/<name> <prompt>` — 加载对应 skill 并用后面的 prompt 执行一轮对话
-- `/unskill <name>` — 卸载当前会话里的 skill
-
-## 日志规范
-
-dong 默认把运行诊断日志写入当前工作目录的 `logs/dong.log`。日志按单行事件输出，格式包含时间、级别、进程、logger 名称、稳定事件名和 JSON 字段：
-
-```text
-2026-05-25 12:00:00,000 INFO pid=12345 dong.cli event=run_loop_started fields={"workdir": "..."}
-```
-
-可控项：
-
-- `DONG_LOG_ENABLED=0` — 关闭文件日志
-- `DONG_LOG_LEVEL=DEBUG|INFO|WARNING|ERROR` — 控制日志级别，默认 `INFO`
-- `DONG_LOG_DIR=logs/debug` — 修改日志目录，默认 `<workdir>/logs`，最终路径必须位于 `<workdir>` 内
-- `DONG_LOG_FILE=logs/dong-debug.log` — 修改日志文件；相对路径按 `<workdir>` 解析，最终路径必须位于 `<workdir>` 内
-- `DONG_LOG_PAYLOADS=1` — 显式允许记录 prompt、命令等正文预览；默认关闭，只记录长度和结果
-
-事件命名使用小写蛇形，例如 `cli_started`、`llm_request_finished`、`tool_executed`、`file_read`。默认日志不改变终端输出，也不记录完整 prompt、工具参数或工具结果正文。
-
-## DeepSeek V4 参数
-
-dong 通过 OpenAI ChatCompletions 兼容接口调用模型，并支持以下可选环境变量：
-
-- `DONG_THINKING=enabled|disabled` — 传入 `extra_body={"thinking": {"type": ...}}`
-- `DONG_REASONING_EFFORT=high|max` — 控制 thinking effort
-- `DONG_TOOL_STRICT=1` — 为 function tool schema 加 `strict: true`
-- `DONG_RESPONSE_FORMAT=json_object` — 启用 JSON Output；使用时 prompt 里也要明确要求 JSON
-
-模型返回 `reasoning_content` 时，CLI 会以 `thinking` 区块展示；工具调用轮次也会继续保留该字段，确保 DeepSeek V4 thinking + tool-use 的后续请求仍能接上模型推理上下文。
-
-查看和过滤日志：
-
-```bash
-dong logs
-dong logs --limit 50
-dong logs --level WARNING
-dong logs --event tool_executed
-dong logs --logger dong.tools --contains file_read
-dong logs --json --event file_read
-dong logs --follow --event tool_executed
-```
-
-## Skills
-
-dong 支持两类 skill：
-
-- 本地：`.dong/skills/<name>.md`
-- Codex 全局：`${CODEX_HOME:-~/.codex}/skills/<name>/SKILL.md`
-
-同名时本地 skill 优先。dong 原样注入 `SKILL.md`，不会解析或合并 frontmatter。
-
-示例：
-
-```text
-/agent-browser 查看我现在打开了多少个页面
-```
-
-## 架构
+## 项目架构
 
 ```
 dong/
-├── dong/
-│   ├── __init__.py         # 空 Module
-│   ├── __main__.py         # python -m dong 入口
-│   ├── cli.py              # CLI 主入口 + Agent 循环 + Skill 管理 (~450L)
-│   ├── llm.py              # OpenAI ChatCompletions 封装 (~130L)
-│   ├── tools.py            # 内置工具实现 (read/write/edit/bash/grep/fetch) (~450L)
-│   ├── tool.py             # 工具框架：注册/校验/执行/结构化结果 (~150L)
-│   ├── ui.py               # 终端 UI 适配层 (Rich + prompt_toolkit) (~325L)
-│   ├── logging_config.py   # 文件日志配置 + 结构化事件 (~200L)
-│   └── log_viewer.py       # dong logs 子命令实现 (~185L)
-├── docs/
-│   └── adr/                # 架构决策记录
-├── pyproject.toml
-└── .env.example
+├── __init__.py          # 包入口（1 行）
+├── __main__.py          # python -m dong 入口（5 行）
+├── cli.py               # 主入口层：CLI 解析、REPL 对话循环、agent 调度、skill 管理、上下文压缩（1382 行）
+├── llm.py               # LLM 抽象层：多 provider 适配、流式调用、Messages/Responses/Chat 格式转换（830 行）
+├── tools.py             # 内置工具集：read / write / edit / bash / grep / fetch / update_plan（349 行）
+├── tool.py              # 工具注册框架：装饰器注册、Pydantic 参数校验、安全路径验证（149 行）
+├── ui.py                # 终端 UI 适配层：Rich 渲染、prompt_toolkit 输入、补全、确认面板（491 行）
+├── mcp.py               # MCP stdio 客户端：发现外部工具、转发调用、管理 server 生命周期（438 行）
+├── logging_config.py    # 结构化日志：JSON 事件日志、payload 掩码、模块级 logger 工厂（202 行）
+└── log_viewer.py        # 日志查看器：dong logs 子命令，按级别/事件/关键词过滤（184 行）
+
+tests/
+├── test_cli_e2e.py      # CLI 端到端自动化回归测试
+├── test_cli_repl_commands.py  # 交互模式命令测试（exit/clear/dir）
+├── test_cli_skills.py   # Skill 发现、加载、别名解析测试
+├── test_cli_tty_e2e.py  # TTY 模式下 CLI 端到端测试
+├── test_llm.py           # LLM 适配层单元测试（含 prompt 构建、流式、JSON 模式）
+├── test_tools_*.py       # 各内置工具单元测试（read/write/edit/bash/grep/plan）
+├── test_tool_schema.py   # 工具注册与 schema 生成测试
+├── test_ui.py            # UI 渲染行为兼容性测试
+├── test_logging.py       # 日志系统测试
+├── test_log_viewer.py    # 日志查看器测试
+├── test_mcp.py           # MCP 客户端测试
+└── mcp_helpers.py        # MCP 测试辅助工具
 ```
 
-核心约 2000 行，按职责拆分为 9 个 Module。详细架构决策见 [ADR](docs/adr/)。
+### 核心模块职责
+
+**`cli.py`** —— 程序入口与 agent 调度中心
+- argparse 命令行解析（`dong` / `dong "prompt"` / `dong logs` / `dong mcp`）
+- `REPL` 类：交互对话循环，管理对话历史、skill 栈、上下文压缩
+- `AgentLoop` 类：单次 prompt 的完整执行流程（组装 system prompt → 调用 LLM → 执行工具 → 回传结果 → 循环）
+- 上下文压缩：当消息长度超过阈值时，本地自动摘要旧消息（不调用外部 LLM）
+- Skill 发现：扫描 `.dong/skills/`（本地优先）+ `~/.codex/skills/`（Codex 兼容）
+
+**`llm.py`** —— LLM 多 provider 抽象
+- 统一接口 `instructions + input + tools`，由 provider adapter 转换为对应 API 格式
+- Provider 支持：
+  - `anthropic`（默认）：走 Anthropic Messages API，instructions → 顶层 `system`，对话 → `messages`，工具调用 → `tool_use` / `tool_result`
+  - `responses`：OpenAI Responses API，instructions → `instructions` 字段，对话 → `input`
+  - `chat`：OpenAI Chat Completions API，instructions → 首个 `system` message
+  - `auto`：兼容探测，先试 Responses，不支持则回退 Chat Completions
+- 流式调用支持，逐字符输出并通过 `on_content` 回调实时推送到 UI
+
+**`tools.py`** —— 七个内置工具
+| 工具 | 功能 | 安全约束 |
+|------|------|----------|
+| `read` | 读取文件内容（含行号） | `_validate_path()` 防目录遍历 |
+| `write` | 创建或覆盖文件 | `_validate_path()` 防目录遍历 |
+| `edit` | 精确查找替换（唯一匹配） | `_validate_path()` 防目录遍历 |
+| `bash` | 执行 shell 命令（含超时） | 禁止 `rm`/`sudo`/`mv` 等危险操作 |
+| `grep` | 正则搜索文件内容 | 仅读取，无写入风险 |
+| `fetch` | GET 指定 URL | 超时 15s，仅 GET |
+| `update_plan` | 维护任务计划（步骤 + 状态） | 纯内存操作 |
+
+**`tool.py`** —— 工具注册框架
+- `@registry.register()` 装饰器模式注册工具
+- Pydantic v2 自动生成 JSON Schema，通过类型注解推断参数类型
+- `_validate_path()` 统一路径安全检查（拒绝 `..`、符号链接逃逸、绝对路径越界）
+
+**`ui.py`** —— 终端 UI 适配层
+- Rich 渲染：Markdown 消息、工具结果行、启动通知、确认面板
+- prompt_toolkit 输入：多行编辑、历史记录、命令/路径自动补全、粘贴保护
+- Interrupt 兼容：`Ctrl+C` 中断模型调用但不退出程序
+
+**`mcp.py`** —— MCP stdio 客户端
+- 读取 `.dong/mcp.json` 项目配置，管理 stdio transport 的 MCP server
+- server 生命周期：启动 → `tools/list` 发现工具 → 运行时转发 `tools/call` → 退出时关闭
+- 工具命名：`mcp__<server>__<tool>`，注入模型后由模型主动调用
+
+**`logging_config.py`** —— 结构化日志
+- 一行一条 JSON 事件，写入 `logs/dong.log`
+- 事件类型：`tool_executed` / `llm_request` / `skill_loaded` / `agent_turn` 等
+- `DONG_LOG_PAYLOADS=1` 时记录完整 payload，否则仅记录长度和关键字段
+
+**`log_viewer.py`** —— `dong logs` 子命令
+- 支持 `--limit` / `--level` / `--event` / `--logger` / `--follow` 过滤
+- 支持 `--text` 全文关键词搜索
+
+---
+
+## 工作流程
+
+一次典型的对话请求：
+
+```
+用户输入 "在 fib.py 里写一个 fibonacci 函数"
+  ↓
+CLI 组装 AgentPrompt:
+  ├── instructions: 系统提示词（角色 + 规则 + skill 内容）
+  ├── context_messages: 对话历史
+  └── tools: 七个内置工具（+ MCP 工具）
+  ↓
+LLM 返回: {tool_use: write, params: {filepath: "fib.py", content: "..."}}
+  ↓
+CLI 执行 write 工具 → _validate_path() → 写入文件
+  ↓
+工具结果回传 LLM
+  ↓
+LLM 返回最终文本: "已创建 fib.py..."
+  ↓
+UI 渲染给用户
+```
+
+---
+
+## 安装
+
+```bash
+git clone <仓库地址>
+cd dong
+uv sync
+```
+
+依赖（`pyproject.toml`）：
+- `anthropic` ≥ 0.104.1 —— Anthropic Messages API
+- `openai` ≥ 2.38.0 —— OpenAI Responses / Chat Completions API
+- `prompt-toolkit` ≥ 3.0.52 —— 终端输入
+- `pydantic` ≥ 2.13.4 —— 工具参数校验与 Schema 生成
+- `rich` ≥ 15.0.0 —— 终端渲染
+
+---
+
+## 配置
+
+在项目根目录创建 `.env`：
+
+```bash
+DONG_API_KEY=sk-你的API密钥
+```
+
+### 环境变量参考
+
+| 变量 | 作用 | 默认值 |
+|------|------|--------|
+| `DONG_API_KEY` | API 密钥（所有 provider 通用） | 必填 |
+| `DONG_MODEL` | 模型名称 | `deepseek-v4-pro` |
+| `DONG_LLM_API` | 请求接口类型 | `anthropic` |
+| `DONG_BASE_URL` | OpenAI 兼容 API 地址 | `https://api.openai.com/v1` |
+| `DONG_ANTHROPIC_BASE_URL` | Anthropic API 地址 | `https://api.deepseek.com/anthropic` |
+| `DONG_ANTHROPIC_API_KEY` | Anthropic 专用 Key | 未设置时复用 `DONG_API_KEY` |
+| `DONG_MAX_TOKENS` | 最大输出 token | `4096` |
+| `DONG_THINKING` | DeepSeek thinking 模式 | `disabled` |
+| `DONG_REASONING_EFFORT` | 思考深度 | 不设置 |
+| `DONG_RESPONSE_FORMAT` | 响应格式 | `text` |
+| `DONG_TOOL_STRICT` | 工具严格模式 | `0`（关闭） |
+| `DONG_LOG_PAYLOADS` | 日志记录完整 payload | 不设置（仅记录摘要） |
+
+### Provider 配置示例
+
+**DeepSeek Anthropic 兼容接口（默认）**：
+```bash
+DONG_LLM_API=anthropic
+DONG_ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+DONG_ANTHROPIC_API_KEY=sk-你的DeepSeek密钥
+DONG_MODEL=deepseek-v4-pro
+```
+
+**Claude 官方接口**：
+```bash
+DONG_LLM_API=anthropic
+DONG_ANTHROPIC_BASE_URL=https://api.anthropic.com
+DONG_ANTHROPIC_API_KEY=sk-ant-你的Claude密钥
+DONG_MODEL=claude-sonnet-4-20250514
+```
+
+**OpenAI 兼容接口**：
+```bash
+DONG_LLM_API=chat
+DONG_BASE_URL=https://api.openai.com/v1
+DONG_API_KEY=sk-你的OpenAI密钥
+DONG_MODEL=gpt-4o
+```
+
+---
+
+## 使用方式
+
+### 单次模式
+
+```bash
+dong "你的需求"
+```
+
+说完这句，dong 立即开始执行，直到任务完成。
+
+### 交互模式
+
+```bash
+dong
+```
+
+进入 REPL 对话界面。支持以下命令：
+
+| 输入 | 效果 |
+|------|------|
+| `exit` / `quit` | 退出程序 |
+| `clear` | 清空对话上下文 |
+| `dir=/path/to/project` | 切换到另一个项目目录 |
+| `/skill <name>` | 加载指定 skill |
+| `/unskill <name>` | 卸载指定 skill |
+| `/<skill-name>` | 快捷方式：加载 skill 并以后续内容为 prompt |
+
+输入 `/` 时自动弹出命令和 skill 补全菜单。
+
+---
+
+## 内置工具
+
+| 工具 | 用途 |
+|------|------|
+| `read` | 读取文件内容（含行号） |
+| `write` | 创建或覆盖文件 |
+| `edit` | 精准唯一匹配查找替换 |
+| `bash` | 执行 shell 命令（带超时和安全限制） |
+| `grep` | 正则搜索项目文件内容 |
+| `fetch` | GET 获取 URL 内容 |
+| `update_plan` | 创建/更新多步骤任务计划 |
+
+所有文件操作均通过 `_validate_path()` 做路径安全校验，防止目录遍历攻击。`bash` 工具禁止 `rm`、`sudo`、`mv` 等危险操作。
+
+---
+
+## MCP（外部工具扩展）
+
+通过项目级 `.dong/mcp.json` 配置 stdio MCP server：
+
+```json
+{
+  "servers": {
+    "demo": {
+      "command": "python",
+      "args": ["server.py"],
+      "env": {},
+      "enabled": true
+    }
+  }
+}
+```
+
+MCP server 默认不会自动启动。通过 `--mcp` 显式启用：
+
+```bash
+dong --mcp "使用已配置的 MCP 工具完成任务"
+```
+
+MCP 工具以 `mcp__<server>__<tool>` 命名注入模型。查看配置：
+
+```bash
+dong mcp list -d .          # 列出配置的 server
+dong mcp list -d . --tools  # 连接并列出发现的工具
+```
+
+---
+
+## Skills（技能包）
+
+Skill 是一份 Markdown 文件，向 dong 注入领域知识、约束和规范。
+
+**目录结构**：
+```
+.dong/skills/
+├── python-test.md         # Python 测试规范
+├── code-review.md         # 代码审查规范
+└── diagnose/
+    └── SKILL.md            # 目录形式的 skill
+```
+
+**使用 skill**：
+```bash
+dong --skill python-test "给 utils.py 写测试"     # 单次模式
+/skill python-test                                 # 交互模式
+/<skill-name> 后续内容                              # 交互模式快捷方式
+```
+
+- 同名 skill 本地优先（`.dong/skills/` > `~/.codex/skills/`）
+- 兼容 Codex 全局 skill 目录
+- 解析 `name` / `description` frontmatter 用于发现和别名
+
+---
+
+## 日志
+
+dong 运行时写入结构化日志到 `logs/dong.log`。
+
+```bash
+dong logs --limit 50              # 最近 50 条
+dong logs --level WARNING         # 只看错误
+dong logs --event tool_executed   # 只看工具调用
+dong logs --follow --event tool_executed  # 实时监控
+```
+
+`DONG_LOG_PAYLOADS=1` 时记录完整输入输出内容，用于调试。
+
+---
+
+## 开发
+
+```bash
+uv sync --group dev     # 安装开发依赖
+uv run pytest           # 运行全部测试
+uv run ruff check --fix # 代码风格检查
+```
+
+### 测试分层
+
+| 层级 | 说明 | 运行方式 |
+|------|------|----------|
+| 单元测试 | 工具、LLM 适配、日志等模块独立测试 | `pytest tests/test_tools_*.py tests/test_llm.py` |
+| CLI 自动化回归 | CLI 命令、REPL 行为、skill 管理 | `pytest tests/test_cli_*.py` |
+| 端到端验证 | 用真实 API 配置完成一轮完整对话 | 手动执行：`dong "简单任务"` |
+
+### 编码约定
+
+- Python 3.11+，f-string 优先，完整类型标注
+- Import 顺序：stdlib → third-party → local
+- 工具通过 `@registry.register()` 装饰器注册
+- 所有文件 I/O 必须经过 `_validate_path()`
+- 测试文件与模块一一对应：`dong/xxx.py` → `tests/test_xxx.py`
+- 所有代码需添加中文注释
+
+---
+
+## 对比
+
+| | dong | Claude Code | Codex | Aider |
+|------|------|-------------|-------|-------|
+| 代码规模 | ~4000 行 | 大型项目 | 大型项目 | 大型项目 |
+| 核心理念 | 极简 · 中文友好 | 功能全面 | Claude 原生 | Git 地图式 |
+| 模型支持 | Anthropic / OpenAI / 兼容接口 | Claude 系列 | Claude 系列 | 广泛 |
+| Skill 系统 | ✅ Markdown 文件 | ✅ | ✅ | ❌ |
+| MCP 支持 | ✅ stdio transport | ✅ | ✅ | ❌ |
+| 结构化日志 | ✅ JSON 事件 | ✅ | ✅ | ✅ |
+| 上下文压缩 | ✅ 本地算法 | ✅ | ✅ | ✅ |
+
+---
+
+## 许可
+
+MIT

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import sys
 import textwrap
+import json
+import time
 from collections.abc import Callable, Iterable
+from contextlib import AbstractContextManager
+from threading import Event, Thread
 from typing import TextIO
 
 from prompt_toolkit import PromptSession
@@ -15,11 +19,37 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from rich.console import Console
 from rich.markdown import Markdown
-from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from rich.theme import Theme
 
 from dong.tool import ToolResult
+
+
+DONG_LIGHT_THEME = Theme({
+    "markdown.paragraph": "#24292f",
+    "markdown.h1": "bold #0b5cad",
+    "markdown.h2": "bold #0b5cad",
+    "markdown.h3": "bold #0b5cad",
+    "markdown.h4": "bold #0b5cad",
+    "markdown.h5": "bold #0b5cad",
+    "markdown.h6": "bold #0b5cad",
+    "markdown.strong": "bold #24292f",
+    "markdown.em": "italic #24292f",
+    "markdown.code": "#005a9e",
+    "markdown.code_block": "#24292f",
+    "markdown.item": "#24292f",
+    "markdown.item.bullet": "#6a737d",
+    "markdown.item.number": "#6a737d",
+    "markdown.link": "underline #0969da",
+    "markdown.link_url": "#0969da",
+    "markdown.block_quote": "#57606a",
+    "markdown.hr": "#d0d7de",
+    "markdown.table.border": "#d0d7de",
+    "markdown.table.header": "bold #24292f",
+})
+
+MARKDOWN_CODE_THEME = "ansi_light"
 
 
 class _SlashAwareCompleter(Completer):
@@ -134,8 +164,8 @@ class TerminalUI:
         self.stdout = stdout or sys.stdout
         self.stderr = stderr or sys.stderr
         self.input_func = input_func
-        self.console = Console(file=self.stdout, highlight=False)
-        self.err_console = Console(file=self.stderr, highlight=False)
+        self.console = Console(file=self.stdout, highlight=False, theme=DONG_LIGHT_THEME)
+        self.err_console = Console(file=self.stderr, highlight=False, theme=DONG_LIGHT_THEME)
         self._session: PromptSession[str] | None = None
 
     def _interactive(self) -> bool:
@@ -197,13 +227,8 @@ class TerminalUI:
         """对危险命令进行显式确认，默认拒绝。"""
         default = default.lower()
         suffix = " [Y/n] " if default == "y" else " [y/N] "
-        self.err_console.print(
-            Panel(
-                Text(command, style="bold red"),
-                title="Dangerous command",
-                border_style="red",
-            )
-        )
+        self.err_console.print("[bold red]Dangerous command[/]")
+        self.err_console.print(Text(command, style="bold red"))
         answer = self.input_func(f"Run command?{suffix}").strip().lower()
         return answer in ("y", "yes") or (answer == "" and default == "y")
 
@@ -221,9 +246,10 @@ class TerminalUI:
         table.add_column()
         table.add_row("model", model)
         table.add_row("workdir", workdir)
-        table.add_row("AGENTS.md", "loaded" if agents_loaded else "not found")
+        table.add_row("DONG.md", "loaded" if agents_loaded else "not found")
         table.add_row("tools", ", ".join(tools))
-        self.err_console.print(Panel(table, title="dong", border_style="cyan"))
+        self.err_console.print("[bold cyan]dong[/]")
+        self.err_console.print(table)
 
     def show_repl_help(self, *, skill_count: int) -> None:
         """显示 REPL 的固定命令提示和可用 skill 数量。"""
@@ -281,12 +307,40 @@ class TerminalUI:
         self.err_console.print(
             f"  [{style}]{status}[/] {name}({display_args}) - {summary}"
         )
+        if name == "update_plan" and result.detail.strip():
+            self.err_console.print("[bold #0b5cad]plan[/]")
+            self.err_console.print(_markdown(result.detail))
+        elif not result.success:
+            detail = (result.error or result.detail).strip()
+            if detail and detail != summary:
+                self.err_console.print("[bold red]tool detail[/]")
+                self.err_console.print(Text(self._display_detail(detail)))
+
+    def show_working(
+        self,
+        message: str,
+        *,
+        timeout_seconds: float | None = None,
+        cancel_hint: str = "Ctrl-C 取消当前任务",
+    ) -> AbstractContextManager[None]:
+        """显示当前正在执行的阶段；退出上下文时自动清理状态行。"""
+        return _WorkingStatus(
+            self.err_console,
+            message,
+            timeout_seconds=timeout_seconds,
+            cancel_hint=cancel_hint,
+        )
+
+    def stream_assistant_message(self) -> AbstractContextManager[Callable[[str], None]]:
+        """流式输出 assistant 文本增量；结束后由调用方决定是否补渲染最终消息。"""
+        return _AssistantMessageStream(self.console)
 
     def show_assistant_message(self, text: str) -> None:
         """把模型最终文本按 Markdown 渲染到 stdout。"""
-        normalized = _normalize_model_text(text)
+        normalized = _assistant_display_text(text)
         if normalized:
-            self.console.print(Markdown(normalized))
+            self.console.print("[bold #0b5cad]assistant[/]")
+            self.console.print(_markdown(normalized))
 
     def show_reasoning_message(self, text: str) -> None:
         """把模型返回的 reasoning_content 作为低调的 thinking 区块展示。"""
@@ -294,21 +348,16 @@ class TerminalUI:
         if not normalized:
             return
 
-        self.err_console.print(
-            Panel(
-                Markdown(normalized),
-                title="thinking",
-                border_style="bright_black",
-            )
-        )
+        self.err_console.print("[#57606a]thinking[/]")
+        self.err_console.print(_markdown(normalized))
 
     def show_warning(self, message: str) -> None:
-        """渲染黄色警告面板。"""
-        self.err_console.print(Panel(message, title="Warning", border_style="yellow"))
+        """渲染黄色警告。"""
+        self.err_console.print(f"[yellow]Warning:[/] {message}")
 
     def show_error(self, message: str) -> None:
-        """渲染红色错误面板。"""
-        self.err_console.print(Panel(message, title="Error", border_style="red"))
+        """渲染红色错误。"""
+        self.err_console.print(f"[red]Error:[/] {message}")
 
     def blank_line(self) -> None:
         """在 stderr 输出一个空行，通常用于中断后的视觉分隔。"""
@@ -319,7 +368,152 @@ class TerminalUI:
         """截断过长工具参数，避免状态行过宽。"""
         return args_raw[:limit] + ("..." if len(args_raw) > limit else "")
 
+    @staticmethod
+    def _display_detail(detail: str, limit: int = 4000) -> str:
+        """截断过长失败明细，避免错误面板刷屏。"""
+        if len(detail) <= limit:
+            return detail
+        return detail[:limit].rstrip() + f"\n... (truncated, {len(detail)} total chars)"
+
 
 def _normalize_model_text(text: str) -> str:
     """归一化模型文本，避免整体缩进被 Markdown 误判为代码块。"""
     return textwrap.dedent(text).strip()
+
+
+def _markdown(text: str) -> Markdown:
+    """使用 light 风格 Markdown，避免默认黑底 inline code/code block。"""
+    return Markdown(
+        text,
+        code_theme=MARKDOWN_CODE_THEME,
+        inline_code_theme=MARKDOWN_CODE_THEME,
+    )
+
+
+class _WorkingStatus(AbstractContextManager[None]):
+    """后台刷新 Rich status，让同步阻塞调用也能展示耗时和超时阶段。"""
+
+    def __init__(
+        self,
+        console: Console,
+        message: str,
+        *,
+        timeout_seconds: float | None,
+        cancel_hint: str,
+        refresh_interval: float = 0.5,
+    ) -> None:
+        self.console = console
+        self.message = message
+        self.timeout_seconds = timeout_seconds
+        self.cancel_hint = cancel_hint
+        self.refresh_interval = refresh_interval
+        self._stop = Event()
+        self._started = 0.0
+        self._status = None
+        self._thread: Thread | None = None
+
+    def __enter__(self) -> None:
+        self._started = time.monotonic()
+        self._status = self.console.status(
+            _format_working_message(
+                self.message,
+                elapsed_seconds=0,
+                timeout_seconds=self.timeout_seconds,
+                cancel_hint=self.cancel_hint,
+            ),
+            spinner="dots",
+        )
+        self._status.__enter__()
+        self._thread = Thread(target=self._refresh, daemon=True)
+        self._thread.start()
+        return None
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self._status is not None:
+            self._status.__exit__(exc_type, exc, traceback)
+        return False
+
+    def _refresh(self) -> None:
+        while not self._stop.wait(self.refresh_interval):
+            elapsed = int(time.monotonic() - self._started)
+            if self._status is not None:
+                self._status.update(
+                    _format_working_message(
+                        self.message,
+                        elapsed_seconds=elapsed,
+                        timeout_seconds=self.timeout_seconds,
+                        cancel_hint=self.cancel_hint,
+                    )
+                )
+
+
+class _AssistantMessageStream(AbstractContextManager[Callable[[str], None]]):
+    """把模型文本增量直接写到 stdout，避免工具调用前的说明被完整响应阻塞。"""
+
+    def __init__(self, console: Console) -> None:
+        self.console = console
+        self.started = False
+
+    def __enter__(self) -> Callable[[str], None]:
+        return self.write
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        if self.started:
+            self.console.out("")
+            self.console.file.flush()
+        return False
+
+    def write(self, delta: str) -> None:
+        """写入一段模型文本；首个增量到达时再显示 assistant 标题。"""
+        if not delta:
+            return
+        if not self.started:
+            self.console.print("[bold cyan]assistant[/]")
+            self.started = True
+        self.console.out(delta, end="")
+        self.console.file.flush()
+
+
+def _format_working_message(
+    message: str,
+    *,
+    elapsed_seconds: int,
+    timeout_seconds: float | None,
+    cancel_hint: str,
+) -> str:
+    """格式化运行中状态，包含耗时、超时阈值和取消提示。"""
+    elapsed = max(0, elapsed_seconds)
+    if timeout_seconds is None:
+        suffix = f"{elapsed}s · {cancel_hint}"
+    else:
+        timeout_label = f"{timeout_seconds:g}s"
+        if elapsed < timeout_seconds:
+            suffix = f"{elapsed}s/{timeout_label} · {cancel_hint}"
+        else:
+            suffix = f"{elapsed}s/{timeout_label} · 已超过超时阈值，等待清理... · {cancel_hint}"
+    return f"[cyan]{message}[/] [dim]{suffix}[/]"
+
+
+def _assistant_display_text(text: str) -> str:
+    """提取最终回答文本；兼容 JSON Output 包装后的 content/message/answer。"""
+    normalized = _normalize_model_text(text)
+    if not normalized or not normalized.startswith("{"):
+        return normalized
+
+    try:
+        payload = json.loads(normalized)
+    except json.JSONDecodeError:
+        return normalized
+
+    if not isinstance(payload, dict):
+        return normalized
+
+    for key in ("content", "message", "answer"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return _normalize_model_text(value)
+
+    return normalized

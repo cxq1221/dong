@@ -6,8 +6,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from dong.logging_config import get_logger, log_event, preview_payload
 from dong.tool import ToolResult, registry
@@ -46,7 +47,35 @@ class GrepInput(BaseModel):
 class FetchInput(BaseModel):
     """fetch 工具入参：要 GET 的 URL 和超时时间。"""
     url: str
-    timeout: int = 15
+    timeout: int = Field(default=15, gt=0)
+
+class PlanItem(BaseModel):
+    """update_plan 单个步骤：描述任务和当前状态。"""
+    step: str = Field(description="One short step in the plan")
+    status: Literal["pending", "in_progress", "completed"] = Field(
+        description="Current status for this step",
+    )
+
+class UpdatePlanInput(BaseModel):
+    """update_plan 工具入参：一次性提交完整最新计划。"""
+    explanation: str = Field(
+        default="",
+        description="Optional short explanation for why the plan changed",
+    )
+    plan: list[PlanItem] = Field(
+        min_length=1,
+        description="Full current plan, not a partial patch",
+    )
+
+    @model_validator(mode="after")
+    def validate_plan_shape(self) -> "UpdatePlanInput":
+        """保持 Codex 风格约束：最多一个 in_progress，步骤不能为空。"""
+        in_progress_count = sum(1 for item in self.plan if item.status == "in_progress")
+        if in_progress_count > 1:
+            raise ValueError("at most one plan item may be in_progress")
+        if any(not item.step.strip() for item in self.plan):
+            raise ValueError("plan steps must be non-empty")
+        return self
 
 
 # ═══════════════════════════════════════
@@ -279,6 +308,35 @@ def fetch_tool(args: FetchInput, cwd: str) -> ToolResult:
         success=True,
         summary=f"🌐 GET {args.url} ({content_type}, {size} chars)",
         detail=text,
+    )
+
+
+@registry.register("update_plan", "Update the visible task plan")
+def update_plan_tool(args: UpdatePlanInput, cwd: str) -> ToolResult:
+    """更新当前任务计划，并返回适合展示给用户和模型继续引用的摘要。"""
+    status_labels = {
+        "pending": "pending",
+        "in_progress": "in_progress",
+        "completed": "completed",
+    }
+    lines = []
+    if args.explanation.strip():
+        lines.append(args.explanation.strip())
+        lines.append("")
+    for index, item in enumerate(args.plan, start=1):
+        lines.append(f"{index}. [{status_labels[item.status]}] {item.step.strip()}")
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "plan_updated",
+        items=len(args.plan),
+        in_progress=sum(1 for item in args.plan if item.status == "in_progress"),
+        completed=sum(1 for item in args.plan if item.status == "completed"),
+    )
+    return ToolResult(
+        success=True,
+        summary=f"Updated plan ({len(args.plan)} steps)",
+        detail="\n".join(lines),
     )
 
 
