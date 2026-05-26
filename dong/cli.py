@@ -1300,6 +1300,9 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "mcp":
         run_mcp_cli(sys.argv[2:])
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "help":
+        # 把 "help" 子命令重定向到 argparse 的 --help
+        sys.argv = [sys.argv[0], "--help"]
 
     # 解析 CLI 参数：模型、工作目录、最大轮数、预加载 skill、一次性 prompt。
     parser = argparse.ArgumentParser(description="dong — a minimal CLI coding agent")

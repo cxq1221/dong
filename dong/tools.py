@@ -1,6 +1,7 @@
 """内置工具实现：每个工具函数都通过 @registry.register() 暴露给模型。"""
 import logging
 import os
+import shutil
 import subprocess
 import urllib.error
 import urllib.parse
@@ -43,6 +44,9 @@ class GrepInput(BaseModel):
     """grep 工具入参：正则模式和搜索路径。"""
     pattern: str
     path: str = "."
+    glob: str = Field(default="", description="glob pattern to filter files, e.g. '*.py'")
+    type: str = Field(default="", description="file type filter, e.g. 'python', 'rust', 'js'")
+    head_limit: int = Field(default=0, description="max lines of output (0 = unlimited)")
 
 class FetchInput(BaseModel):
     """fetch 工具入参：要 GET 的 URL 和超时时间。"""
@@ -208,10 +212,14 @@ def bash_tool(args: BashInput, cwd: str) -> ToolResult:
         command_chars=len(args.command),
         command_preview=preview_payload(args.command),
     )
+    env = os.environ.copy()
+    local_bin = os.path.expanduser("~/.local/bin")
+    existing = env.get("PATH", "")
+    env["PATH"] = f"{local_bin}:{existing}"
     try:
         r = subprocess.run(
             args.command, shell=True, cwd=cwd,
-            capture_output=True, text=True, timeout=30,
+            env=env, capture_output=True, text=True, timeout=30,
         )
         out = r.stdout + r.stderr
         log_event(
@@ -238,11 +246,20 @@ def bash_tool(args: BashInput, cwd: str) -> ToolResult:
 
 @registry.register("grep", "Search for text in files using regex")
 def grep_tool(args: GrepInput, cwd: str) -> ToolResult:
-    """调用系统 grep 递归搜索文本，返回匹配摘要。"""
+    """优先使用 rg 搜索文本，不可用时回退到系统 grep。"""
+    cmd = _build_grep_cmd(args)
+    engine = "rg" if cmd[0] == "rg" else "grep"
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "grep_started",
+        engine=engine,
+        path=args.path,
+        pattern_chars=len(args.pattern),
+    )
     try:
         r = subprocess.run(
-            ["grep", "-rn", args.pattern, args.path],
-            cwd=cwd, capture_output=True, text=True, timeout=10,
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=10,
         )
         out = r.stdout.strip() or "(no matches)"
         if r.stderr:
@@ -252,6 +269,7 @@ def grep_tool(args: GrepInput, cwd: str) -> ToolResult:
             LOGGER,
             logging.WARNING,
             "grep_failed",
+            engine=engine,
             path=args.path,
             pattern_chars=len(args.pattern),
             error=type(e).__name__,
@@ -261,14 +279,40 @@ def grep_tool(args: GrepInput, cwd: str) -> ToolResult:
         LOGGER,
         logging.INFO,
         "grep_finished",
+        engine=engine,
         path=args.path,
         pattern_chars=len(args.pattern),
         returncode=r.returncode,
         output_chars=len(out),
     )
+    if args.head_limit > 0:
+        lines = out.split("\n")
+        out = "\n".join(lines[:args.head_limit])
+        if len(lines) > args.head_limit:
+            out += f"\n... (head_limit={args.head_limit}, {len(lines)} total lines)"
     if len(out) > 3000:
         out = out[:3000] + "\n... (truncated)"
-    return ToolResult(success=True, summary=f"🔍 '{args.pattern}'", detail=out)
+    return ToolResult(success=True, summary=f"🔍 '{args.pattern}' [{engine}]", detail=out)
+
+
+def _build_grep_cmd(args: GrepInput) -> list[str]:
+    """构建 rg（优先）或 grep 命令行参数，不发起实际调用。"""
+    # 优先使用 ripgrep
+    rg_path = shutil.which("rg")
+    if rg_path:
+        cmd = [rg_path, "--no-heading", "--color", "never", "-n", "--with-filename"]
+        if args.glob:
+            cmd.extend(["-g", args.glob])
+        if args.type:
+            cmd.extend(["-t", args.type])
+        cmd.extend(["--", args.pattern, args.path])
+        return cmd
+    # fallback: 系统 grep
+    cmd = ["grep", "-rnH"]
+    if args.glob:
+        cmd.extend(["--include", args.glob])
+    cmd.extend([args.pattern, args.path])
+    return cmd
 
 
 @registry.register("fetch", "GET a URL and return its content")
