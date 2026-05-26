@@ -8,6 +8,7 @@
 5. ⚠️任务完成后，需要使用skill：redundancy-gates 检查代码
 6. ⚠️所有代码都要增加中文注释，主要介绍流程和定义，每个类/文件开头要说明定义
 ## 注意事项
+- 每次增加新的特性，先调研 ../Projects/claw-code 的相关功能的实现方式
 - Code style: Python 3.11+, f-strings over %, type hints everywhere
 - Tools use `@registry.register()` decorator pattern
 - Tests: pytest, in `tests/`, one file per module

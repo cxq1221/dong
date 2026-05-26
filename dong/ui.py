@@ -17,6 +17,7 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
@@ -167,6 +168,7 @@ class TerminalUI:
         self.console = Console(file=self.stdout, highlight=False, theme=DONG_LIGHT_THEME)
         self.err_console = Console(file=self.stderr, highlight=False, theme=DONG_LIGHT_THEME)
         self._session: PromptSession[str] | None = None
+        self._background_input_mode = False
 
     def _interactive(self) -> bool:
         """判断当前是否处于可交互 TTY，用于决定是否启用 prompt_toolkit。"""
@@ -175,10 +177,20 @@ class TerminalUI:
             and getattr(self.stdout, "isatty", lambda: False)()
         )
 
-    def read_prompt(self, completions: Iterable[str] = ()) -> str:
+    def set_background_input_mode(self, enabled: bool) -> None:
+        """切换后台任务输入模式；此模式下避免使用会抢占光标的动态 status。"""
+        self._background_input_mode = enabled
+
+    def read_prompt(
+        self,
+        completions: Iterable[str] = (),
+        *,
+        prompt_text: str = "\ndong ",
+        bottom_toolbar: str | None = None,
+    ) -> str:
         """读取一次 REPL 输入；非 TTY 环境下退回到普通 input()。"""
         if not self._interactive():
-            return self.input_func("\ndong ")
+            return self.input_func(prompt_text)
 
         if self._session is None:
             self._session = PromptSession(history=InMemoryHistory())
@@ -214,14 +226,16 @@ class TerminalUI:
             if event.current_buffer.document.text_before_cursor.startswith("/"):
                 event.current_buffer.start_completion(select_first=False)
 
-        return self._session.prompt(
-            "\ndong ",
-            completer=completer,
-            complete_while_typing=True,
-            multiline=True,
-            enable_history_search=True,
-            key_bindings=key_bindings,
-        )
+        with patch_stdout():
+            return self._session.prompt(
+                prompt_text,
+                completer=completer,
+                complete_while_typing=True,
+                multiline=True,
+                enable_history_search=True,
+                key_bindings=key_bindings,
+                bottom_toolbar=bottom_toolbar,
+            )
 
     def confirm_dangerous_command(self, command: str, default: str = "n") -> bool:
         """对危险命令进行显式确认，默认拒绝。"""
@@ -231,6 +245,10 @@ class TerminalUI:
         self.err_console.print(Text(command, style="bold red"))
         answer = self.input_func(f"Run command?{suffix}").strip().lower()
         return answer in ("y", "yes") or (answer == "" and default == "y")
+
+    def show_auto_skill(self, name: str, reason: str) -> None:
+        """展示本轮自动选择的 skill，让隐式上下文变成可见决策。"""
+        self.err_console.print(f"  Auto skill: {name} ({reason})")
 
     def show_startup(
         self,
@@ -293,6 +311,11 @@ class TerminalUI:
         """提示工作目录已切换。"""
         self.err_console.print(f"  workdir -> {workdir}")
 
+    def show_input_queued(self, *, pending: int) -> None:
+        """提示用户输入已排队，会在当前任务后继续执行。"""
+        suffix = f" ({pending} pending)" if pending > 1 else ""
+        self.err_console.print(f"  [#57606a]queued input{suffix}[/]")
+
     def show_tool_cancelled(self, name: str, args_raw: str) -> None:
         """展示工具调用被取消的结果。"""
         display_args = self._display_args(args_raw)
@@ -324,6 +347,13 @@ class TerminalUI:
         cancel_hint: str = "Ctrl-C 取消当前任务",
     ) -> AbstractContextManager[None]:
         """显示当前正在执行的阶段；退出上下文时自动清理状态行。"""
+        if self._background_input_mode:
+            return _StaticWorkingStatus(
+                self.err_console,
+                message,
+                timeout_seconds=timeout_seconds,
+                cancel_hint=cancel_hint,
+            )
         return _WorkingStatus(
             self.err_console,
             message,
@@ -448,6 +478,35 @@ class _WorkingStatus(AbstractContextManager[None]):
                         cancel_hint=self.cancel_hint,
                     )
                 )
+
+
+class _StaticWorkingStatus(AbstractContextManager[None]):
+    """后台输入模式下的非动态工作提示，避免与输入行争抢光标。"""
+
+    def __init__(
+        self,
+        console: Console,
+        message: str,
+        *,
+        timeout_seconds: float | None,
+        cancel_hint: str,
+    ) -> None:
+        self.console = console
+        self.message = message
+        self.timeout_seconds = timeout_seconds
+        self.cancel_hint = cancel_hint
+
+    def __enter__(self) -> None:
+        self.console.print(_format_working_message(
+            self.message,
+            elapsed_seconds=0,
+            timeout_seconds=self.timeout_seconds,
+            cancel_hint="继续输入会排队",
+        ))
+        return None
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        return False
 
 
 class _AssistantMessageStream(AbstractContextManager[Callable[[str], None]]):

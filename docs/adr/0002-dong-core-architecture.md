@@ -13,8 +13,8 @@ dong/
 ├── __init__.py          # 空 Module，暴露公共 API
 ├── __main__.py          # python -m dong 入口，薄转发到 cli.main()
 ├── cli.py               # CLI 主入口 + Agent 循环 + Skill 管理 (~450L)
-├── llm.py               # OpenAI ChatCompletions 封装 (~130L)
-├── tools.py             # 内置工具实现（read/write/edit/bash/grep/fetch）(~450L)
+├── llm.py               # OpenAI Responses / ChatCompletions / Anthropic Messages 请求适配 (~250L)
+├── tools.py             # 内置工具实现（read/write/edit/bash/grep/fetch/update_plan）(~450L)
 ├── tool.py              # 工具框架：注册/校验/执行/结构化结果 (~150L)
 ├── ui.py                # 终端 UI 适配层（Rich + prompt_toolkit）(~325L)
 ├── logging_config.py    # 文件日志配置 / 结构化事件 (~200L)
@@ -39,7 +39,7 @@ dong/
 
 `cli.py` 中的 `run_loop()` 是核心 Agent 循环：
 
-1. 拼接 system prompt：内置 system + AGENTS.md（若存在）+ 已加载 Skills
+1. 拼接 system prompt：内置 system + DONG.md（若存在）+ 已加载 Skills
 2. while 循环（最多 20 轮工具调用）：
    - 调用 `llm.chat()` 传入 messages 和 tool definitions
    - 模型返回 tool_calls → 逐个执行 → 追加 tool result 消息
@@ -94,17 +94,17 @@ class ToolRegistry:
 
 ## 4. 内置工具设计（tools.py）
 
-### 5 个核心工具
+### 核心工具
 
 | 工具 | 功能 | 安全考虑 |
 |------|------|----------|
 | `read` | 读文件，返回带行号的文本 | 纯读，无副作用 |
 | `write` | 覆盖写入文件 | 无条件覆盖，由模型判断 |
 | `edit` | 唯一匹配的字符串替换 | 避免误替换；匹配不到时失败 |
-| `bash` | 执行 shell 命令，3s 超时 | 危险命令需用户确认；在 cwd 下执行 |
+| `bash` | 执行 shell 命令，30s 超时 | 危险命令需用户确认；在 cwd 下执行 |
 | `grep` | 正则搜索文件内容 | 纯读，无副作用 |
-
-另有 `fetch` 工具（HTTP GET）用于获取 URL 内容，15s 超时。
+| `fetch` | HTTP GET URL 内容，默认 15s 超时 | 只读取指定 URL，长响应会截断 |
+| `update_plan` | 更新当前任务计划 | 只返回计划摘要，不改项目文件 |
 
 ### 决策：cwd 作为工具共享上下文
 
@@ -122,19 +122,30 @@ class ToolRegistry:
 
 ## 5. LLM 层（llm.py）
 
-### 决策：OpenAI ChatCompletions 单次请求，非流式
+### 决策：内部接口保持 instructions，provider adapter 转换请求形状
 
 ```python
-def chat(messages, *, model, tools=None, ...) -> ChatCompletionMessage
+def chat(messages, tools, *, model=None, instructions="") -> ChatCompletionMessageLike
 ```
 
-- 基 URL 由 `DONG_BASE_URL` 环境变量控制，方便接入兼容 API
-- API Key 从 `DONG_API_KEY` 或 `OPENAI_API_KEY` 读取
-- 支持 `extra_body` 透传 DeepSeek V4 特有参数（thinking、reasoning_effort）
-- 返回完整 `ChatCompletionMessage`（含 content、tool_calls、reasoning_content）
+- OpenAI 基 URL 由 `DONG_BASE_URL` 环境变量控制，方便接入兼容 API
+- OpenAI API Key 从 `DONG_API_KEY` 或 `OPENAI_API_KEY` 读取
+- Anthropic 基 URL 由 `DONG_ANTHROPIC_BASE_URL` 控制，默认 `https://api.deepseek.com/anthropic`
+- Anthropic API Key 从 `DONG_ANTHROPIC_API_KEY` 读取，未设置时复用 `DONG_API_KEY`
+- 默认系统提示词由 `dong/default_agent_define.md` 提供，并通过 `instructions` 传给 LLM
+- `DONG_LLM_API=anthropic` 是默认请求形状，使用 Anthropic Messages API；`instructions` 放到顶层 `system`
+- DeepSeek Anthropic 兼容接口默认通过 `DONG_ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic` 接入
+- `DONG_LLM_API=chat` 使用 OpenAI 兼容 ChatCompletions，并把 `instructions` 兼容为首个 `system` message
+- `DONG_LLM_API=responses` 使用 OpenAI Responses API；`DONG_LLM_API=auto` 保留为探测模式，Responses 不支持时回退到 ChatCompletions
+- 支持 DeepSeek V4 ChatCompletions 特有参数（thinking、reasoning_effort）
+- 返回 CLI 主循环可消费的 assistant message 形状（含 content、tool_calls、reasoning_content）
 
 ### 后果
-- 无流式输出：用户需等待完整响应
+- 流式输出：ChatCompletions 和 Anthropic Messages Adapter 都会把文本 delta 交给 UI，同时累积完整 assistant message 供工具循环使用
+- 默认请求形状贴近 Codex 的 `instructions + input + tools` Interface
+- DeepSeek 等 OpenAI 兼容服务仍可通过 `chat` 模式运行，但不再把 Responses 失败探测作为推荐路径
+- Anthropic / DeepSeek Anthropic provider 的工具调用会在 adapter 中转换为 `tool_use` / `tool_result`
+- `DONG_RESPONSE_FORMAT=json_object` 只映射 OpenAI Responses / ChatCompletions 请求参数；Anthropic provider 暂依赖 prompt 约束
 - reasoning_content 由 UI 层单独渲染为 thinking 面板
 
 ---
@@ -280,6 +291,7 @@ dong logs [选项]          # 日志查看
 ## 12. 依赖策略
 
 ### 运行时依赖
+- `anthropic` — Anthropic Messages API 调用
 - `openai` — LLM API 调用
 - `playwright` — fetch 工具使用（HTTP GET，通过 playwright 的 sync_api）
 - `prompt-toolkit` — REPL 输入补全与历史
@@ -299,3 +311,34 @@ dong logs [选项]          # 日志查看
 ### 后果
 - 总依赖数 ~5 个运行时库，安装体积小
 - 所有核心逻辑（Agent 循环、工具执行、补全）均为自研，可控性强
+
+---
+
+## 10. 上下文压缩与文件化留痕
+
+### 决策：预算感知压缩 + 最近消息原样保留
+
+`cli.py` 的 `trim_context()` 不再只依赖固定消息条数。它会同时检查：
+
+- 最近消息条数预算：默认保留 14 条 working 消息
+- 上下文字符预算：默认 `DONG_CONTEXT_MAX_CHARS=24000`
+
+当任一预算超限时，dong 会把旧消息压缩成一条合成 `system` 摘要，并保留最近消息原文继续对话。摘要生成是本地确定性规则，不额外调用 LLM，也不引入 tokenizer 或数据库。
+
+### 文件存储
+
+每次发生压缩时，完整摘要写入项目内：
+
+```text
+.dong/context/compact-YYYYMMDDTHHMMSSZ.md
+```
+
+运行时上下文只引用这份摘要文件路径和短摘要内容。这样可以满足“上下文优化有留痕、但不引入数据库”的约束。
+
+### Tool 调用边界
+
+压缩边界会回退到安全点，避免保留孤立 `tool` 消息。也就是说，如果最近窗口从工具结果开始，dong 会把对应的 assistant `tool_call` 一起保留下来，避免 OpenAI 兼容接口因为 tool/result 配对断裂返回 400。
+
+### 参考来源
+
+该策略参考了 `../Projects/claw-code/rust/crates/runtime/src/compact.rs` 的核心做法：旧上下文摘要化、最近消息原样保留、tool-use/tool-result 边界保护、重复压缩时避免摘要无限嵌套。dong 采用更小的实现：字符预算近似 token，摘要文件落盘，不做跨进程会话恢复。

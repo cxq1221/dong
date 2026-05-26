@@ -1,28 +1,44 @@
 # Dong CLI
 
-Dong is a minimal CLI coding agent whose first UI improvement phase preserves existing command behavior while improving terminal input and rendering.
+Dong is a minimal CLI coding agent whose interactive experience is moving from an inline scrolling REPL to a Codex-like fullscreen terminal UI.
 
 ## Language
 
-**Behavior-Compatible UI Phase**:
-A UI improvement phase that keeps existing command names, arguments, REPL commands, tool execution behavior, and agent loop semantics unchanged.
-_Avoid_: rewrite, full-screen mode
+**Codex-like Fullscreen TUI Phase**:
+The replacement interactive UI phase where bare `dong` owns the terminal layout, keeps a fixed composer visible, and renders all agent output through a transcript.
+_Avoid_: inline REPL phase, scrolling prompt patch, Rich direct terminal writes
 
 **Inline REPL**:
-The terminal interaction mode where the conversation scrolls in the main terminal and prompts are read one turn at a time.
-_Avoid_: fullscreen TUI, dashboard
+The former terminal interaction mode where conversation output and the next prompt shared the same scrolling terminal region.
+_Avoid_: default interactive mode, persistent composer
 
 **Terminal UI Module**:
 The module that owns terminal input, confirmation prompts, startup notices, assistant rendering, tool-result rendering, and user-visible errors.
 _Avoid_: agent loop, tool registry
 
+**Persistent Composer**:
+The fixed bottom input area that remains available while the agent is thinking or executing tools.
+_Avoid_: next prompt, queued line prompt
+
+**Transcript**:
+The scrollable output area that displays assistant, thinking, tool, warning, and error events.
+_Avoid_: stdout log, raw terminal scrollback
+
+**TUI UI Adapter**:
+The adapter that implements the existing agent-loop UI methods by enqueueing transcript/status events instead of printing directly to the terminal.
+_Avoid_: direct Console.print, agent-loop rewrite
+
+**Offscreen Rich Rendering**:
+Rendering Rich Markdown and styled content into ANSI/text artifacts before handing them to the fullscreen TUI layout.
+_Avoid_: Rich Live, direct Rich status, semantic Markdown widget
+
 **First-Phase Prompt Input**:
-The initial prompt_toolkit input experience: prompt history, optional history search, multiline entry, built-in command and skill completion, paste-safe input, and compatible interrupt behavior.
+The prompt_toolkit input experience inside the **Persistent Composer**: prompt history, optional history search, multiline entry, built-in command and skill completion, paste-safe input, and compatible interrupt behavior.
 _Avoid_: command palette, fuzzy finder, Vim mode
 
 **First-Phase Rich Rendering**:
-The initial Rich output experience: structured startup notices, Markdown assistant messages, concise tool-result lines, clear errors, warning styling, and dangerous-command confirmation panels without live dashboards.
-_Avoid_: live token HUD, fullscreen layout, interactive folding, streaming Markdown
+The initial Rich output experience rendered through **Offscreen Rich Rendering** into the **Transcript**.
+_Avoid_: direct Rich terminal writes, interactive folding, mouse selection
 
 **Behavior Compatibility Tests**:
 Tests that prove existing CLI commands, tool execution semantics, and entry modes still work while asserting only stable UI text or return behavior instead of exact ANSI snapshots.
@@ -33,15 +49,17 @@ The runtime diagnostic stream written by dong into `logs/dong.log`, with `dong l
 _Avoid_: ad hoc print debugging, prompt dumps
 
 **First-Phase UI Dependencies**:
-The first UI phase may add Rich and prompt_toolkit while keeping argparse and deferring Typer or fullscreen frameworks.
+The first fullscreen TUI phase uses Rich and prompt_toolkit.Application while keeping argparse and avoiding Textual.
 _Avoid_: Typer migration, Textual dependency
 
 ## Relationships
 
-- A **Behavior-Compatible UI Phase** preserves the **Inline REPL**.
-- The **Inline REPL** can improve input and rendering without changing tool execution semantics.
+- The **Codex-like Fullscreen TUI Phase** replaces the **Inline REPL** as the default bare `dong` interactive mode.
+- The **Codex-like Fullscreen TUI Phase** uses a **Persistent Composer** and a **Transcript**.
 - A **Terminal UI Module** adapts Rich and prompt_toolkit behind a small interface.
 - The agent loop calls the **Terminal UI Module** but still owns turn ordering and tool execution.
+- A **TUI UI Adapter** preserves the agent-loop UI method surface while routing output into the **Transcript**.
+- **Offscreen Rich Rendering** lets **First-Phase Rich Rendering** coexist with a **Persistent Composer**.
 - **Operational File Logging** records the agent loop, LLM adapter, skill loading, and tool execution paths without changing user-visible terminal output, then exposes filtered local inspection through `dong logs`.
 - **First-Phase Prompt Input** belongs inside the **Terminal UI Module**.
 - **First-Phase Rich Rendering** belongs inside the **Terminal UI Module**.
@@ -50,17 +68,17 @@ _Avoid_: Typer migration, Textual dependency
 
 ## Example dialogue
 
-> **Dev:** "Can we use Rich and prompt_toolkit in the first UI pass?"
-> **Domain expert:** "Yes, as long as it remains a **Behavior-Compatible UI Phase** and preserves the **Inline REPL**."
+> **Dev:** "Should bare `dong` keep using the old scrolling prompt?"
+> **Domain expert:** "No — the **Codex-like Fullscreen TUI Phase** replaces the **Inline REPL** for the default interactive mode."
 
 > **Dev:** "Should the new UI module execute tools?"
 > **Domain expert:** "No — the **Terminal UI Module** renders tool results, but the agent loop still owns execution."
 
-> **Dev:** "Should phase one add a command palette or Vim mode?"
-> **Domain expert:** "No — phase one uses **First-Phase Prompt Input** and keeps richer navigation for later."
+> **Dev:** "Can Rich Markdown write directly to the terminal while the composer is visible?"
+> **Domain expert:** "No — use **Offscreen Rich Rendering** so the **Transcript** and **Persistent Composer** stay under one TUI layout."
 
-> **Dev:** "Should phase one show a live token dashboard?"
-> **Domain expert:** "No — phase one uses **First-Phase Rich Rendering** because LLM calls are non-streaming today."
+> **Dev:** "Should input typed while the agent works modify the current LLM/tool turn?"
+> **Domain expert:** "No — the **Persistent Composer** queues the next message; the active turn remains unchanged."
 
 > **Dev:** "Should tests snapshot every ANSI escape emitted by Rich?"
 > **Domain expert:** "No — **Behavior Compatibility Tests** assert stable behavior and key text, not brittle ANSI output."
@@ -70,4 +88,4 @@ _Avoid_: Typer migration, Textual dependency
 
 ## Flagged ambiguities
 
-- "CLI UI" could mean a fullscreen terminal app or the existing scrolling REPL; resolved for phase one as **Inline REPL**.
+- "CLI UI" previously meant **Inline REPL** improvements; resolved now as the **Codex-like Fullscreen TUI Phase** for bare `dong`.

@@ -60,6 +60,19 @@ def _read_available(fd: int, *, duration: float = 0.5) -> str:
     return "".join(chunks)
 
 
+def _wait_file_contains(path, needle: str, *, timeout: float = 5.0) -> str:
+    """等待文件内容包含指定文本。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            text = path.read_text(encoding="utf-8")
+            if needle in text:
+                return text
+        time.sleep(0.05)
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    raise AssertionError(f"timed out waiting for {needle!r}; file was:\n{text}")
+
+
 def test_interactive_tty_repl_shows_slash_skill_menu_and_runs_commands(tmp_path) -> None:
     """真实 TTY 下输入 / 应显示 skill 候选，并可继续执行 REPL 命令。"""
     _write(tmp_path / ".dong" / "skills" / "review.md", "# Review")
@@ -96,21 +109,130 @@ def test_interactive_tty_repl_shows_slash_skill_menu_and_runs_commands(tmp_path)
 
         _read_available(master_fd, duration=0.2)
         os.write(master_fd, b"re")
-        filtered_output = _read_until(master_fd, "/review")
-        assert "/review" in filtered_output
+        filtered_output = _read_until(master_fd, "review")
+        assert "review" in filtered_output
 
         # Clear the partially typed slash command, then exercise real REPL commands.
         os.write(master_fd, b"\x15/skill review\r")
         load_output = _read_until(master_fd, "Loaded skill")
         assert "review" in load_output
-        _read_until(master_fd, "dong", timeout=2.0)
 
         os.write(master_fd, b"/unskill review\r")
         remove_output = _read_until(master_fd, "Removed skill: review")
         assert "Removed skill: review" in remove_output
-        _read_until(master_fd, "dong", timeout=2.0)
 
-        os.write(master_fd, b"exit\r")
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+        _read_available(master_fd, duration=0.1)
+        os.close(master_fd)
+
+
+def test_interactive_tty_tui_accepts_input_while_agent_is_working(tmp_path) -> None:
+    """全屏 TUI 下第一条仍在执行时，第二条输入应被接收并排队执行。"""
+    runner = tmp_path / "run_fake_dong.py"
+    calls_log = tmp_path / "calls.log"
+    _write(
+        runner,
+        f"""
+import sys
+import time
+from types import SimpleNamespace
+
+from dong import cli
+
+
+def fake_chat(messages, _tools, instructions="", **kwargs):
+    prompt = [m for m in messages if isinstance(m, dict) and m.get("role") == "user"][-1]["content"]
+    with open({str(calls_log)!r}, "a", encoding="utf-8") as f:
+        f.write(f"start {{prompt}}\\n")
+        f.flush()
+    if prompt == "first":
+        time.sleep(1.0)
+    with open({str(calls_log)!r}, "a", encoding="utf-8") as f:
+        f.write(f"end {{prompt}}\\n")
+        f.flush()
+    return SimpleNamespace(role="assistant", content=f"done {{prompt}}", tool_calls=[])
+
+
+cli.chat = fake_chat
+sys.argv = ["dong", "-d", {str(tmp_path)!r}]
+cli.main()
+""",
+    )
+
+    master_fd, slave_fd = pty.openpty()
+    os.set_blocking(master_fd, False)
+    env = {
+        **os.environ,
+        "TERM": "xterm-256color",
+        "PROMPT_TOOLKIT_NO_CPR": "1",
+        "PYTHONUNBUFFERED": "1",
+    }
+    proc = subprocess.Popen(
+        [sys.executable, str(runner)],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=os.getcwd(),
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    try:
+        _read_until(master_fd, "dong")
+
+        os.write(master_fd, b"first\r")
+        _read_until(master_fd, "working", timeout=3.0)
+        os.write(master_fd, b"second\r")
+
+        output = _read_until(master_fd, "done first", timeout=8.0)
+        assert "done first" in output
+        assert "queued 1" in output
+        calls = _wait_file_contains(
+            calls_log,
+            "start first\nend first\nstart second\nend second",
+            timeout=8.0,
+        )
+        assert calls.splitlines()[:4] == [
+            "start first",
+            "end first",
+            "start second",
+            "end second",
+        ]
+
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+        _read_available(master_fd, duration=0.1)
+        os.close(master_fd)
+
+
+def test_interactive_tty_tui_ctrl_d_exits(tmp_path) -> None:
+    """Ctrl-D 应直接退出全屏 TUI。"""
+    master_fd, slave_fd = pty.openpty()
+    os.set_blocking(master_fd, False)
+    env = {
+        **os.environ,
+        "TERM": "xterm-256color",
+        "PROMPT_TOOLKIT_NO_CPR": "1",
+        "PYTHONUNBUFFERED": "1",
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "dong", "-d", str(tmp_path)],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=os.getcwd(),
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    try:
+        _read_until(master_fd, "dong")
+        os.write(master_fd, b"\x04")
         proc.wait(timeout=5)
         assert proc.returncode == 0
     finally:

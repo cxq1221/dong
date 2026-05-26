@@ -4,15 +4,35 @@ import logging
 import os
 import re
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from importlib import resources
+from queue import Empty, Queue
+from threading import Event, Thread
 
 from dong.log_viewer import LogFilter, stream_logs
 from dong.llm import chat, get_model_name
 from dong.logging_config import configure_logging, get_logger, log_event
 from dong.mcp import McpConfigFile, McpManager, configured_server_names, config_path
+from dong.skill_router import SkillRouteDecision, route_skills
+from dong.skills import (
+    SKILLS_RELPATH,
+    SkillInfo as SkillInfo,
+    SkillInvocation as SkillInvocation,
+    SkillSource as SkillSource,
+    _codex_skills_dir,
+    _skill_entry_names,
+    build_skill_messages,
+    describe_loaded_skills,
+    describe_skills,
+    list_skills,
+    load_skill,
+    parse_skill_invocation,
+    print_skill_status as print_skill_status,
+    resolve_skill,
+)
 from dong.tool import ToolResult
 from dong.tools import TOOL_DEFS, execute, _is_dangerous, _validate_path
 from dong.ui import TerminalUI
@@ -20,8 +40,6 @@ from dong.ui import TerminalUI
 LOGGER = get_logger(__name__)
 
 DEFAULT_AGENT_DEFINE_FILENAME = "default_agent_define.md"
-SKILLS_RELPATH = ".dong/skills"
-CODEX_SKILLS_RELPATH = "skills"
 DONG_RULE_CANDIDATES = ["DONG.md", ".dong/DONG.md"]
 CONTEXT_SUMMARY_RELPATH = ".dong/context"
 CONTEXT_SUMMARY_PREFIX = "--- Compacted conversation context ---"
@@ -42,33 +60,6 @@ def load_default_instructions() -> str:
 
 # 兼容旧测试和外部导入；真实请求会把它放入 instructions，而不是 messages。
 SYSTEM_PROMPT = load_default_instructions()
-
-
-@dataclass(frozen=True)
-class SkillInfo:
-    """一个 skill 的发现结果和最终选中的来源。"""
-    name: str
-    description: str | None
-    sources: tuple[str, ...]
-    selected_source: str
-    selected_path: str
-
-
-@dataclass(frozen=True)
-class SkillSource:
-    """单个 skill 文件解析出的来源和展示元数据。"""
-    name: str
-    entry_name: str
-    description: str | None
-    source: str
-    path: str
-
-
-@dataclass(frozen=True)
-class SkillInvocation:
-    """slash skill 调用解析后的结果，包含 skill 元信息和用户 prompt。"""
-    info: SkillInfo
-    prompt: str
 
 
 @dataclass(frozen=True)
@@ -114,226 +105,8 @@ def load_dong_md(workdir):
 
 
 # ═══════════════════════════════════════
-#  Skill 管理
+#  Skill 状态展示与 prompt 组装
 # ═══════════════════════════════════════
-
-def _skills_dir(workdir: str) -> str:
-    """返回项目本地 skill 目录。"""
-    return os.path.join(workdir, SKILLS_RELPATH)
-
-
-def _codex_skills_dir() -> str:
-    """返回全局 Codex skill 目录，允许 CODEX_HOME 覆盖默认位置。"""
-    codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-    return os.path.join(os.path.abspath(codex_home), CODEX_SKILLS_RELPATH)
-
-
-def _validate_skill_name(name: str) -> None:
-    """限制 skill 名只能是单个路径段，防止通过名称做路径穿越。"""
-    if not _is_valid_skill_name(name):
-        raise FileNotFoundError(f"Invalid skill name: {name!r}")
-
-
-def _is_valid_skill_name(name: str | None) -> bool:
-    """判断 skill 名是否能安全用作命令入口和路径段。"""
-    return bool(name) and name == os.path.basename(name) and name not in (".", "..")
-
-
-def _validate_path_under(root: str, *parts: str, follow_symlinks: bool = True) -> str:
-    """把路径解析到 root 内部；可选择是否跟随符号链接。"""
-    resolve = os.path.realpath if follow_symlinks else os.path.abspath
-    root_path = resolve(root)
-    path = resolve(os.path.join(root_path, *parts))
-    if path != root_path and not path.startswith(root_path + os.sep):
-        raise PermissionError(f"Path traversal denied: {os.path.join(*parts)} → {path}")
-    return path
-
-
-def _parse_skill_frontmatter(content: str) -> tuple[str | None, str | None]:
-    """解析 SKILL.md 顶部 frontmatter 中的 name/description 元数据。"""
-    lines = content.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return None, None
-
-    name = None
-    description = None
-    for line in lines[1:]:
-        stripped = line.strip()
-        if stripped == "---":
-            break
-        if stripped.startswith("name:"):
-            name = _unquote_frontmatter_value(stripped.removeprefix("name:").strip())
-        elif stripped.startswith("description:"):
-            description = _unquote_frontmatter_value(
-                stripped.removeprefix("description:").strip(),
-            )
-    return name or None, description or None
-
-
-def _unquote_frontmatter_value(value: str) -> str:
-    """去掉 frontmatter 单行值两侧的简单引号，保持解析逻辑轻量。"""
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-        value = value[1:-1]
-    return value.strip()
-
-
-def _skill_source_from_path(source: str, path: str, fallback_name: str) -> SkillSource:
-    """从 skill 文件读取展示名和说明；解析失败时退回路径名。"""
-    content = open(path, encoding="utf-8").read()
-    metadata_name, description = _parse_skill_frontmatter(content)
-    name = metadata_name if _is_valid_skill_name(metadata_name) else fallback_name
-    return SkillSource(
-        name=name,
-        entry_name=fallback_name,
-        description=description,
-        source=source,
-        path=path,
-    )
-
-
-def _discover_skill_sources(workdir: str) -> list[SkillSource]:
-    """按优先级扫描所有 skill 文件，并解析 name/description 元数据。"""
-    sources = []
-
-    local_root = _skills_dir(workdir)
-    if os.path.isdir(local_root):
-        for entry_name in sorted(os.listdir(local_root)):
-            if entry_name.startswith("."):
-                continue
-            if entry_name.endswith(".md"):
-                fallback_name = os.path.splitext(entry_name)[0]
-                if not _is_valid_skill_name(fallback_name):
-                    continue
-                path = _validate_path_under(local_root, entry_name)
-                if os.path.isfile(path):
-                    sources.append(_skill_source_from_path("local", path, fallback_name))
-                continue
-            if not _is_valid_skill_name(entry_name):
-                continue
-            path = _validate_path_under(
-                local_root,
-                entry_name,
-                "SKILL.md",
-                follow_symlinks=False,
-            )
-            if os.path.isfile(path):
-                sources.append(_skill_source_from_path("local", path, entry_name))
-
-    codex_root = _codex_skills_dir()
-    if os.path.isdir(codex_root):
-        for dirname in sorted(os.listdir(codex_root)):
-            if dirname.startswith(".") or not _is_valid_skill_name(dirname):
-                continue
-            path = _validate_path_under(
-                codex_root,
-                dirname,
-                "SKILL.md",
-                follow_symlinks=False,
-            )
-            if os.path.isfile(path):
-                sources.append(_skill_source_from_path("codex", path, dirname))
-
-    return sources
-
-
-def _skill_sources(workdir: str, name: str) -> list[SkillSource]:
-    """按优先级查找本地和全局两类 skill 来源，支持 frontmatter name 别名。"""
-    _validate_skill_name(name)
-    sources = [
-        source
-        for source in _discover_skill_sources(workdir)
-        if name in (source.name, source.entry_name)
-    ]
-
-    log_event(
-        LOGGER,
-        logging.DEBUG,
-        "skill_sources_resolved",
-        skill=name,
-        sources=[source.source for source in sources],
-    )
-    return sources
-
-
-def _format_skill_info(info: SkillInfo) -> str:
-    """把 skill 元信息格式化成人类可读的一行状态。"""
-    summary = f"{info.name} ({', '.join(info.sources)})"
-    if info.description:
-        summary = f"{summary} - {info.description}"
-    return summary
-
-
-def _available_skill_infos(workdir: str) -> list[SkillInfo]:
-    """扫描项目本地和全局目录，合并同名 skill 的可用来源。"""
-    found: dict[str, list[SkillSource]] = {}
-    for source in _discover_skill_sources(workdir):
-        found.setdefault(source.name, []).append(source)
-
-    infos = []
-    for name in sorted(found):
-        sources = found[name]
-        if not sources:
-            continue
-        infos.append(SkillInfo(
-            name=name,
-            description=sources[0].description,
-            sources=tuple(source.source for source in sources),
-            selected_source=sources[0].source,
-            selected_path=sources[0].path,
-        ))
-    return infos
-
-
-def list_skills(workdir: str) -> list[str]:
-    """列出可用 skill 名称。"""
-    return [info.name for info in _available_skill_infos(workdir)]
-
-
-def _skill_entry_names(workdir: str) -> list[str]:
-    """列出可用于调用 skill 的规范名和路径别名。"""
-    names = set()
-    for source in _discover_skill_sources(workdir):
-        names.add(source.name)
-        names.add(source.entry_name)
-    return sorted(names)
-
-
-def describe_skills(workdir: str) -> list[str]:
-    """列出可用 skill 及其来源，用于 CLI 展示。"""
-    return [_format_skill_info(info) for info in _available_skill_infos(workdir)]
-
-
-def describe_loaded_skills(workdir: str, loaded_skills: list[str]) -> list[str]:
-    """描述当前已加载 skill；缺失项也显式标记出来。"""
-    loaded = []
-    for name in loaded_skills:
-        try:
-            info = resolve_skill(workdir, name)
-            loaded.append(f"{info.name} ({info.selected_source})")
-        except FileNotFoundError:
-            loaded.append(f"{name} (missing)")
-    return loaded
-
-
-def print_items(label: str, items: list[str], indent: str = "  ") -> None:
-    """向 stderr 打印带缩进的列表。"""
-    print(f"{indent}{label}:", file=sys.stderr)
-    for item in items:
-        print(f"{indent}  {item}", file=sys.stderr)
-
-
-def print_skill_status(workdir: str, loaded_skills: list[str]) -> None:
-    """在非 rich 路径下输出 skill 可用/已加载状态。"""
-    avail = describe_skills(workdir)
-    if avail:
-        print_items("Available", avail)
-    else:
-        print(f"  (no skills in {SKILLS_RELPATH}/ or {_codex_skills_dir()}/)", file=sys.stderr)
-    if loaded_skills:
-        print_items("Loaded", describe_loaded_skills(workdir, loaded_skills))
-    else:
-        print("  (no skills loaded)", file=sys.stderr)
-
 
 def show_skill_status(ui: TerminalUI, workdir: str, loaded_skills: list[str]) -> None:
     """通过 UI 适配层展示 skill 可用/已加载状态。"""
@@ -352,87 +125,56 @@ def show_skill_status(ui: TerminalUI, workdir: str, loaded_skills: list[str]) ->
         ui.err_console.print("  (no skills loaded)")
 
 
-def parse_skill_invocation(workdir: str, inp: str) -> SkillInvocation | None:
-    """把 `/skill-name prompt` 快捷语法解析成加载并运行 skill 的请求。"""
-    if not inp.startswith("/") or inp == "/":
-        return None
-    command, _, prompt = inp[1:].partition(" ")
-    name = command.strip()
-    if not name:
-        return None
-    return SkillInvocation(info=resolve_skill(workdir, name), prompt=prompt.strip())
-
-
-def resolve_skill(workdir: str, name: str) -> SkillInfo:
-    """解析 skill 名称；不存在时返回带候选列表的错误。"""
-    sources = _skill_sources(workdir, name)
-    if not sources:
-        log_event(LOGGER, logging.WARNING, "skill_missing", skill=name, workdir=workdir)
-        avail = describe_skills(workdir)
-        if avail:
-            hint = "Available:\n  " + "\n  ".join(avail)
-        else:
-            hint = "(no skills yet)"
-        raise FileNotFoundError(f"Skill '{name}' not found. {hint}")
-    return SkillInfo(
-        name=sources[0].name,
-        description=sources[0].description,
-        sources=tuple(source.source for source in sources),
-        selected_source=sources[0].source,
-        selected_path=sources[0].path,
-    )
-
-
-def load_skill(workdir: str, name: str) -> tuple[SkillInfo, str]:
-    """读取已解析 skill 的文件内容。"""
-    info = resolve_skill(workdir, name)
-    content = open(info.selected_path, encoding="utf-8").read().strip()
-    log_event(
-        LOGGER,
-        logging.INFO,
-        "skill_loaded",
-        skill=name,
-        source=info.selected_source,
-        chars=len(content),
-    )
-    return info, content
-
-
-def _skill_system_content(info: SkillInfo, content: str) -> str:
-    """把 skill 内容和其文件位置一起注入，明确相对路径解析规则。"""
-    skill_dir = os.path.dirname(info.selected_path)
-    return (
-        f"--- Skill: {info.name} ({info.selected_source}) ---\n"
-        f"Skill path: {info.selected_path}\n"
-        f"Skill dir: {skill_dir}\n"
-        "Relative path rule: resolve paths mentioned by this skill, such as "
-        "`scripts/...`, `references/...`, or `assets/...`, relative to Skill dir. "
-        "Use the resolved path when calling tools.\n\n"
-        f"{content}"
-    )
-
-
-def build_messages(loaded_skills, workdir):
+def build_messages(loaded_skills: list[str], workdir: str) -> list[dict[str, str]]:
     """构建动态系统消息；默认系统提示词由 instructions 单独承载。"""
-    msgs = []
+    messages = []
     project_rules = load_dong_md(workdir)
     if project_rules:
-        msgs.append(project_rules)
-    for sname in loaded_skills:
-        try:
-            info, content = load_skill(workdir, sname)
-            msgs.append({
-                "role": "system",
-                "content": _skill_system_content(info, content),
-            })
-        except FileNotFoundError:
-            pass
-    return msgs
+        messages.append(project_rules)
+    messages.extend(build_skill_messages(loaded_skills, workdir))
+    return messages
 
 
-def build_agent_prompt(loaded_skills, workdir) -> AgentPrompt:
+def build_agent_prompt(loaded_skills: list[str], workdir: str) -> AgentPrompt:
     """构建固定 agent prompt，把所有 system 内容集中到 instructions。"""
     return _agent_prompt_from_messages(build_messages(loaded_skills, workdir))
+
+
+def _skills_for_turn(
+    loaded_skills: list[str],
+    auto_decision: SkillRouteDecision | None,
+) -> list[str]:
+    """合并常驻 skill 和当前轮自动 skill；自动 skill 不写回会话状态。"""
+
+    skills = list(loaded_skills)
+    for name in (auto_decision.selected if auto_decision else ()):
+        if name not in skills:
+            skills.append(name)
+    return skills
+
+
+def _route_auto_skills(
+    prompt: str,
+    *,
+    workdir: str,
+    loaded_skills: list[str],
+    ui: TerminalUI,
+) -> SkillRouteDecision:
+    """执行自动 skill 路由并输出一行可见提示，方便用户理解本轮上下文。"""
+
+    decision = route_skills(prompt, workdir, loaded_skills=loaded_skills)
+    if decision.selected:
+        for skill_name in decision.selected:
+            ui.show_auto_skill(skill_name, decision.reason)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "auto_skill_selected",
+            skills=list(decision.selected),
+            confidence=decision.confidence,
+            reason=decision.reason,
+        )
+    return decision
 
 
 def _agent_prompt_from_messages(messages: list) -> AgentPrompt:
@@ -805,11 +547,17 @@ def _chat_with_streaming_ui(messages, tool_defs, instructions: str, ui: Terminal
     working_status = ui.show_working("AI 正在思考...")
     working_active = True
     working_entered = False
+    reasoning_stream_factory = getattr(ui, "stream_reasoning_message", None)
 
     try:
         working_status.__enter__()
         working_entered = True
-        with ui.stream_assistant_message() as write_delta:
+        reasoning_stream = (
+            reasoning_stream_factory()
+            if callable(reasoning_stream_factory)
+            else nullcontext(lambda _delta: None)
+        )
+        with ui.stream_assistant_message() as write_delta, reasoning_stream as write_reasoning_delta:
 
             def on_text_delta(delta: str) -> None:
                 nonlocal working_active
@@ -820,11 +568,17 @@ def _chat_with_streaming_ui(messages, tool_defs, instructions: str, ui: Terminal
                     working_active = False
                 write_delta(delta)
 
+            def on_reasoning_delta(delta: str) -> None:
+                if not delta:
+                    return
+                write_reasoning_delta(delta)
+
             message = chat(
                 messages,
                 tool_defs,
                 instructions=instructions,
                 on_text_delta=on_text_delta,
+                on_reasoning_delta=on_reasoning_delta,
             )
     except BaseException as exc:
         if working_active and working_entered:
@@ -1252,6 +1006,193 @@ def handle_repl_command(
     return ReplAction(handled=False)
 
 
+def _is_repl_exit_input(inp: str) -> bool:
+    """判断用户输入是否是退出 REPL 的命令。"""
+    return inp.strip() in ("exit", "quit", "/bye")
+
+
+def _process_repl_input(
+    inp: str,
+    *,
+    workdir: str,
+    loaded_skills: list[str],
+    working: list,
+    ui: TerminalUI,
+    max_turns: int,
+    enable_mcp: bool,
+) -> tuple[str, bool]:
+    """处理一条 REPL 输入；返回新的 workdir 和是否请求退出。"""
+    inp = inp.strip()
+    if not inp:
+        return workdir, False
+
+    action = handle_repl_command(
+        inp,
+        workdir=workdir,
+        loaded_skills=loaded_skills,
+        working=working,
+        ui=ui,
+    )
+    if action.exit_requested:
+        return workdir, True
+    if action.workdir is not None:
+        return action.workdir, False
+    if action.handled and action.prompt is None:
+        return workdir, False
+
+    prompt = action.prompt if action.prompt is not None else inp
+    auto_decision = None
+    if action.prompt is None:
+        log_event(LOGGER, logging.INFO, "repl_prompt_received", prompt_chars=len(inp))
+        auto_decision = _route_auto_skills(
+            prompt,
+            workdir=workdir,
+            loaded_skills=loaded_skills,
+            ui=ui,
+        )
+
+    working.append({"role": "user", "content": prompt})
+    base_sys = build_agent_prompt(_skills_for_turn(loaded_skills, auto_decision), workdir)
+    run_loop(base_sys, working, workdir, max_turns=max_turns, ui=ui, enable_mcp=enable_mcp)
+    working[:] = trim_context(working, workdir=workdir)
+    return workdir, False
+
+
+def _run_repl_sync(
+    *,
+    workdir: str,
+    loaded_skills: list[str],
+    working: list,
+    ui: TerminalUI,
+    max_turns: int,
+    enable_mcp: bool,
+) -> None:
+    """非交互输入流使用的同步 REPL，保持管道和测试行为稳定。"""
+    while True:
+        try:
+            inp = ui.read_prompt(repl_completions(workdir, loaded_skills))
+        except (EOFError, KeyboardInterrupt):
+            ui.blank_line()
+            break
+
+        workdir, exit_requested = _process_repl_input(
+            inp,
+            workdir=workdir,
+            loaded_skills=loaded_skills,
+            working=working,
+            ui=ui,
+            max_turns=max_turns,
+            enable_mcp=enable_mcp,
+        )
+        if exit_requested:
+            break
+
+
+def _discard_pending_inputs(input_queue: Queue[str | None]) -> None:
+    """丢弃尚未开始执行的排队输入，用于用户退出或 Ctrl-C。"""
+    while True:
+        try:
+            input_queue.get_nowait()
+        except Empty:
+            return
+        input_queue.task_done()
+
+
+def _run_repl_with_input_queue(
+    *,
+    workdir: str,
+    loaded_skills: list[str],
+    working: list,
+    ui: TerminalUI,
+    max_turns: int,
+    enable_mcp: bool,
+) -> None:
+    """交互式 REPL：主线程继续读输入，后台 worker 顺序执行 AI 工作。"""
+    input_queue: Queue[str | None] = Queue()
+    stop_requested = Event()
+    active_task = Event()
+    worker_busy = Event()
+    worker_errors: list[BaseException] = []
+    current_workdir = workdir
+
+    def worker() -> None:
+        nonlocal current_workdir
+        while True:
+            item = input_queue.get()
+            try:
+                if item is None:
+                    return
+                worker_busy.set()
+                current_workdir, exit_requested = _process_repl_input(
+                    item,
+                    workdir=current_workdir,
+                    loaded_skills=loaded_skills,
+                    working=working,
+                    ui=ui,
+                    max_turns=max_turns,
+                    enable_mcp=enable_mcp,
+                )
+                if exit_requested:
+                    stop_requested.set()
+                    return
+            except BaseException as exc:  # pragma: no cover - 主线程会重新抛出
+                worker_errors.append(exc)
+                stop_requested.set()
+                return
+            finally:
+                worker_busy.clear()
+                if input_queue.empty():
+                    active_task.clear()
+                input_queue.task_done()
+
+    worker_thread = Thread(target=worker, name="dong-repl-worker", daemon=False)
+    worker_thread.start()
+    ui.set_background_input_mode(True)
+    try:
+        while not stop_requested.is_set():
+            if worker_errors:
+                raise worker_errors[0]
+
+            try:
+                is_busy = active_task.is_set() or worker_busy.is_set() or input_queue.qsize() > 0
+                inp = ui.read_prompt(
+                    repl_completions(current_workdir, loaded_skills),
+                    prompt_text="\ndong next " if is_busy else "\ndong ",
+                    bottom_toolbar="AI 正在工作；当前输入会排队到下一轮" if is_busy else None,
+                )
+            except (EOFError, KeyboardInterrupt):
+                ui.blank_line()
+                stop_requested.set()
+                _discard_pending_inputs(input_queue)
+                input_queue.put(None)
+                break
+
+            inp = inp.strip()
+            if not inp:
+                continue
+
+            if _is_repl_exit_input(inp):
+                stop_requested.set()
+                _discard_pending_inputs(input_queue)
+                input_queue.put(inp)
+                break
+
+            should_show_queued = worker_busy.is_set() or input_queue.qsize() > 0
+            active_task.set()
+            input_queue.put(inp)
+            if should_show_queued:
+                ui.show_input_queued(pending=input_queue.qsize())
+    finally:
+        ui.set_background_input_mode(False)
+        if not stop_requested.is_set():
+            stop_requested.set()
+            _discard_pending_inputs(input_queue)
+            input_queue.put(None)
+        worker_thread.join()
+        if worker_errors:
+            raise worker_errors[0]
+
+
 def _positive_int(value: str) -> int:
     """解析正整数 CLI 参数，用于 logs limit。"""
     parsed = int(value)
@@ -1390,18 +1331,22 @@ def main():
 
     # 加载项目规则；DONG.md 会进入系统消息，约束 agent 的行为。
     project_rules = load_dong_md(workdir)
-    ui.show_startup(
-        model=args.model,
-        workdir=workdir,
-        agents_loaded=project_rules is not None,
-        tools=[
-            *(tool["function"]["name"] for tool in TOOL_DEFS),
-            *(["mcp"] if args.mcp else []),
-        ],
-    )
+    interactive_tui = not args.input and ui._interactive()
+    tool_names = [
+        *(tool["function"]["name"] for tool in TOOL_DEFS),
+        *(["mcp"] if args.mcp else []),
+    ]
+    if not interactive_tui:
+        ui.show_startup(
+            model=args.model,
+            workdir=workdir,
+            agents_loaded=project_rules is not None,
+            tools=tool_names,
+        )
 
     # 保存当前已启用的 skill 名称；build_messages 会根据它们拼装系统提示词。
     loaded_skills = []
+    startup_loaded_skills: list[SkillInfo] = []
 
     # 处理命令行里重复传入的 --skill，例如：--skill python --skill git。
     for name in args.skill:
@@ -1409,7 +1354,10 @@ def main():
             info, _ = load_skill(workdir, name)
             if info.name not in loaded_skills:
                 loaded_skills.append(info.name)
-            ui.show_loaded_skill(info.name, info.selected_source, indent="   ")
+            if interactive_tui:
+                startup_loaded_skills.append(info)
+            else:
+                ui.show_loaded_skill(info.name, info.selected_source, indent="   ")
         except FileNotFoundError as e:
             ui.show_skill_error(e)
             raise SystemExit(2) from e
@@ -1419,54 +1367,60 @@ def main():
         working = []
         user_prompt = " ".join(args.input)
         log_event(LOGGER, logging.INFO, "single_prompt_received", prompt_chars=len(user_prompt))
+        auto_decision = _route_auto_skills(
+            user_prompt,
+            workdir=workdir,
+            loaded_skills=loaded_skills,
+            ui=ui,
+        )
         working.append({"role": "user", "content": user_prompt})
-        base_sys = build_agent_prompt(loaded_skills, workdir)
+        base_sys = build_agent_prompt(_skills_for_turn(loaded_skills, auto_decision), workdir)
         run_loop(base_sys, working, workdir, max_turns=args.max_turns, ui=ui, enable_mcp=args.mcp)
     else:
         # REPL 模式：没有一次性 prompt，就进入交互循环，持续保留 working 上下文。
         avail = describe_skills(workdir)
-        ui.show_repl_help(skill_count=len(avail))
         log_event(LOGGER, logging.INFO, "repl_started", skill_count=len(avail))
         working = []
-        while True:
-            try:
-                # 每次读取用户输入，直到 EOF/Ctrl-C 或退出命令。
-                inp = ui.read_prompt(repl_completions(workdir, loaded_skills))
-            except (EOFError, KeyboardInterrupt):
-                ui.blank_line()
-                break
-            inp = inp.strip()
-            if not inp:
-                continue
+        if interactive_tui:
+            from dong.tui import TuiApp
 
-            action = handle_repl_command(
-                inp,
+            def process_tui_input(inp: str, tui_ui) -> bool:  # type: ignore[no-untyped-def]
+                nonlocal workdir
+                workdir, exit_requested = _process_repl_input(
+                    inp,
+                    workdir=workdir,
+                    loaded_skills=loaded_skills,
+                    working=working,
+                    ui=tui_ui,
+                    max_turns=args.max_turns,
+                    enable_mcp=args.mcp,
+                )
+                return exit_requested
+
+            tui_app = TuiApp(
+                process_input=process_tui_input,
+                completion_provider=lambda: repl_completions(workdir, loaded_skills),
+            )
+            tui_app.ui.show_startup(
+                model=args.model,
+                workdir=workdir,
+                agents_loaded=project_rules is not None,
+                tools=tool_names,
+            )
+            for info in startup_loaded_skills:
+                tui_app.ui.show_loaded_skill(info.name, info.selected_source, indent="   ")
+            tui_app.ui.show_repl_help(skill_count=len(avail))
+            tui_app.run()
+        else:
+            ui.show_repl_help(skill_count=len(avail))
+            _run_repl_sync(
                 workdir=workdir,
                 loaded_skills=loaded_skills,
                 working=working,
                 ui=ui,
+                max_turns=args.max_turns,
+                enable_mcp=args.mcp,
             )
-            if action.exit_requested:
-                break
-            if action.workdir is not None:
-                workdir = action.workdir
-                continue
-            if action.prompt is not None:
-                working.append({"role": "user", "content": action.prompt})
-                base_sys = build_agent_prompt(loaded_skills, workdir)
-                run_loop(base_sys, working, workdir, max_turns=args.max_turns, ui=ui, enable_mcp=args.mcp)
-                working = trim_context(working, workdir=workdir)
-                continue
-            if action.handled:
-                continue
-
-            # ── 正常对话 ──
-            # 普通输入直接进入上下文，并用当前 workdir + skills 重新构建系统消息后运行。
-            log_event(LOGGER, logging.INFO, "repl_prompt_received", prompt_chars=len(inp))
-            working.append({"role": "user", "content": inp})
-            base_sys = build_agent_prompt(loaded_skills, workdir)
-            run_loop(base_sys, working, workdir, max_turns=args.max_turns, ui=ui, enable_mcp=args.mcp)
-            working = trim_context(working, workdir=workdir)
 
 
 if __name__ == "__main__":

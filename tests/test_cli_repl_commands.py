@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from io import StringIO
+from threading import Event
 
-from dong.cli import handle_repl_command, repl_completions
+from dong import cli
+from dong.cli import _run_repl_with_input_queue, handle_repl_command, repl_completions
 from dong.ui import TerminalUI
 
 
@@ -18,6 +20,42 @@ def _ui() -> tuple[TerminalUI, StringIO]:
     """构造只捕获 stderr 的测试 UI。"""
     err = StringIO()
     return TerminalUI(stderr=err), err
+
+
+class QueueTestUI(TerminalUI):
+    """用于模拟交互式输入队列的测试 UI。"""
+
+    def __init__(
+        self,
+        *,
+        first_started: Event,
+        release_first: Event,
+        second_started: Event,
+    ) -> None:
+        super().__init__(stdout=StringIO(), stderr=StringIO())
+        self.first_started = first_started
+        self.release_first = release_first
+        self.second_started = second_started
+        self.read_count = 0
+        self.queued: list[int] = []
+        self.prompts: list[str] = []
+
+    def read_prompt(self, completions=(), *, prompt_text="\ndong ", bottom_toolbar=None):  # type: ignore[no-untyped-def]
+        """第一条执行中输入第二条，第二条开始后再退出。"""
+        self.prompts.append(prompt_text)
+        self.read_count += 1
+        if self.read_count == 1:
+            return "first"
+        if self.read_count == 2:
+            assert self.first_started.wait(timeout=1)
+            return "second"
+        assert self.first_started.is_set()
+        self.release_first.set()
+        assert self.second_started.wait(timeout=1)
+        return "exit"
+
+    def show_input_queued(self, *, pending: int) -> None:
+        self.queued.append(pending)
 
 
 def test_clear_command_preserves_behavior() -> None:
@@ -37,6 +75,47 @@ def test_clear_command_preserves_behavior() -> None:
     assert action.exit_requested is False
     assert working == []
     assert "context cleared" in err.getvalue()
+
+
+def test_interactive_repl_queues_input_while_agent_is_working(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """AI 工作中输入的新消息应排队，并在当前轮结束后自动执行。"""
+    first_started = Event()
+    release_first = Event()
+    second_started = Event()
+    seen_prompts: list[str] = []
+    ui = QueueTestUI(
+        first_started=first_started,
+        release_first=release_first,
+        second_started=second_started,
+    )
+
+    def fake_run_loop(_base_sys, working, _workdir, *, max_turns, ui, enable_mcp):  # type: ignore[no-untyped-def]
+        prompt = working[-1]["content"]
+        seen_prompts.append(prompt)
+        if prompt == "first":
+            first_started.set()
+            assert release_first.wait(timeout=1)
+        if prompt == "second":
+            second_started.set()
+        working.append({"role": "assistant", "content": f"done {prompt}"})
+
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+
+    _run_repl_with_input_queue(
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=[],
+        ui=ui,
+        max_turns=3,
+        enable_mcp=False,
+    )
+
+    assert seen_prompts == ["first", "second"]
+    assert ui.prompts[:2] == ["\ndong ", "\ndong next "]
+    assert ui.queued == [1]
 
 
 def test_dir_command_returns_new_absolute_workdir(tmp_path) -> None:
@@ -182,3 +261,43 @@ def test_repl_completions_include_frontmatter_name_and_entry_alias(tmp_path) -> 
     assert "/skill code-review" in completions
     assert "/code-review" in completions
     assert "/review" in completions
+
+
+def test_repl_auto_skill_is_temporary_for_current_turn(tmp_path, monkeypatch) -> None:
+    """普通 prompt 命中意图时，应只在当前轮临时注入自动选择的 skill。"""
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    _write(
+        tmp_path / ".dong" / "skills" / "chrome-cdp" / "SKILL.md",
+        (
+            "---\n"
+            "name: chrome-cdp\n"
+            "description: Inspect local Chrome pages\n"
+            "keywords: 浏览器, 当前页面\n"
+            "---\n\n"
+            "# Chrome CDP\n"
+        ),
+    )
+    ui, err = _ui()
+    loaded: list[str] = []
+    seen_instructions: list[str] = []
+
+    def fake_run_loop(base_sys, working, _workdir, *, max_turns, ui, enable_mcp):  # type: ignore[no-untyped-def]
+        seen_instructions.append(base_sys.instructions)
+        working.append({"role": "assistant", "content": "ok"})
+
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+
+    cli._process_repl_input(
+        "帮我看一下当前浏览器页面",
+        workdir=str(tmp_path),
+        loaded_skills=loaded,
+        working=[],
+        ui=ui,
+        max_turns=3,
+        enable_mcp=False,
+    )
+
+    assert loaded == []
+    assert "Skill: chrome-cdp" in seen_instructions[0]
+    assert "Auto skill: chrome-cdp" in err.getvalue()

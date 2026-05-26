@@ -133,6 +133,18 @@ class TrackingStreamUI(RecordingUI):
         yield write_delta
 
 
+class TrackingReasoningStreamUI(TrackingStreamUI):
+    """记录 reasoning delta 是否被 run_loop 接到 UI。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reasoning_deltas: list[str] = []
+
+    @contextmanager
+    def stream_reasoning_message(self):
+        yield self.reasoning_deltas.append
+
+
 class FinalAssistantPanelUI(RecordingUI):
     """记录最终 assistant 面板渲染次数，用于区分裸流式输出和最终答复。"""
 
@@ -177,6 +189,43 @@ def test_single_prompt_mode_runs_through_tool_call_and_final_answer(
     assert "read(" in captured.err
     assert "note.txt" in captured.err
     assert "Read complete." in captured.out
+
+
+def test_single_prompt_mode_auto_injects_matching_skill(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单次 prompt 模式也应按用户意图临时注入自动选择的 skill。"""
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    skill_path = tmp_path / ".dong" / "skills" / "chrome-cdp" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True, exist_ok=True)
+    skill_path.write_text(
+        (
+            "---\n"
+            "name: chrome-cdp\n"
+            "description: Inspect local Chrome pages\n"
+            "keywords: 浏览器, 当前页面\n"
+            "---\n\n"
+            "# Chrome CDP\n"
+        ),
+        encoding="utf-8",
+    )
+    seen_instructions: list[str] = []
+
+    def fake_run_loop(base_sys, working, _workdir, *, max_turns, ui, enable_mcp):  # type: ignore[no-untyped-def]
+        seen_instructions.append(base_sys.instructions)
+
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["dong", "-d", str(tmp_path), "帮我看一下当前浏览器页面"],
+    )
+
+    cli.main()
+
+    assert "Skill: chrome-cdp" in seen_instructions[0]
 
 
 def test_run_loop_shows_working_status_for_model_and_tools(
@@ -252,6 +301,32 @@ def test_run_loop_streams_assistant_text_before_tool_execution(
     assert "assistant" in output
     assert "我先读取文件。" in output
     assert "Read complete." in output
+
+
+def test_run_loop_streams_reasoning_deltas(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLM reasoning delta 应实时转发给支持该接口的 UI。"""
+    ui = TrackingReasoningStreamUI()
+
+    def fake_chat(_messages, _tools, instructions="", **kwargs):  # type: ignore[no-untyped-def]
+        on_reasoning_delta = kwargs.get("on_reasoning_delta")
+        if on_reasoning_delta is not None:
+            on_reasoning_delta("先分析")
+            on_reasoning_delta("代码。")
+        return _assistant_message(content="完成。", reasoning_content="先分析代码。")
+
+    monkeypatch.setattr(cli, "chat", fake_chat)
+
+    cli.run_loop(
+        cli.build_agent_prompt([], str(tmp_path)),
+        [{"role": "user", "content": "hello"}],
+        str(tmp_path),
+        ui=ui,
+    )
+
+    assert ui.reasoning_deltas == ["先分析", "代码。"]
 
 
 def test_run_loop_stops_working_status_before_streaming_text(
