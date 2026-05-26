@@ -13,6 +13,7 @@ from queue import Empty, Queue
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.completion import Completer
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI
@@ -20,6 +21,8 @@ from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
+from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
 from rich.console import Console
 from rich.markdown import Markdown
@@ -65,6 +68,32 @@ class ConfirmationRequest:
     default: str
     done: threading.Event = field(default_factory=threading.Event)
     result: bool | None = None
+
+
+class _TranscriptControl(FormattedTextControl):
+    """Transcript 专用 control：把鼠标滚轮映射到 dong 自己的历史视图。"""
+
+    def __init__(self, app: TuiApp) -> None:
+        self.app = app
+        super().__init__(
+            app._formatted_transcript,
+            get_cursor_position=app._transcript_cursor_position,
+        )
+
+    def invalidate_content(self) -> None:
+        """清理 prompt_toolkit 的片段缓存，确保滚动切片立即重算。"""
+        self.reset()
+        self._fragment_cache.clear()
+        self._content_cache.clear()
+
+    def mouse_handler(self, mouse_event: MouseEvent):  # type: ignore[no-untyped-def]
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            self.app.scroll_transcript(3)
+            return None
+        if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            self.app.scroll_transcript(-3)
+            return None
+        return super().mouse_handler(mouse_event)
 
 
 class _DynamicSlashCompleter(Completer):
@@ -116,7 +145,10 @@ class TuiApp:
         self._busy = False
         self._follow_bottom = True
         self._scroll_offset = 0
+        self._transcript_total_line_count = 1
+        self._transcript_cursor_line = 0
         self._last_ctrl_c = 0.0
+        self._render_width_override: int | None = None
         self._confirmation: ConfirmationRequest | None = None
         self._transcript: list[TranscriptItem] = []
         self._status = StatusState()
@@ -134,7 +166,7 @@ class TuiApp:
         )
         self.key_bindings = self._key_bindings()
         self.composer.control.key_bindings = self.key_bindings
-        self.transcript_control = FormattedTextControl(self._formatted_transcript)
+        self.transcript_control = _TranscriptControl(self)
         self.status_control = FormattedTextControl(self._formatted_status)
         self.application = Application(
             layout=Layout(
@@ -176,6 +208,17 @@ class TuiApp:
                 cancellation_requested=self._status.cancellation_requested,
             )
 
+    @property
+    def render_width(self) -> int:
+        """Current transcript render width, bounded for narrow terminals."""
+        if self._render_width_override is not None:
+            return max(20, self._render_width_override)
+        try:
+            columns = self.application.output.get_size().columns
+        except Exception:
+            columns = 80
+        return max(20, columns - 2)
+
     def run(self) -> None:
         """Run the fullscreen TUI until the user exits."""
         self._running = True
@@ -209,6 +252,7 @@ class TuiApp:
             self._transcript.append(item)
             if not self._follow_bottom:
                 self._status.new_output = True
+            self.transcript_control.invalidate_content()
         self.invalidate()
         return item
 
@@ -220,6 +264,7 @@ class TuiApp:
                 item.raw = raw
             if not self._follow_bottom:
                 self._status.new_output = True
+            self.transcript_control.invalidate_content()
         self.invalidate()
 
     def update_status(self, label: str) -> None:
@@ -270,6 +315,23 @@ class TuiApp:
         if self._running:
             self.application.invalidate()
 
+    def scroll_transcript(self, lines: int) -> None:
+        """Scroll transcript history; positive lines move to older output."""
+        if lines == 0:
+            return
+        with self._lock:
+            max_offset = max(0, self._transcript_total_line_count - 1)
+            if lines > 0:
+                self._follow_bottom = False
+                self._scroll_offset = min(max_offset, self._scroll_offset + lines)
+            else:
+                self._scroll_offset = max(0, self._scroll_offset + lines)
+                if self._scroll_offset == 0:
+                    self._follow_bottom = True
+                    self._status.new_output = False
+            self.transcript_control.invalidate_content()
+        self.invalidate()
+
     def _worker(self) -> None:
         while True:
             item = self._input_queue.get()
@@ -312,7 +374,19 @@ class TuiApp:
     def _formatted_transcript(self) -> ANSI:
         with self._lock:
             lines = self._render_transcript_lines()
-        return ANSI("\n".join(lines) if lines else f"\x1b[36m{self.title}\x1b[0m")
+            if lines:
+                text = "\n".join(lines)
+                self._transcript_cursor_line = max(0, len(lines) - 1)
+            else:
+                text = f"\x1b[36m{self.title}\x1b[0m"
+                self._transcript_total_line_count = 1
+                self._transcript_cursor_line = 0
+        return ANSI(text)
+
+    def _transcript_cursor_position(self) -> Point:
+        """Keep prompt_toolkit's window anchored to the bottom of the current transcript slice."""
+        with self._lock:
+            return Point(x=0, y=max(0, self._transcript_cursor_line))
 
     def _formatted_status(self) -> ANSI:
         with self._lock:
@@ -330,7 +404,7 @@ class TuiApp:
             completion_hint = self._completion_hint()
             if completion_hint:
                 parts.append(completion_hint)
-        return ANSI("  " + " · ".join(parts))
+        return ANSI("  " + _fit_to_width(" · ".join(parts), self.render_width))
 
     def _completion_hint(self) -> str:
         text = self.composer.text
@@ -346,6 +420,7 @@ class TuiApp:
     def _render_transcript_lines(self) -> list[str]:
         text = "\n\n".join(item.ansi.rstrip() for item in self._transcript if item.ansi.strip())
         lines = text.splitlines()
+        self._transcript_total_line_count = max(1, len(lines))
         if self._follow_bottom:
             return lines[-2000:]
         if self._scroll_offset <= 0:
@@ -422,25 +497,17 @@ class TuiApp:
 
         @bindings.add("pageup")
         def _(event) -> None:  # type: ignore[no-untyped-def]
-            with self._lock:
-                self._follow_bottom = False
-                self._scroll_offset += 20
-            self.invalidate()
+            self.scroll_transcript(20)
 
         @bindings.add("pagedown")
         def _(event) -> None:  # type: ignore[no-untyped-def]
-            with self._lock:
-                self._scroll_offset = max(0, self._scroll_offset - 20)
-                if self._scroll_offset == 0:
-                    self._follow_bottom = True
-                    self._status.new_output = False
-            self.invalidate()
+            self.scroll_transcript(-20)
 
         @bindings.add("home")
         def _(event) -> None:  # type: ignore[no-untyped-def]
             with self._lock:
                 self._follow_bottom = False
-                self._scroll_offset = 10_000
+                self._scroll_offset = max(0, self._transcript_total_line_count - 1)
             self.invalidate()
 
         @bindings.add("end")
@@ -465,7 +532,12 @@ class TuiUI:
         self._active_reasoning_item: TranscriptItem | None = None
 
     def show_system_message(self, text: str) -> None:
-        self.app.append_item("system", "system", render_text("system", text), raw=text)
+        self.app.append_item(
+            "system",
+            "system",
+            render_text("system", text, width=self.app.render_width),
+            raw=text,
+        )
 
     def show_startup(
         self,
@@ -481,17 +553,22 @@ class TuiUI:
             f"DONG.md    {'loaded' if agents_loaded else 'not found'}\n"
             f"tools      {', '.join(tools)}"
         )
-        self.app.append_item("system", "dong", render_text("dong", text), raw=text)
+        self.app.append_item("system", "dong", render_text("dong", text, width=self.app.render_width), raw=text)
 
     def show_repl_help(self, *, skill_count: int) -> None:
         lines = []
         if skill_count:
             lines.append(f"Skills: {skill_count} available  (/skill to list, /skill <name> to load)")
         lines.append("Commands: exit, clear, dir=<path>, /skill, /unskill, /<skill> <prompt>")
-        self.app.append_item("system", "help", render_text("help", "\n".join(lines)), raw="\n".join(lines))
+        text = "\n".join(lines)
+        self.app.append_item("system", "help", render_text("help", text, width=self.app.render_width), raw=text)
 
     def show_loaded_skill(self, name: str, source: str, *, indent: str = "  ") -> None:
-        self.app.append_item("system", "skill", render_text("skill", f"Loaded skill: {name} ({source})"))
+        self.app.append_item(
+            "system",
+            "skill",
+            render_text("skill", f"Loaded skill: {name} ({source})", width=self.app.render_width),
+        )
 
     def show_skill_already_loaded(self, name: str, source: str) -> None:
         self.show_system_message(f"Skill already loaded: {name} ({source})")
@@ -521,13 +598,17 @@ class TuiUI:
         self.app.append_item(
             "warning",
             "danger",
-            render_text("Dangerous command", command),
+            render_text("Dangerous command", command, width=self.app.render_width),
             raw=command,
         )
         return self.app.request_confirmation(command, default)
 
     def show_tool_cancelled(self, name: str, args_raw: str) -> None:
-        self.app.append_item("tool_result", "cancelled", render_text("cancelled", f"{name}({args_raw})"))
+        self.app.append_item(
+            "tool_result",
+            "cancelled",
+            render_text("cancelled", f"{name}({args_raw})", width=self.app.render_width),
+        )
 
     def show_tool_result(self, name: str, args_raw: str, result: ToolResult) -> None:
         display_args = _display_args(args_raw)
@@ -535,13 +616,18 @@ class TuiUI:
         summary = result.summary or result.error or "(no summary)"
         raw = f"{status} {name}({display_args}) - {summary}"
         if name == "update_plan" and result.detail.strip():
-            ansi = render_markdown(f"**{raw}**\n\n{result.detail}")
+            ansi = render_markdown(f"**{raw}**\n\n{result.detail}", width=self.app.render_width)
             self.app.append_item("plan", "plan", ansi, raw=result.detail)
             return
         if not result.success and (result.error or result.detail):
             detail = (result.error or result.detail).strip()
             raw = f"{raw}\n{detail}"
-        self.app.append_item("tool_result", status, render_text(status, raw), raw=raw)
+        self.app.append_item(
+            "tool_result",
+            status,
+            render_text(status, raw, width=self.app.render_width),
+            raw=raw,
+        )
 
     def show_working(
         self,
@@ -568,7 +654,7 @@ class TuiUI:
         if not normalized:
             return
         item = self._active_assistant_item
-        ansi = render_markdown(f"**assistant**\n\n{normalized}")
+        ansi = render_markdown(f"**assistant**\n\n{normalized}", width=self.app.render_width)
         if item is not None:
             self.app.update_item(item, ansi=ansi, raw=normalized)
             self._active_assistant_item = None
@@ -580,7 +666,7 @@ class TuiUI:
         if not normalized:
             return
         item = self._active_reasoning_item
-        ansi = render_markdown(f"**thinking**\n\n{normalized}")
+        ansi = render_markdown(f"**thinking**\n\n{normalized}", width=self.app.render_width)
         if item is not None:
             self.app.update_item(item, ansi=ansi, raw=normalized)
             self._active_reasoning_item = None
@@ -588,10 +674,20 @@ class TuiUI:
             self.app.append_item("thinking", "thinking", ansi, raw=normalized)
 
     def show_warning(self, message: str) -> None:
-        self.app.append_item("warning", "warning", render_text("Warning", message), raw=message)
+        self.app.append_item(
+            "warning",
+            "warning",
+            render_text("Warning", message, width=self.app.render_width),
+            raw=message,
+        )
 
     def show_error(self, message: str) -> None:
-        self.app.append_item("error", "error", render_text("Error", message), raw=message)
+        self.app.append_item(
+            "error",
+            "error",
+            render_text("Error", message, width=self.app.render_width),
+            raw=message,
+        )
 
     def blank_line(self) -> None:
         self.app.append_item("system", "blank", "\n", raw="")
@@ -622,7 +718,7 @@ class _TuiWorkingStatus(AbstractContextManager[None]):
             self.app.append_item(
                 "tool_start",
                 "running",
-                render_text("running", self.message),
+                render_text("running", self.message, width=self.app.render_width),
                 raw=f"running {self.message}",
             )
         self._update()
@@ -684,7 +780,7 @@ class _StreamingTranscriptContext(AbstractContextManager[Callable[[str], None]])
         raw = "".join(self.parts)
         if not raw:
             return
-        ansi = render_markdown(f"**{self.title}**\n\n{raw}")
+        ansi = render_markdown(f"**{self.title}**\n\n{raw}", width=self.app.render_width)
         if self.item is None:
             self.item = self.app.append_item(self.kind, self.title, ansi, raw=raw)
             self.item.streaming = True
@@ -734,6 +830,26 @@ def render_text(title: str, text: str, *, width: int = 100) -> str:
 
 def _display_args(args_raw: str, limit: int = 60) -> str:
     return args_raw[:limit] + ("..." if len(args_raw) > limit else "")
+
+
+def _fit_to_width(text: str, width: int) -> str:
+    """Fit plain status text to a terminal display width."""
+    if width <= 1:
+        return ""
+    if get_cwidth(text) <= width:
+        return text
+    result = []
+    used = 0
+    marker = "…"
+    marker_width = get_cwidth(marker)
+    limit = max(0, width - marker_width)
+    for char in text:
+        char_width = get_cwidth(char)
+        if used + char_width > limit:
+            break
+        result.append(char)
+        used += char_width
+    return "".join(result).rstrip() + marker
 
 
 def _plain_working_message(

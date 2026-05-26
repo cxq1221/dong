@@ -7,7 +7,11 @@ import threading
 from prompt_toolkit.document import Document
 
 from dong.tool import ToolResult
-from dong.tui import TuiApp, render_markdown
+from dong.tui import TuiApp, _fit_to_width, render_markdown
+
+
+def _content_line_text(content, line_no: int) -> str:  # type: ignore[no-untyped-def]
+    return "".join(fragment[1] for fragment in content.get_line(line_no))
 
 
 def _completion_texts(app: TuiApp, text: str) -> list[str]:
@@ -23,6 +27,24 @@ def test_rich_markdown_renders_offscreen_with_ansi_color() -> None:
     assert "Title" in rendered
     assert "code" in rendered
     assert "\x1b[" in rendered
+
+
+def test_rich_markdown_respects_narrow_width() -> None:
+    """窄宽度下 Rich 离屏渲染应按指定宽度换行，而不是固定 100 列。"""
+    rendered = render_markdown(
+        "这是一个很长的句子，用来验证窄终端宽度下不会仍然按照一百列排版。",
+        width=24,
+    )
+
+    plain = rendered.replace("\x1b[0m", "")
+    assert len(plain.splitlines()) > 1
+
+
+def test_status_text_is_truncated_to_display_width() -> None:
+    """状态栏是单行区域，宽度不足时应主动截断并显示省略号。"""
+    fitted = _fit_to_width("正在执行工具：bash 1234567890", 12)
+
+    assert fitted.endswith("…")
 
 
 def test_tui_ui_updates_streaming_assistant_and_thinking_items() -> None:
@@ -111,6 +133,41 @@ def test_tui_tool_result_preserves_update_plan_detail() -> None:
 
     assert "first" in app.transcript_text
     assert "second" in app.transcript_text
+
+
+def test_tui_tool_result_uses_current_render_width() -> None:
+    """TuiUI 渲染 transcript 时应使用当前 TUI 宽度。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app._render_width_override = 24
+
+    app.ui.show_assistant_message("这是一个很长的句子，用来验证 TUI 宽度传入 Rich renderer。")
+
+    assert len(app._transcript[0].ansi.splitlines()) > 1
+
+
+def test_transcript_cursor_tracks_bottom_page() -> None:
+    """transcript 超过一屏时，prompt_toolkit 光标应锚定当前视图底部。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
+
+    content = app.transcript_control.create_content(width=80, height=20)
+
+    assert content.cursor_position.y == 59
+    assert _content_line_text(content, 0) == "line 0"
+    assert _content_line_text(content, 59) == "line 59"
+
+
+def test_transcript_manual_scroll_changes_visible_slice() -> None:
+    """PageUp/滚轮滚动应改变 transcript 视图，而不是被默认窗口滚动重置。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
+    app.transcript_control.create_content(width=80, height=20)
+
+    app.scroll_transcript(20)
+    content = app.transcript_control.create_content(width=80, height=20)
+
+    assert content.cursor_position.y == 39
+    assert _content_line_text(content, content.line_count - 1) == "line 39"
 
 
 def test_tui_working_status_records_tool_start() -> None:
