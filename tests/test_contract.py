@@ -8,11 +8,18 @@ from dong.contract import (
     ContractMode,
     ContractSignature,
     ContractSignal,
+    RuleFloor,
+    Scoreboard,
+    ScorerResult,
     TriggerReason,
+    apply_score,
     build_evidence_hash,
+    build_rule_floor,
     ensure_best_practices,
+    load_scoreboard,
     pressure_summary,
     sign_evidence,
+    validate_scorer_result,
     verify_signature,
 )
 
@@ -197,3 +204,71 @@ def test_sign_evidence_produces_verifiable_hash() -> None:
     assert signature.elapsed_ms >= 0
     assert signature.signature_hash.startswith("0")
     assert verify_signature(evidence, signature) is True
+
+
+def test_rule_floor_caps_score_when_code_changed_without_verification() -> None:
+    """修改代码但没有验证证据时，规则底座必须限制最高分。"""
+    evidence = ContractEvidence(
+        contract_version=1,
+        session_id="session-1",
+        trigger_reasons=["file_change"],
+        user_objective="改代码",
+        tool_summary=[{"name": "edit", "success": True}],
+        file_changes=[{"path": "a.py", "operation": "edit"}],
+        verification_evidence=[],
+        final_answer="完成",
+        known_risks=[],
+        unverified_items=[],
+    )
+
+    floor = build_rule_floor(evidence, signature_valid=False)
+
+    assert isinstance(floor, RuleFloor)
+    assert floor.base_score_ceiling <= 60
+    assert "missing_verification" in floor.evidence_gaps
+    assert "invalid_signature" in floor.required_deductions
+
+
+def test_validate_scorer_result_rejects_score_above_rule_ceiling() -> None:
+    """scorer 不能突破规则底座给无证据交付高分。"""
+    floor = RuleFloor(
+        base_score_ceiling=70,
+        required_deductions=["missing_verification"],
+        evidence_gaps=["missing_verification"],
+        signature_valid=True,
+    )
+
+    result = validate_scorer_result(
+        {
+            "score": 95,
+            "deductions": [],
+            "risk_flags": [],
+            "lesson_for_session": "下次先跑测试。",
+            "workspace_summary": "缺少验证",
+        },
+        floor,
+    )
+
+    assert isinstance(result, ScorerResult)
+    assert result.score == 70
+    assert "missing_verification" in result.deductions
+
+
+def test_scoreboard_updates_average_and_pressure(tmp_path) -> None:
+    """评分表应跨 session 维护平均分、压力等级和常见扣分原因。"""
+    scoreboard = load_scoreboard(str(tmp_path))
+    result = ScorerResult(
+        score=58,
+        deductions=["missing_verification"],
+        risk_flags=["unstable_delivery"],
+        lesson_for_session="先跑测试。",
+        workspace_summary="缺少验证",
+    )
+
+    updated = apply_score(str(tmp_path), scoreboard, "session-1", result)
+
+    assert isinstance(updated, Scoreboard)
+    assert updated.average_score == 58
+    assert updated.pressure_level == "watch"
+    assert updated.common_deductions["missing_verification"] == 1
+    assert load_scoreboard(str(tmp_path)).average_score == 58

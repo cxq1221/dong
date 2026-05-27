@@ -14,6 +14,7 @@ TOOL_THRESHOLD = 5
 VERIFY_COMMAND_KEYWORDS = ("pytest", "ruff", "mypy", "test", "lint", "build", "uv run")
 FILE_CHANGE_TOOLS = {"write", "edit"}
 BEST_PRACTICES_RELPATH = ".dong/contracts/best-practices.md"
+SCOREBOARD_RELPATH = ".dong/scoreboard.json"
 DEFAULT_BEST_PRACTICES = """# dong 契约最佳实践
 
 这份材料是复杂开发交付的外部参考，不是强制流程。主 Agent 可以不参考，但交付后会被第三方 scorer 审计。
@@ -61,6 +62,44 @@ class ContractEvidence:
 
     def to_dict(self) -> dict:
         """把证据包转换为普通 dict，方便规范化 JSON 和后续持久化。"""
+
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RuleFloor:
+    """规则底座；用确定性证据规则限制 scorer 可给出的最高分。"""
+
+    base_score_ceiling: int
+    required_deductions: list[str]
+    evidence_gaps: list[str]
+    signature_valid: bool
+
+
+@dataclass(frozen=True)
+class ScorerResult:
+    """scorer 结果；保存最终分数、扣分原因、风险标记和本轮教训。"""
+
+    score: int
+    deductions: list[str]
+    risk_flags: list[str]
+    lesson_for_session: str
+    workspace_summary: str
+
+
+@dataclass(frozen=True)
+class Scoreboard:
+    """评分表；跨 session 维护近期分数、压力等级和常见扣分原因。"""
+
+    version: int
+    average_score: float | None
+    recent_scores: list[int]
+    pressure_level: str
+    common_deductions: dict[str, int]
+    sessions: dict[str, dict]
+
+    def to_dict(self) -> dict:
+        """转换为普通 dict，供 JSON 持久化使用。"""
 
         return asdict(self)
 
@@ -260,6 +299,195 @@ def verify_signature(evidence: ContractEvidence, signature: ContractSignature) -
     return expected_hash == signature.signature_hash and expected_hash.startswith(prefix)
 
 
+def build_rule_floor(evidence: ContractEvidence, signature_valid: bool) -> RuleFloor:
+    """根据证据包生成确定性规则底座，防止 scorer 给缺证据交付过高分。"""
+
+    ceiling = 100
+    required_deductions: list[str] = []
+    evidence_gaps: list[str] = []
+
+    if evidence.file_changes and not evidence.verification_evidence:
+        ceiling = min(ceiling, 60)
+        required_deductions.append("missing_verification")
+        evidence_gaps.append("missing_verification")
+
+    if evidence.file_changes and not evidence.known_risks and not evidence.unverified_items:
+        ceiling = min(ceiling, 85)
+        required_deductions.append("missing_risk_disclosure")
+        evidence_gaps.append("missing_risk_disclosure")
+
+    if not signature_valid:
+        ceiling = min(ceiling, 50)
+        required_deductions.append("invalid_signature")
+
+    has_failed_tool = any(item.get("success") is False for item in evidence.tool_summary)
+    if has_failed_tool and not _discloses_failure(evidence.final_answer):
+        ceiling = min(ceiling, 70)
+        required_deductions.append("undisclosed_failure")
+        evidence_gaps.append("undisclosed_failure")
+
+    return RuleFloor(
+        base_score_ceiling=ceiling,
+        required_deductions=sorted(set(required_deductions)),
+        evidence_gaps=sorted(set(evidence_gaps)),
+        signature_valid=signature_valid,
+    )
+
+
+def validate_scorer_result(raw: dict, rule_floor: RuleFloor) -> ScorerResult:
+    """校验并归一化 scorer 输出，强制应用规则底座的分数上限和必需扣分。"""
+
+    score = _clamp_score(raw.get("score", 0), rule_floor.base_score_ceiling)
+    deductions = _parse_string_list(raw.get("deductions"))
+    for deduction in rule_floor.required_deductions:
+        if deduction not in deductions:
+            deductions.append(deduction)
+
+    return ScorerResult(
+        score=score,
+        deductions=deductions,
+        risk_flags=_parse_string_list(raw.get("risk_flags")),
+        lesson_for_session=_parse_string(raw.get("lesson_for_session")),
+        workspace_summary=_parse_string(raw.get("workspace_summary")),
+    )
+
+
+def load_scoreboard(workdir: str) -> Scoreboard:
+    """读取工作区评分表；不存在时返回空评分表。"""
+
+    path = Path(workdir) / SCOREBOARD_RELPATH
+    if not path.exists():
+        return _empty_scoreboard()
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return Scoreboard(
+        version=int(payload.get("version", 1)),
+        average_score=payload.get("average_score"),
+        recent_scores=[_clamp_score(score, 100) for score in payload.get("recent_scores", [])],
+        pressure_level=_parse_string(payload.get("pressure_level")) or "normal",
+        common_deductions={
+            _parse_string(key): int(value)
+            for key, value in payload.get("common_deductions", {}).items()
+        },
+        sessions={
+            _parse_string(key): value for key, value in payload.get("sessions", {}).items()
+        },
+    )
+
+
+def apply_score(
+    workdir: str,
+    scoreboard: Scoreboard,
+    session_id: str,
+    result: ScorerResult,
+) -> Scoreboard:
+    """把本轮 scorer 结果写入评分表，并更新平均分、压力等级和扣分计数。"""
+
+    recent_scores = [*scoreboard.recent_scores, result.score][-20:]
+    average_score = round(sum(recent_scores) / len(recent_scores), 2)
+    common_deductions = dict(scoreboard.common_deductions)
+    for deduction in result.deductions:
+        common_deductions[deduction] = common_deductions.get(deduction, 0) + 1
+
+    sessions = dict(scoreboard.sessions)
+    sessions[session_id] = {
+        "score": result.score,
+        "deductions": result.deductions,
+        "risk_flags": result.risk_flags,
+        "lesson_for_session": result.lesson_for_session,
+        "workspace_summary": result.workspace_summary,
+    }
+
+    updated = Scoreboard(
+        version=scoreboard.version,
+        average_score=average_score,
+        recent_scores=recent_scores,
+        pressure_level=_pressure_level(average_score),
+        common_deductions=common_deductions,
+        sessions=sessions,
+    )
+    path = Path(workdir) / SCOREBOARD_RELPATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(updated.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return updated
+
+
+def _empty_scoreboard() -> Scoreboard:
+    """创建空评分表；无历史分时默认压力等级为 normal。"""
+
+    return Scoreboard(
+        version=1,
+        average_score=None,
+        recent_scores=[],
+        pressure_level="normal",
+        common_deductions={},
+        sessions={},
+    )
+
+
+def _clamp_score(raw_score: object, ceiling: int) -> int:
+    """把任意输入转换为 0 到规则上限之间的整数分。"""
+
+    try:
+        score = int(raw_score)
+    except (TypeError, ValueError):
+        score = 0
+    return max(0, min(100, ceiling, score))
+
+
+def _parse_string(raw_value: object) -> str:
+    """把 scorer 字段安全转换为字符串，空值归一化为空字符串。"""
+
+    if raw_value is None:
+        return ""
+    if isinstance(raw_value, str):
+        return raw_value
+    return str(raw_value)
+
+
+def _parse_string_list(raw_value: object) -> list[str]:
+    """把 scorer 列表字段归一化为字符串列表，兼容单字符串输入。"""
+
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, str):
+        return [raw_value] if raw_value else []
+    if isinstance(raw_value, list):
+        return [_parse_string(item) for item in raw_value if _parse_string(item)]
+    return [_parse_string(raw_value)]
+
+
+def _pressure_level(average_score: float) -> str:
+    """按平均分转换压力等级：75 以上正常，50 到 74.99 观察，低于 50 留校。"""
+
+    if average_score >= 75:
+        return "normal"
+    if average_score >= 50:
+        return "watch"
+    return "probation"
+
+
+def _discloses_failure(final_answer: str) -> bool:
+    """检查最终答复是否用中文或英文明确披露失败。"""
+
+    answer = final_answer.lower()
+    failure_markers = (
+        "失败",
+        "未成功",
+        "报错",
+        "错误",
+        "fail",
+        "failed",
+        "failure",
+        "error",
+        "not successful",
+    )
+    return any(marker in answer for marker in failure_markers)
+
+
 def ensure_best_practices(workdir: str) -> Path:
     """确保契约最佳实践材料存在；已有自定义文件必须原样保留。"""
 
@@ -308,12 +536,20 @@ __all__ = [
     "ContractSignal",
     "DEFAULT_BEST_PRACTICES",
     "FILE_CHANGE_TOOLS",
+    "RuleFloor",
+    "SCOREBOARD_RELPATH",
+    "Scoreboard",
+    "ScorerResult",
     "TOOL_THRESHOLD",
     "TriggerReason",
     "VERIFY_COMMAND_KEYWORDS",
+    "apply_score",
     "build_evidence_hash",
+    "build_rule_floor",
     "ensure_best_practices",
+    "load_scoreboard",
     "pressure_summary",
     "sign_evidence",
+    "validate_scorer_result",
     "verify_signature",
 ]
