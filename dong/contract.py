@@ -19,6 +19,9 @@ VERIFY_COMMAND_KEYWORDS = (
     "lint",
     "build",
     "uv run",
+    "uv run python",
+    "python -c",
+    "python3 -c",
     "assert",
 )
 FILE_CHANGE_TOOLS = {"write", "edit"}
@@ -139,6 +142,8 @@ class ContractSignal:
     name: str = ""
     detail: str = ""
     success: bool | None = None
+    summary: str = ""
+    result_detail: str = ""
     error: str = ""
     tool_call_id: str = ""
 
@@ -154,6 +159,8 @@ class ContractSignal:
         name: str,
         *,
         success: bool,
+        summary: str = "",
+        result_detail: str = "",
         error: str = "",
         tool_call_id: str = "",
     ) -> ContractSignal:
@@ -163,6 +170,8 @@ class ContractSignal:
             kind="tool_result",
             name=name,
             success=success,
+            summary=summary,
+            result_detail=result_detail,
             error=error,
             tool_call_id=tool_call_id,
         )

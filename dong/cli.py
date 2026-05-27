@@ -623,6 +623,8 @@ def _build_contract_evidence(
         }
         if contract_signal.kind == "tool_result":
             item["success"] = contract_signal.success
+            item["summary"] = contract_signal.summary
+            item["detail"] = contract_signal.result_detail
             item["error"] = contract_signal.error
             item["tool_call_id"] = contract_signal.tool_call_id
         tool_summary.append(item)
@@ -1294,6 +1296,8 @@ def run_loop(
                             ContractSignal.tool_result(
                                 name,
                                 success=invalid_result.success,
+                                summary=invalid_result.summary,
+                                result_detail=invalid_result.detail,
                                 error=invalid_result.error,
                                 tool_call_id=tc.id,
                             ),
@@ -1323,6 +1327,7 @@ def run_loop(
                             ContractSignal.tool_result(
                                 name,
                                 success=False,
+                                summary="User cancelled dangerous command",
                                 error="User cancelled dangerous command",
                                 tool_call_id=tc.id,
                             ),
@@ -1386,6 +1391,8 @@ def run_loop(
                     ContractSignal.tool_result(
                         name,
                         success=result.success,
+                        summary=result.summary,
+                        result_detail=result.detail,
                         error=result.error,
                         tool_call_id=tc.id,
                     ),

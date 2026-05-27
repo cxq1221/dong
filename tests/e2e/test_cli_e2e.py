@@ -327,7 +327,7 @@ def test_contract_pressure_injected_after_complex_signal(tmp_path, monkeypatch) 
     """复杂信号触发后，下一轮模型请求应看到契约压力摘要。"""
     responses = iter([
         _assistant_message(tool_calls=[
-            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "x", "new": "y"}')
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old_string": "x", "new_string": "y"}')
         ]),
         _assistant_message(content="done"),
     ])
@@ -357,7 +357,7 @@ def test_contract_artifact_created_after_complex_final_answer(tmp_path, monkeypa
     (tmp_path / "a.py").write_text("x", encoding="utf-8")
     responses = iter([
         _assistant_message(tool_calls=[
-            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "x", "new": "y"}')
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old_string": "x", "new_string": "y"}')
         ]),
         _assistant_message(content="已修改 a.py；未运行测试。"),
     ])
@@ -395,7 +395,7 @@ def test_contract_artifact_records_assert_bash_verification(tmp_path, monkeypatc
     )
     responses = iter([
         _assistant_message(tool_calls=[
-            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "value = 1", "new": "value = 2"}')
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old_string": "value = 1", "new_string": "value = 2"}')
         ]),
         _assistant_message(tool_calls=[
             _tool_call("call-2", "bash", assert_command)
@@ -424,12 +424,55 @@ def test_contract_artifact_records_assert_bash_verification(tmp_path, monkeypatc
     assert payload["unverified_items"] == []
 
 
+def test_contract_artifact_records_python_print_verification_output(tmp_path, monkeypatch) -> None:
+    """python -c 打印校验值时，证据包应记录命令和输出。"""
+    (tmp_path / "a.py").write_text("value = 1\n", encoding="utf-8")
+    command = json.dumps({
+        "command": "python -c \"exec(open('a.py').read()); print('value =', value)\""
+    })
+    responses = iter([
+        _assistant_message(tool_calls=[
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old_string": "value = 1", "new_string": "value = 2"}')
+        ]),
+        _assistant_message(tool_calls=[
+            _tool_call("call-2", "bash", command)
+        ]),
+        _assistant_message(content="已修改并通过 python -c 验证。"),
+        _assistant_message(content='{"score": 92, "deductions": [], "risk_flags": [], "lesson_for_session": "", "workspace_summary": "已验证"}'),
+    ])
+
+    monkeypatch.setattr(
+        cli,
+        "chat",
+        lambda _messages, _tools, instructions="", **_kwargs: next(responses),
+    )
+
+    cli.run_loop(
+        cli.build_agent_prompt([], str(tmp_path)),
+        [{"role": "user", "content": "edit and verify"}],
+        str(tmp_path),
+        max_turns=4,
+    )
+
+    artifacts = list((tmp_path / ".dong" / "contracts").glob("session-*.json"))
+    assert len(artifacts) == 1
+    payload = json.loads(artifacts[0].read_text(encoding="utf-8"))
+    assert payload["verification_evidence"]
+    bash_results = [
+        item
+        for item in payload["tool_summary"]
+        if item["kind"] == "tool_result" and item["name"] == "bash"
+    ]
+    assert bash_results[0]["success"] is True
+    assert "value = 2" in bash_results[0]["detail"]
+
+
 def test_contract_artifact_records_read_after_edit_verification(tmp_path, monkeypatch) -> None:
     """文件修改后的 read/grep 复查应进入契约验证证据。"""
     (tmp_path / "a.py").write_text("value = 1\n", encoding="utf-8")
     responses = iter([
         _assistant_message(tool_calls=[
-            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "value = 1", "new": "value = 2"}')
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old_string": "value = 1", "new_string": "value = 2"}')
         ]),
         _assistant_message(tool_calls=[
             _tool_call("call-2", "read", '{"filepath": "a.py"}')
@@ -465,7 +508,7 @@ def test_contract_scorer_updates_scoreboard_and_session_lesson(tmp_path, monkeyp
     (tmp_path / "a.py").write_text("x", encoding="utf-8")
     responses = iter([
         _assistant_message(tool_calls=[
-            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "x", "new": "y"}')
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old_string": "x", "new_string": "y"}')
         ]),
         _assistant_message(content="已修改 a.py。"),
         _assistant_message(content='{"score": 58, "deductions": ["missing_verification"], "risk_flags": ["unstable_delivery"], "lesson_for_session": "后续修改必须先运行相关测试。", "workspace_summary": "缺少验证"}'),
@@ -498,7 +541,7 @@ def test_contract_flow_logs_required_audit_events(tmp_path, monkeypatch) -> None
     (tmp_path / "a.py").write_text("x", encoding="utf-8")
     responses = iter([
         _assistant_message(tool_calls=[
-            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "x", "new": "y"}')
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old_string": "x", "new_string": "y"}')
         ]),
         _assistant_message(content="已修改 a.py。"),
         _assistant_message(content='{"score": 58, "deductions": ["missing_verification"], "risk_flags": [], "lesson_for_session": "先运行测试。", "workspace_summary": "缺少验证"}'),
@@ -572,7 +615,7 @@ def test_contract_signature_failure_is_logged_without_crashing(tmp_path, monkeyp
     (tmp_path / "a.py").write_text("x", encoding="utf-8")
     responses = iter([
         _assistant_message(tool_calls=[
-            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "x", "new": "y"}')
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old_string": "x", "new_string": "y"}')
         ]),
         _assistant_message(content="已修改 a.py。"),
     ])
@@ -605,7 +648,7 @@ def test_contract_scorer_failure_is_logged_without_scoreboard(tmp_path, monkeypa
     (tmp_path / "a.py").write_text("x", encoding="utf-8")
     responses = iter([
         _assistant_message(tool_calls=[
-            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "x", "new": "y"}')
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old_string": "x", "new_string": "y"}')
         ]),
         _assistant_message(content="已修改 a.py。"),
         _assistant_message(content="not-json"),
