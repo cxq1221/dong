@@ -11,7 +11,16 @@ from pathlib import Path
 
 CONTRACT_VERSION = 1
 TOOL_THRESHOLD = 5
-VERIFY_COMMAND_KEYWORDS = ("pytest", "ruff", "mypy", "test", "lint", "build", "uv run")
+VERIFY_COMMAND_KEYWORDS = (
+    "pytest",
+    "ruff",
+    "mypy",
+    "test",
+    "lint",
+    "build",
+    "uv run",
+    "assert",
+)
 FILE_CHANGE_TOOLS = {"write", "edit"}
 BEST_PRACTICES_RELPATH = ".dong/contracts/best-practices.md"
 SCOREBOARD_RELPATH = ".dong/scoreboard.json"

@@ -32,6 +32,7 @@ from dong.contract import (
     ContractSignature,
     ContractSignal,
     ScorerResult,
+    VERIFY_COMMAND_KEYWORDS,
     apply_score,
     build_rule_floor,
     ensure_best_practices,
@@ -598,10 +599,7 @@ def _contract_tool_args(detail: str) -> dict:
 def _looks_like_contract_verification(command: str) -> bool:
     """用保守关键词识别契约证据里的验证命令。"""
     command_lower = command.lower()
-    return any(
-        keyword in command_lower
-        for keyword in ("pytest", "ruff", "test", "lint", "build")
-    )
+    return any(keyword in command_lower for keyword in VERIFY_COMMAND_KEYWORDS)
 
 
 def _build_contract_evidence(
