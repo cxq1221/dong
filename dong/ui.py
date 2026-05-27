@@ -733,7 +733,7 @@ def _format_working_message(
 
 
 def _assistant_display_text(text: str) -> str:
-    """提取最终回答文本；兼容 JSON Output 包装后的 content/message/answer。"""
+    """提取最终回答文本；只在纯单键 JSON Output 包装时解包 content/message/answer。"""
     normalized = _normalize_model_text(text)
     if not normalized or not normalized.startswith("{"):
         return normalized
@@ -743,12 +743,15 @@ def _assistant_display_text(text: str) -> str:
     except json.JSONDecodeError:
         return normalized
 
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or len(payload) != 1:
         return normalized
 
-    for key in ("content", "message", "answer"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return _normalize_model_text(value)
+    key = next(iter(payload))
+    if key not in ("content", "message", "answer"):
+        return normalized
+
+    value = payload[key]
+    if isinstance(value, str) and value.strip():
+        return _normalize_model_text(value)
 
     return normalized

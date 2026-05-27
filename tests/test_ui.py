@@ -157,8 +157,23 @@ def test_assistant_message_dedents_accidental_leading_spaces() -> None:
     assert "**{name}**" not in rendered
 
 
-def test_assistant_message_unwraps_json_output_content() -> None:
-    """JSON Output 包装的最终回答应只渲染 content，而不是原始 JSON。"""
+def test_assistant_message_unwraps_single_key_json_output_content() -> None:
+    """单字段 JSON Output 包装的最终回答应只渲染 content。"""
+    out = StringIO()
+    ui = TerminalUI(stdout=out)
+
+    ui.show_assistant_message('{"content": "# 产品文档\\n\\n- 中文内容"}')
+
+    rendered = out.getvalue()
+    assert "assistant" in rendered
+    assert "产品文档" in rendered
+    assert "中文内容" in rendered
+    assert '"content"' not in rendered
+    assert '"format"' not in rendered
+
+
+def test_assistant_message_preserves_multi_key_json_output() -> None:
+    """多字段 JSON 不应被误判为纯回答包装，避免丢失模型输出结构。"""
     out = StringIO()
     ui = TerminalUI(stdout=out)
 
@@ -167,11 +182,8 @@ def test_assistant_message_unwraps_json_output_content() -> None:
     )
 
     rendered = out.getvalue()
-    assert "assistant" in rendered
-    assert "产品文档" in rendered
-    assert "中文内容" in rendered
-    assert '"content"' not in rendered
-    assert '"format"' not in rendered
+    assert '"content"' in rendered
+    assert '"format"' in rendered
 
 
 def test_reasoning_message_renders_thinking_panel() -> None:
