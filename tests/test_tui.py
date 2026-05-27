@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import threading
 
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 
 from dong.tool import ToolResult
-from dong.tui import TuiApp, _fit_to_width, render_markdown
+from dong.tui import TuiApp, _fit_to_width, render_markdown, render_text
 
 
 def _content_line_text(content, line_no: int) -> str:  # type: ignore[no-untyped-def]
@@ -18,6 +20,15 @@ def _completion_texts(app: TuiApp, text: str) -> list[str]:
     completer = app.composer.completer
     assert completer is not None
     return [item.text for item in completer.get_completions(Document(text), None)]
+
+
+def _mouse_event(row: int, event_type: MouseEventType) -> MouseEvent:
+    return MouseEvent(
+        position=Point(x=0, y=row),
+        event_type=event_type,
+        button=MouseButton.LEFT,
+        modifiers=frozenset(),
+    )
 
 
 def test_rich_markdown_renders_offscreen_with_ansi_color() -> None:
@@ -38,6 +49,14 @@ def test_rich_markdown_respects_narrow_width() -> None:
 
     plain = rendered.replace("\x1b[0m", "")
     assert len(plain.splitlines()) > 1
+
+
+def test_render_text_preserves_square_brackets() -> None:
+    """普通文本渲染不能把方括号内容误当 Rich markup 吞掉。"""
+    rendered = render_text("user", "literal [notatag] and [red] text")
+
+    assert "[notatag]" in rendered
+    assert "[red]" in rendered
 
 
 def test_status_text_is_truncated_to_display_width() -> None:
@@ -92,6 +111,29 @@ def test_tui_worker_processes_queued_inputs_in_order() -> None:
     assert seen == ["first", "second"]
 
 
+def test_tui_exit_unblocks_pending_confirmation() -> None:
+    """TUI 退出时应拒绝并唤醒危险命令确认，避免 worker 线程挂住。"""
+    confirmation_seen = threading.Event()
+
+    def process_input(_text: str, ui) -> bool:  # type: ignore[no-untyped-def]
+        confirmation_seen.set()
+        ui.confirm_dangerous_command("rm -rf tmp", "n")
+        raise AssertionError("shutdown should abort the active confirmation")
+
+    app = TuiApp(process_input=process_input, completion_provider=lambda: [])
+    app._worker_thread.start()
+
+    app.submit_text("run")
+    assert confirmation_seen.wait(timeout=1)
+    assert app.composer.buffer.read_only()
+
+    app.request_exit()
+    app._worker_thread.join(timeout=1)
+
+    assert not app._worker_thread.is_alive()
+    assert not app.composer.buffer.read_only()
+
+
 def test_tui_confirmation_blocks_until_answered() -> None:
     """危险命令确认应由 TUI 同步等待用户回答。"""
     app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
@@ -119,6 +161,111 @@ def test_tui_slash_completer_filters_skills() -> None:
     assert "/review" in _completion_texts(app, "/")
     assert "clear" not in _completion_texts(app, "/")
     assert _completion_texts(app, "/re") == ["/review"]
+
+
+def test_tui_ui_shows_auto_skill_selection() -> None:
+    """TUI 适配器应支持自动 skill 提示，避免自动路由路径崩溃。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+
+    app.ui.show_auto_skill("chrome-cdp", "matched: 浏览器")
+
+    assert "Matched skill: chrome-cdp" in app.transcript_text
+    assert "mode      auto" in app.transcript_text
+    assert "matched: 浏览器" in app.transcript_text
+
+
+def test_tui_status_completion_hint_uses_short_lived_cache() -> None:
+    """状态栏反复重绘时不应每次都重新扫描 completion provider。"""
+    calls = 0
+
+    def completions() -> list[str]:
+        nonlocal calls
+        calls += 1
+        return ["/skill", "/review"]
+
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=completions)
+    app.composer.buffer.text = "/"
+
+    assert "/review" in str(app._formatted_status())
+    assert "/review" in str(app._formatted_status())
+    assert calls == 1
+
+
+def test_tui_defaults_to_copy_friendly_mouse_mode() -> None:
+    """TUI 默认不捕获鼠标，终端应能直接拖选 transcript 文本复制。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+
+    assert app.application.mouse_support() is False
+    assert "copy" in str(app._formatted_status())
+
+    assert app.toggle_mouse_capture() is True
+
+    assert app.application.mouse_support() is True
+    assert "mouse" in str(app._formatted_status())
+
+
+def test_tui_status_shows_context_usage() -> None:
+    """TUI status bar 应展示完整 context window，并单独标出压缩阈值。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+
+    app.ui.show_context_usage(
+        estimated_tokens=1234,
+        budget_limit=800_000,
+        context_window_tokens=1_000_000,
+        compacted=False,
+    )
+
+    rendered = str(app._formatted_status())
+    assert "ctx 1.2k/1M 0% · compact at 800k" in rendered
+
+
+def test_tui_status_uses_budget_when_context_window_is_unknown() -> None:
+    """未知模型没有完整窗口时，TUI 继续按压缩预算展示。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+
+    app.ui.show_context_usage(
+        estimated_tokens=1234,
+        budget_limit=10_000,
+        context_window_tokens=None,
+        compacted=False,
+    )
+
+    rendered = str(app._formatted_status())
+    assert "ctx 1.2k/10k 12%" in rendered
+
+
+def test_tui_status_marks_compacted_context_and_clear_resets_usage() -> None:
+    """发生压缩时 status 应标记 compacted，清空上下文后应移除用量展示。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+
+    app.ui.show_context_usage(
+        estimated_tokens=9500,
+        budget_limit=10_000,
+        context_window_tokens=None,
+        compacted=True,
+    )
+    assert "compacted" in str(app._formatted_status())
+
+    app.ui.show_context_cleared()
+
+    assert "ctx " not in str(app._formatted_status())
+
+
+def test_tui_tool_result_finishes_active_streaming_message() -> None:
+    """工具调用后的下一轮最终答复不应覆盖上一轮 streaming 前言。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+
+    with app.ui.stream_assistant_message() as write_assistant:
+        write_assistant("I will inspect first.")
+    app.ui.show_tool_result(
+        "bash",
+        '{"command": "ls"}',
+        ToolResult(success=True, summary="$ ls", detail=""),
+    )
+    app.ui.show_assistant_message("Final answer")
+
+    assert "I will inspect first." in app.transcript_text
+    assert "Final answer" in app.transcript_text
 
 
 def test_tui_tool_result_preserves_update_plan_detail() -> None:
@@ -168,6 +315,112 @@ def test_transcript_manual_scroll_changes_visible_slice() -> None:
 
     assert content.cursor_position.y == 39
     assert _content_line_text(content, content.line_count - 1) == "line 39"
+
+
+def test_transcript_manual_scroll_stays_pinned_when_new_output_arrives() -> None:
+    """手动离开底部后，新输出不应把当前历史视图继续向下推。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
+    app.transcript_control.create_content(width=80, height=20)
+    app.scroll_transcript(20)
+    before = app.transcript_control.create_content(width=80, height=20)
+
+    app.append_item("assistant", "assistant", "line 60")
+    after = app.transcript_control.create_content(width=80, height=20)
+
+    assert _content_line_text(before, before.line_count - 1) == "line 39"
+    assert _content_line_text(after, after.line_count - 1) == "line 39"
+    assert app.status.new_output is True
+    assert not app._follow_bottom
+
+
+def test_transcript_returning_to_bottom_resumes_following_new_output() -> None:
+    """手动滚动回到底部后，应清除新输出标记并恢复自动跟随。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
+    app.transcript_control.create_content(width=80, height=20)
+    app.scroll_transcript(20)
+    app.append_item("assistant", "assistant", "line 60")
+
+    app.scroll_transcript(-1000)
+    bottom = app.transcript_control.create_content(width=80, height=20)
+    app.append_item("assistant", "assistant", "line 61")
+    after = app.transcript_control.create_content(width=80, height=20)
+
+    assert _content_line_text(bottom, bottom.line_count - 1) == "line 60"
+    assert _content_line_text(after, after.line_count - 1) == "line 61"
+    assert app.status.new_output is False
+    assert app._follow_bottom
+
+
+def test_transcript_scrollbar_is_hidden_when_content_fits() -> None:
+    """内容不足一屏时，右侧滚动条只占位不显示滑块。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(10)))
+
+    app.transcript_control.create_content(width=80, height=20)
+    rendered = "".join(text for _style, text in app._formatted_scrollbar())
+
+    assert "█" not in rendered
+    assert "│" not in rendered
+
+
+def test_transcript_scrollbar_thumb_tracks_bottom_position() -> None:
+    """长 transcript 应显示按比例计算的滚动条滑块。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
+
+    app.transcript_control.create_content(width=80, height=20)
+    state = app._scrollbar_state_locked()
+
+    assert state.visible
+    assert state.thumb_height == 6
+    assert state.thumb_top == 14
+    assert state.max_scroll_offset == 40
+
+
+def test_transcript_scrollbar_probe_render_does_not_shrink_viewport() -> None:
+    """scrollbar 自身的布局探测不应覆盖 transcript 的真实可视高度。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
+    app.transcript_control.create_content(width=80, height=20)
+
+    app.scrollbar_control.create_content(width=1, height=1)
+    state = app._scrollbar_state_locked()
+
+    assert state.track_height == 20
+    assert state.thumb_height == 6
+    assert state.thumb_top == 14
+
+
+def test_transcript_scrollbar_track_click_jumps_to_position() -> None:
+    """点击滚动条轨道应把 transcript 跳转到对应历史位置。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
+    app.transcript_control.create_content(width=80, height=20)
+
+    app.scrollbar_control.mouse_handler(_mouse_event(0, MouseEventType.MOUSE_DOWN))
+
+    assert app._scroll_offset == 40
+    assert not app._follow_bottom
+
+
+def test_transcript_scrollbar_drag_updates_offset_and_returns_to_bottom() -> None:
+    """拖动滚动条滑块应实时更新位置，拖到底部后恢复 follow-bottom。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
+    app.transcript_control.create_content(width=80, height=20)
+
+    app.scrollbar_control.mouse_handler(_mouse_event(14, MouseEventType.MOUSE_DOWN))
+    app.scrollbar_control.mouse_handler(_mouse_event(0, MouseEventType.MOUSE_MOVE))
+    assert app._scroll_offset == 40
+    assert not app._follow_bottom
+
+    app.scrollbar_control.mouse_handler(_mouse_event(14, MouseEventType.MOUSE_MOVE))
+    app.scrollbar_control.mouse_handler(_mouse_event(14, MouseEventType.MOUSE_UP))
+
+    assert app._scroll_offset == 0
+    assert app._follow_bottom
 
 
 def test_tui_working_status_records_tool_start() -> None:

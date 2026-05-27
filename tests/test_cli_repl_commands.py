@@ -7,6 +7,7 @@ from threading import Event
 
 from dong import cli
 from dong.cli import _run_repl_with_input_queue, handle_repl_command, repl_completions
+from dong.tui import TuiApp
 from dong.ui import TerminalUI
 
 
@@ -75,6 +76,30 @@ def test_clear_command_preserves_behavior() -> None:
     assert action.exit_requested is False
     assert working == []
     assert "context cleared" in err.getvalue()
+
+
+def test_clear_command_updates_session_snapshot(tmp_path) -> None:
+    """clear 命令接入 session 时，应同步清空可恢复上下文。"""
+    from dong.session import SessionStore
+
+    ui, _err = _ui()
+    session = SessionStore(str(tmp_path)).create()
+    working = session.messages
+    session.append_message({"role": "user", "content": "hello"})
+
+    action = handle_repl_command(
+        "clear",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=working,
+        ui=ui,
+        session=session,
+    )
+    loaded = SessionStore(str(tmp_path)).load(session.session_id)
+
+    assert action.handled is True
+    assert working == []
+    assert loaded.messages == []
 
 
 def test_interactive_repl_queues_input_while_agent_is_working(
@@ -188,7 +213,7 @@ def test_skill_load_and_unskill_preserve_loaded_skill_list(tmp_path) -> None:
 def test_slash_skill_invocation_returns_prompt(tmp_path) -> None:
     """`/review prompt` 应加载 skill 并把剩余文本作为 prompt 返回。"""
     _write(tmp_path / ".dong" / "skills" / "review.md", "# Review")
-    ui, _err = _ui()
+    ui, err = _ui()
     loaded: list[str] = []
 
     action = handle_repl_command(
@@ -202,6 +227,10 @@ def test_slash_skill_invocation_returns_prompt(tmp_path) -> None:
     assert action.handled is True
     assert action.prompt == "inspect cli.py"
     assert loaded == ["review"]
+    rendered = err.getvalue()
+    assert "Matched skill" in rendered
+    assert "review" in rendered
+    assert "slash" in rendered
 
 
 def test_bare_skill_invocation_supports_frontmatter_alias(tmp_path) -> None:
@@ -210,7 +239,7 @@ def test_bare_skill_invocation_supports_frontmatter_alias(tmp_path) -> None:
         tmp_path / ".dong" / "skills" / "review.md",
         "---\nname: code-review\n---\n\n# Review",
     )
-    ui, _err = _ui()
+    ui, err = _ui()
     loaded: list[str] = []
 
     action = handle_repl_command(
@@ -224,6 +253,10 @@ def test_bare_skill_invocation_supports_frontmatter_alias(tmp_path) -> None:
     assert action.handled is True
     assert action.prompt == "inspect cli.py"
     assert loaded == ["code-review"]
+    rendered = err.getvalue()
+    assert "Matched skill" in rendered
+    assert "code-review" in rendered
+    assert "bare" in rendered
 
 
 def test_repl_completions_include_commands_and_skills(tmp_path) -> None:
@@ -263,8 +296,8 @@ def test_repl_completions_include_frontmatter_name_and_entry_alias(tmp_path) -> 
     assert "/review" in completions
 
 
-def test_repl_auto_skill_is_temporary_for_current_turn(tmp_path, monkeypatch) -> None:
-    """普通 prompt 命中意图时，应只在当前轮临时注入自动选择的 skill。"""
+def test_repl_prompt_does_not_preselect_skill(tmp_path, monkeypatch) -> None:
+    """普通 prompt 不再做确定性预选，skill 交给模型通过工具发现和加载。"""
 
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     _write(
@@ -299,5 +332,37 @@ def test_repl_auto_skill_is_temporary_for_current_turn(tmp_path, monkeypatch) ->
     )
 
     assert loaded == []
-    assert "Skill: chrome-cdp" in seen_instructions[0]
-    assert "Auto skill: chrome-cdp" in err.getvalue()
+    assert "Skill: chrome-cdp" not in seen_instructions[0]
+    assert "Matched skill" not in err.getvalue()
+
+
+def test_repl_prompt_does_not_auto_inject_skill_in_tui(tmp_path, monkeypatch) -> None:
+    """fullscreen TUI 下普通 prompt 同样不做运行时自动 skill 预选。"""
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    _write(
+        tmp_path / ".dong" / "skills" / "chrome-cdp" / "SKILL.md",
+        "---\nname: chrome-cdp\nkeywords: 浏览器\n---\n\n# Chrome CDP\n",
+    )
+    loaded: list[str] = []
+    seen_instructions: list[str] = []
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+
+    def fake_run_loop(base_sys, working, _workdir, *, max_turns, ui, enable_mcp):  # type: ignore[no-untyped-def]
+        seen_instructions.append(base_sys.instructions)
+        working.append({"role": "assistant", "content": "ok"})
+
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+
+    cli._process_repl_input(
+        "帮我看浏览器",
+        workdir=str(tmp_path),
+        loaded_skills=loaded,
+        working=[],
+        ui=app.ui,
+        max_turns=3,
+        enable_mcp=False,
+    )
+
+    assert "Skill: chrome-cdp" not in seen_instructions[0]
+    assert "Matched skill: chrome-cdp" not in app.transcript_text

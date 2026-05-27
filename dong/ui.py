@@ -248,7 +248,23 @@ class TerminalUI:
 
     def show_auto_skill(self, name: str, reason: str) -> None:
         """展示本轮自动选择的 skill，让隐式上下文变成可见决策。"""
-        self.err_console.print(f"  Auto skill: {name} ({reason})")
+        self.show_skill_match(name, mode="auto", reason=reason)
+
+    def show_skill_match(
+        self,
+        name: str,
+        *,
+        mode: str,
+        source: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """展示本轮实际命中的 skill，区分自动、slash 和裸命中来源。"""
+        details = [mode]
+        if source:
+            details.append(source)
+        if reason:
+            details.append(reason)
+        self.err_console.print(f"  [bold cyan]Matched skill:[/] {name} [#57606a]({' · '.join(details)})[/]")
 
     def show_startup(
         self,
@@ -306,6 +322,17 @@ class TerminalUI:
     def show_context_cleared(self) -> None:
         """提示当前会话上下文已清空。"""
         self.err_console.print("  (context cleared)")
+
+    def show_context_usage(
+        self,
+        *,
+        estimated_tokens: int,
+        budget_limit: int,
+        context_window_tokens: int | None = None,
+        compacted: bool,
+    ) -> None:
+        """普通终端不持续展示 context 用量，TUI 会覆盖此方法。"""
+        return
 
     def show_workdir(self, workdir: str) -> None:
         """提示工作目录已切换。"""

@@ -210,6 +210,55 @@ cli.main()
         os.close(master_fd)
 
 
+def test_interactive_tty_tui_renders_visible_scrollbar_for_long_transcript(tmp_path) -> None:
+    """真实 TTY 渲染长 transcript 时，应能看到右侧轨道和多个滑块字符。"""
+    runner = tmp_path / "run_scrollbar_tui.py"
+    _write(
+        runner,
+        """
+import threading
+
+from dong.tui import TuiApp
+
+
+app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+app.append_item("assistant", "assistant", "\\n".join(f"line {index}" for index in range(80)))
+threading.Timer(0.6, app.application.exit).start()
+app.run()
+""",
+    )
+
+    master_fd, slave_fd = pty.openpty()
+    os.set_blocking(master_fd, False)
+    env = {
+        **os.environ,
+        "TERM": "xterm-256color",
+        "PROMPT_TOOLKIT_NO_CPR": "1",
+        "PYTHONUNBUFFERED": "1",
+    }
+    proc = subprocess.Popen(
+        [sys.executable, str(runner)],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=os.getcwd(),
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    try:
+        output = _read_until(master_fd, "█", timeout=5.0)
+        output += _read_available(master_fd, duration=0.5)
+        assert output.count("│") >= 8
+        assert output.count("█") >= 2
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+        _read_available(master_fd, duration=0.1)
+        os.close(master_fd)
+
+
 def test_interactive_tty_tui_ctrl_d_exits(tmp_path) -> None:
     """Ctrl-D 应直接退出全屏 TUI。"""
     master_fd, slave_fd = pty.openpty()

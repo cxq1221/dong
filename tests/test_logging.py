@@ -93,3 +93,40 @@ def test_payload_preview_requires_explicit_opt_in(monkeypatch) -> None:
 
     monkeypatch.setenv("DONG_LOG_PAYLOADS", "1")
     assert preview_payload("abcdef", limit=3) == "abc...(6 chars)"
+    assert preview_payload("token=raw-secret") == "token=[redacted]"
+    assert preview_payload("authorization: Bearer rawtoken") == (
+        "authorization: Bearer [redacted]"
+    )
+
+
+def test_configure_logging_uses_five_megabyte_rotation(tmp_path, monkeypatch) -> None:
+    """文件日志默认超过 5MiB 后应轮转成分文件保存。"""
+    monkeypatch.delenv("DONG_LOG_ENABLED", raising=False)
+    monkeypatch.delenv("DONG_LOG_MAX_BYTES", raising=False)
+    monkeypatch.delenv("DONG_LOG_BACKUP_COUNT", raising=False)
+
+    configure_logging(tmp_path, force=True)
+    handlers = [
+        handler
+        for handler in logging.getLogger("dong").handlers
+        if getattr(handler, "_dong_handler", False)
+    ]
+
+    assert handlers[0].maxBytes == 5 * 1024 * 1024
+    assert handlers[0].backupCount > 0
+
+
+def test_logging_rotates_into_split_files(tmp_path, monkeypatch) -> None:
+    """日志超过配置大小后，应生成同目录分片文件。"""
+    monkeypatch.delenv("DONG_LOG_ENABLED", raising=False)
+    monkeypatch.setenv("DONG_LOG_MAX_BYTES", "1024")
+    monkeypatch.setenv("DONG_LOG_BACKUP_COUNT", "2")
+    log_path = configure_logging(tmp_path, force=True)
+    logger = get_logger("rotate")
+
+    for index in range(4):
+        log_event(logger, logging.INFO, "large_event", index=index, text="x" * 900)
+    _flush_dong_logs()
+
+    assert log_path == tmp_path / "logs" / "dong.log"
+    assert (tmp_path / "logs" / "dong.log.1").exists()

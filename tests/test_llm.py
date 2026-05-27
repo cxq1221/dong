@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 from dong import llm
@@ -13,6 +14,7 @@ class _FakeCompletions:
     def __init__(self) -> None:
         self.kwargs: dict | None = None
         self.stream_chunks: list | None = None
+        self.usage = None
 
     def create(self, **kwargs):
         """记录请求参数，并返回最小 ChatCompletion 形状。"""
@@ -20,7 +22,10 @@ class _FakeCompletions:
         if kwargs.get("stream"):
             return iter(self.stream_chunks or [])
         message = SimpleNamespace(content="ok", tool_calls=[])
-        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message)],
+            usage=self.usage,
+        )
 
 
 class _FakeResponses:
@@ -28,11 +33,12 @@ class _FakeResponses:
 
     def __init__(self) -> None:
         self.kwargs: dict | None = None
+        self.usage = None
 
     def create(self, **kwargs):
         """记录请求参数，并返回最小 Responses 形状。"""
         self.kwargs = kwargs
-        return SimpleNamespace(output_text="ok", output=[])
+        return SimpleNamespace(output_text="ok", output=[], usage=self.usage)
 
 
 class _FakeAnthropicMessages:
@@ -43,11 +49,12 @@ class _FakeAnthropicMessages:
         self.stream_kwargs: dict | None = None
         self.stream_events: list = []
         self.stream_final_message = SimpleNamespace(content=[{"type": "text", "text": "ok"}])
+        self.usage = None
 
     def create(self, **kwargs):
         """记录请求参数，并返回最小 Anthropic Message 形状。"""
         self.kwargs = kwargs
-        return SimpleNamespace(content=[{"type": "text", "text": "ok"}])
+        return SimpleNamespace(content=[{"type": "text", "text": "ok"}], usage=self.usage)
 
     def stream(self, **kwargs):
         """记录流式请求参数，并返回可迭代的 Anthropic stream 替身。"""
@@ -113,6 +120,31 @@ def _anthropic_stream_event(delta):
     return SimpleNamespace(type="content_block_delta", delta=delta)
 
 
+def test_load_env_files_reads_home_dong_env(monkeypatch, tmp_path) -> None:
+    """uv tool 安装入口没有项目 .env 时，应能读取 ~/.dong/.env。"""
+    home_env = tmp_path / ".dong" / ".env"
+    home_env.parent.mkdir()
+    home_env.write_text("DONG_API_KEY=home-key\nDONG_LLM_API=anthropic\n", encoding="utf-8")
+    monkeypatch.delenv("DONG_API_KEY", raising=False)
+    monkeypatch.delenv("DONG_LLM_API", raising=False)
+
+    llm._load_env_files([home_env])
+
+    assert os.environ["DONG_API_KEY"] == "home-key"
+    assert os.environ["DONG_LLM_API"] == "anthropic"
+
+
+def test_load_env_files_keeps_existing_environment(monkeypatch, tmp_path) -> None:
+    """shell 显式传入的环境变量优先级应高于 .env 文件。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text("DONG_API_KEY=file-key\n", encoding="utf-8")
+    monkeypatch.setenv("DONG_API_KEY", "shell-key")
+
+    llm._load_env_files([env_file])
+
+    assert os.environ["DONG_API_KEY"] == "shell-key"
+
+
 def test_chat_passes_deepseek_thinking_and_reasoning_options(monkeypatch) -> None:
     """DeepSeek V4 thinking 配置应传入 ChatCompletions 请求。"""
     completions, _responses = _install_fake_client(monkeypatch)
@@ -143,6 +175,23 @@ def test_chat_passes_json_response_format_when_enabled(monkeypatch) -> None:
 
     assert completions.kwargs is not None
     assert completions.kwargs["response_format"] == {"type": "json_object"}
+
+
+def test_chat_attaches_chat_completion_usage(monkeypatch) -> None:
+    """ChatCompletions usage 应挂到返回消息，供运行日志记录真实 token。"""
+    completions, _responses = _install_fake_client(monkeypatch)
+    completions.usage = SimpleNamespace(
+        prompt_tokens=11,
+        completion_tokens=7,
+        total_tokens=18,
+    )
+    monkeypatch.setenv("DONG_LLM_API", "chat")
+
+    message = llm.chat([{"role": "user", "content": "usage"}], [], model="deepseek-v4-flash")
+
+    assert message.usage.input_tokens == 11
+    assert message.usage.output_tokens == 7
+    assert message.usage.total_tokens == 18
 
 
 def test_chat_streams_text_deltas_and_returns_final_message(monkeypatch) -> None:
@@ -347,6 +396,23 @@ def test_responses_mode_uses_responses_instructions(monkeypatch) -> None:
     }]
 
 
+def test_responses_mode_attaches_usage(monkeypatch) -> None:
+    """Responses API usage 应转成统一 input/output/total 字段。"""
+    _completions, responses = _install_fake_client(monkeypatch)
+    responses.usage = {
+        "input_tokens": 13,
+        "output_tokens": 5,
+        "total_tokens": 18,
+    }
+    monkeypatch.setenv("DONG_LLM_API", "responses")
+
+    message = llm.chat([{"role": "user", "content": "usage"}], [], model="gpt-4o")
+
+    assert message.usage.input_tokens == 13
+    assert message.usage.output_tokens == 5
+    assert message.usage.total_tokens == 18
+
+
 def test_responses_json_output_uses_text_format(monkeypatch) -> None:
     """Responses API 的 JSON Output 应放到 text.format。"""
     _completions, responses = _install_fake_client(monkeypatch)
@@ -401,6 +467,24 @@ def test_anthropic_converts_function_tools(monkeypatch) -> None:
         "description": "Read file",
         "input_schema": {"type": "object"},
     }]
+
+
+def test_anthropic_attaches_usage(monkeypatch) -> None:
+    """Anthropic usage 应包含缓存 token，并合并到 total_tokens。"""
+    anthropic_messages = _install_fake_anthropic_client(monkeypatch)
+    anthropic_messages.usage = SimpleNamespace(
+        input_tokens=20,
+        output_tokens=9,
+        cache_creation_input_tokens=3,
+        cache_read_input_tokens=4,
+    )
+    monkeypatch.setenv("DONG_LLM_API", "anthropic")
+
+    message = llm.chat([{"role": "user", "content": "usage"}], [], model="deepseek-v4-flash")
+
+    assert message.usage.input_tokens == 20
+    assert message.usage.output_tokens == 9
+    assert message.usage.total_tokens == 36
 
 
 def test_anthropic_response_tool_use_becomes_tool_calls(monkeypatch) -> None:

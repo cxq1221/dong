@@ -1,0 +1,5 @@
+{"type":"session_meta","version":1,"session_id":"session-1779871546892-1","created_at_ms":1779871546892,"updated_at_ms":1779871546892,"workspace_root":"/Users/joey/Desktop/dong","model":"deepseek-v4-pro","message_count":0}
+{"type":"prompt_history","timestamp_ms":1779871546895,"text":"hi"}
+{"type":"session_meta","version":1,"session_id":"session-1779871546892-1","created_at_ms":1779871546892,"updated_at_ms":1779871546895,"workspace_root":"/Users/joey/Desktop/dong","model":"deepseek-v4-pro","message_count":0}
+{"type":"message","message":{"role":"user","content":"hi"}}
+{"type":"session_meta","version":1,"session_id":"session-1779871546892-1","created_at_ms":1779871546892,"updated_at_ms":1779871546895,"workspace_root":"/Users/joey/Desktop/dong","model":"deepseek-v4-pro","message_count":1}

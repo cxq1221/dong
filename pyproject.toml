@@ -11,6 +11,8 @@ dependencies = [
     "prompt-toolkit>=3.0.52",
     "pydantic>=2.13.4",
     "rich>=15.0.0",
+    "tiktoken>=0.13.0",
+    "transformers>=4.52.0",
 ]
 
 [tool.uv]

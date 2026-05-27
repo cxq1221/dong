@@ -12,9 +12,11 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 from dong.logging_config import get_logger, log_event, preview_payload
+from dong.skills import resolve_skill, skill_catalog
 from dong.tool import ToolResult, registry
 
 LOGGER = get_logger(__name__)
+MAX_SKILL_TOOL_RESULTS = 5
 
 
 # ═══════════════════════════════════════
@@ -52,6 +54,24 @@ class FetchInput(BaseModel):
     """fetch 工具入参：要 GET 的 URL 和超时时间。"""
     url: str
     timeout: int = Field(default=15, gt=0)
+
+class SkillSearchInput(BaseModel):
+    """skill_search 工具入参：让模型按用户意图检索可用 skill。"""
+    query: str = Field(default="", description="Natural language skill search query")
+    limit: int = Field(
+        default=MAX_SKILL_TOOL_RESULTS,
+        ge=1,
+        le=MAX_SKILL_TOOL_RESULTS,
+        description="Maximum search results to return, capped at 5",
+    )
+
+class SkillLoadInput(BaseModel):
+    """skill_load 工具入参：声明模型希望本轮临时启用的 skill。"""
+    skill: str = Field(description="Skill name returned by skill_search")
+    args: str = Field(
+        default="",
+        description="Optional natural-language reason or remaining task context",
+    )
 
 class PlanItem(BaseModel):
     """update_plan 单个步骤：描述任务和当前状态。"""
@@ -313,6 +333,84 @@ def _build_grep_cmd(args: GrepInput) -> list[str]:
         cmd.extend(["--include", args.glob])
     cmd.extend([args.pattern, args.path])
     return cmd
+
+
+def _skill_search_score(query: str, text: str) -> int:
+    """按轻量词频给 skill 搜索结果排序；空查询退化为目录列表。"""
+    normalized_query = query.casefold().strip()
+    if not normalized_query:
+        return 0
+    normalized_text = text.casefold()
+    score = 0
+    for term in normalized_query.split():
+        if term and term in normalized_text:
+            score += 2
+    if normalized_query in normalized_text:
+        score += 5
+    return score
+
+
+@registry.register(
+    "skill_search",
+    "Search local skills by intent before loading task-specific instructions",
+)
+def skill_search_tool(args: SkillSearchInput, cwd: str) -> ToolResult:
+    """返回少量 skill 候选，只暴露元数据，避免把全部 skill 内容塞进上下文。"""
+    entries = skill_catalog(cwd)
+    scored = [
+        (_skill_search_score(args.query, entry.search_text), entry)
+        for entry in entries
+    ]
+    scored.sort(key=lambda item: (-item[0], item[1].name))
+    selected = [
+        entry
+        for score, entry in scored
+        if score > 0 or not args.query.strip()
+    ][: args.limit]
+    lines = []
+    for entry in selected:
+        summary = " ".join(entry.search_text.split())
+        if len(summary) > 220:
+            summary = summary[:217] + "..."
+        lines.append(f"- {entry.name}: {summary}")
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "skill_search_finished",
+        query_chars=len(args.query),
+        results=len(selected),
+    )
+    detail = "\n".join(lines) if lines else "(no matching skills)"
+    return ToolResult(
+        success=True,
+        summary=f"Found {len(selected)} skill candidate(s)",
+        detail=detail,
+    )
+
+
+@registry.register(
+    "skill_load",
+    "Load one skill for the current user turn; its instructions are injected into the next model request",
+)
+def skill_load_tool(args: SkillLoadInput, cwd: str) -> ToolResult:
+    """校验 skill 是否存在；真正的指令注入由 agent loop 在下一次请求前完成。"""
+    info = resolve_skill(cwd, args.skill)
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "skill_load_requested",
+        skill=info.name,
+        source=info.selected_source,
+        args_chars=len(args.args),
+    )
+    return ToolResult(
+        success=True,
+        summary=f"Skill queued for this turn: {info.name}",
+        detail=(
+            "Skill instructions will be injected into the next model request. "
+            "The SKILL.md body is intentionally not returned as tool output."
+        ),
+    )
 
 
 @registry.register("fetch", "GET a URL and return its content")

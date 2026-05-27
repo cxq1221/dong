@@ -1,0 +1,7 @@
+{"type":"session_meta","version":1,"session_id":"session-1779871645865-1","created_at_ms":1779871645865,"updated_at_ms":1779871645865,"workspace_root":"/Users/joey/Desktop/dong","model":"deepseek-v4-pro","message_count":0}
+{"type":"prompt_history","timestamp_ms":1779871645870,"text":"hi"}
+{"type":"session_meta","version":1,"session_id":"session-1779871645865-1","created_at_ms":1779871645865,"updated_at_ms":1779871645870,"workspace_root":"/Users/joey/Desktop/dong","model":"deepseek-v4-pro","message_count":0}
+{"type":"message","message":{"role":"user","content":"hi"}}
+{"type":"session_meta","version":1,"session_id":"session-1779871645865-1","created_at_ms":1779871645865,"updated_at_ms":1779871645870,"workspace_root":"/Users/joey/Desktop/dong","model":"deepseek-v4-pro","message_count":1}
+{"type":"message","message":{"role":"assistant","content":"嗨！有什么我可以帮忙的吗？","reasoning_content":"The user is just saying hi. This is a casual greeting, so I should respond naturally and conversationally, without any structured format or tool calls.","_anthropic_content_blocks":[{"signature":"f19a927b-d1d5-4a35-b988-be12508ef261","thinking":"The user is just saying hi. This is a casual greeting, so I should respond naturally and conversationally, without any structured format or tool calls.","type":"thinking"},{"text":"嗨！有什么我可以帮忙的吗？","type":"text"}]}}
+{"type":"session_meta","version":1,"session_id":"session-1779871645865-1","created_at_ms":1779871645865,"updated_at_ms":1779871648416,"workspace_root":"/Users/joey/Desktop/dong","model":"deepseek-v4-pro","message_count":2}

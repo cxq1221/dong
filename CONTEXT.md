@@ -48,6 +48,10 @@ _Avoid_: brittle ANSI snapshot
 The runtime diagnostic stream written by dong into `logs/dong.log`, with `dong logs` support for level, event, logger, and text filtering over stable event names and JSON field payloads.
 _Avoid_: ad hoc print debugging, prompt dumps
 
+**Context Compaction Module**:
+The module that owns conversation-history budget estimation, model-aware compaction thresholds, summary generation, summary file persistence, and tool-call/tool-result pair preservation.
+_Avoid_: ad hoc trim helper, token cleanup branch, caller-owned history pruning
+
 **First-Phase UI Dependencies**:
 The first fullscreen TUI phase uses Rich and prompt_toolkit.Application while keeping argparse and avoiding Textual.
 _Avoid_: Typer migration, Textual dependency
@@ -61,6 +65,7 @@ _Avoid_: Typer migration, Textual dependency
 - A **TUI UI Adapter** preserves the agent-loop UI method surface while routing output into the **Transcript**.
 - **Offscreen Rich Rendering** lets **First-Phase Rich Rendering** coexist with a **Persistent Composer**.
 - **Operational File Logging** records the agent loop, LLM adapter, skill loading, and tool execution paths without changing user-visible terminal output, then exposes filtered local inspection through `dong logs`.
+- The **Context Compaction Module** protects the agent loop from context-window growth while preserving resumable intent and provider-valid tool history.
 - **First-Phase Prompt Input** belongs inside the **Terminal UI Module**.
 - **First-Phase Rich Rendering** belongs inside the **Terminal UI Module**.
 - **Behavior Compatibility Tests** verify a **Behavior-Compatible UI Phase**.

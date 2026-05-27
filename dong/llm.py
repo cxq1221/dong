@@ -16,14 +16,27 @@ from dong.logging_config import get_logger, log_event
 
 LOGGER = get_logger(__name__)
 
-# 自动加载项目根目录的 .env，避免为了一个简单场景额外引入依赖。
-_env_path = pathlib.Path(__file__).resolve().parent.parent / ".env"
-if _env_path.exists():
-    for line in _env_path.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, _, v = line.partition("=")
-            os.environ.setdefault(k.strip(), v.strip())
+def _env_file_candidates() -> list[pathlib.Path]:
+    """返回 dong 支持的 .env 位置；用户全局配置用于 uv tool 等安装入口。"""
+    return [
+        pathlib.Path(__file__).resolve().parent.parent / ".env",
+        pathlib.Path.home() / ".dong" / ".env",
+    ]
+
+
+def _load_env_files(paths: list[pathlib.Path] | None = None) -> None:
+    """按顺序加载 .env；已存在的进程环境变量不被文件覆盖。"""
+    for env_path in paths or _env_file_candidates():
+        if not env_path.exists():
+            continue
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip())
+
+
+_load_env_files()
 
 _openai_client = None
 _anthropic_client = None
@@ -344,7 +357,11 @@ def _anthropic_messages_and_system(messages: list, instructions: str) -> tuple[l
             converted.append({"role": "user", "content": tool_results})
             continue
         if role == "assistant":
-            preserved_blocks = getattr(message, "_anthropic_content_blocks", None)
+            preserved_blocks = (
+                message.get("_anthropic_content_blocks")
+                if isinstance(message, dict)
+                else getattr(message, "_anthropic_content_blocks", None)
+            )
             if preserved_blocks:
                 converted.append({"role": "assistant", "content": preserved_blocks})
                 index += 1
@@ -465,6 +482,45 @@ def _response_tool_calls(response: Any) -> list:
     return calls
 
 
+def _usage_value(usage: Any, *names: str) -> int:
+    """兼容不同 provider 的 usage 字段命名，返回第一个可用整数。"""
+    for name in names:
+        value = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+        if isinstance(value, int):
+            return value
+    return 0
+
+
+def _normalized_usage(usage: Any) -> SimpleNamespace | None:
+    """把 OpenAI/Anthropic usage 规整成 dong 内部一致字段。"""
+    if usage is None:
+        return None
+    input_tokens = _usage_value(usage, "input_tokens", "prompt_tokens")
+    output_tokens = _usage_value(usage, "output_tokens", "completion_tokens")
+    cache_creation_input_tokens = _usage_value(usage, "cache_creation_input_tokens")
+    cache_read_input_tokens = _usage_value(usage, "cache_read_input_tokens")
+    total_tokens = _usage_value(usage, "total_tokens") or (
+        input_tokens
+        + output_tokens
+        + cache_creation_input_tokens
+        + cache_read_input_tokens
+    )
+    return SimpleNamespace(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+def _attach_usage(message: Any, usage: Any) -> None:
+    """把 provider usage 挂到统一 message 上，保持 chat() 返回形状兼容。"""
+    normalized = _normalized_usage(usage)
+    if normalized is not None:
+        message.usage = normalized
+
+
 def _responses_message(response: Any) -> SimpleNamespace:
     """把 Responses API 返回转换成 CLI 主循环已经理解的 assistant message。"""
     message = SimpleNamespace(
@@ -475,6 +531,7 @@ def _responses_message(response: Any) -> SimpleNamespace:
     reasoning_content = getattr(response, "reasoning_content", None)
     if reasoning_content:
         message.reasoning_content = reasoning_content
+    _attach_usage(message, getattr(response, "usage", None))
     return message
 
 
@@ -567,6 +624,7 @@ def _anthropic_message(response: Any) -> SimpleNamespace:
     reasoning_content = _anthropic_reasoning_content(response)
     if reasoning_content:
         message.reasoning_content = reasoning_content
+    _attach_usage(message, getattr(response, "usage", None))
     return message
 
 
@@ -586,13 +644,16 @@ def _create_responses(request: LlmRequest):
 
 def _create_chat_completion(request: LlmRequest):
     """使用 ChatCompletions 发起请求；instructions 兼容为 system message。"""
-    return _get_openai_client().chat.completions.create(
+    response = _get_openai_client().chat.completions.create(
         model=request.model,
         messages=_chat_messages(request.input, request.instructions),
         tools=request.tools,
         temperature=0,
         **_chat_request_options(),
-    ).choices[0].message
+    )
+    message = response.choices[0].message
+    _attach_usage(message, getattr(response, "usage", None))
+    return message
 
 
 def _create_chat_completion_stream(
@@ -818,6 +879,7 @@ def chat(
     duration_ms = int((time.monotonic() - started) * 1000)
     tool_calls = getattr(message, "tool_calls", None) or []
     content = getattr(message, "content", None) or ""
+    usage = getattr(message, "usage", None)
     log_event(
         LOGGER,
         logging.INFO,
@@ -826,5 +888,8 @@ def chat(
         duration_ms=duration_ms,
         tool_calls=len(tool_calls),
         content_chars=len(content),
+        input_tokens=getattr(usage, "input_tokens", 0),
+        output_tokens=getattr(usage, "output_tokens", 0),
+        total_tokens=getattr(usage, "total_tokens", 0),
     )
     return message

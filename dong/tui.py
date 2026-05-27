@@ -19,9 +19,9 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
-from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
 from rich.console import Console
@@ -61,6 +61,16 @@ class StatusState:
 
 
 @dataclass
+class ContextUsageState:
+    """TUI status bar 中展示的上下文预算使用情况。"""
+
+    estimated_tokens: int = 0
+    budget_limit: int = 0
+    context_window_tokens: int = 0
+    compacted: bool = False
+
+
+@dataclass
 class ConfirmationRequest:
     """A synchronous confirmation owned by the active agent/tool turn."""
 
@@ -68,6 +78,17 @@ class ConfirmationRequest:
     default: str
     done: threading.Event = field(default_factory=threading.Event)
     result: bool | None = None
+
+
+@dataclass(frozen=True)
+class ScrollbarState:
+    """Transcript 滚动条的可视区和滑块位置。"""
+
+    visible: bool
+    track_height: int
+    thumb_top: int
+    thumb_height: int
+    max_scroll_offset: int
 
 
 class _TranscriptControl(FormattedTextControl):
@@ -86,12 +107,52 @@ class _TranscriptControl(FormattedTextControl):
         self._fragment_cache.clear()
         self._content_cache.clear()
 
+    def create_content(self, width: int, height: int | None):  # type: ignore[no-untyped-def]
+        self.app.set_transcript_viewport_height(height or 1)
+        return super().create_content(width, height)
+
     def mouse_handler(self, mouse_event: MouseEvent):  # type: ignore[no-untyped-def]
         if mouse_event.event_type == MouseEventType.SCROLL_UP:
             self.app.scroll_transcript(3)
             return None
         if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
             self.app.scroll_transcript(-3)
+            return None
+        return super().mouse_handler(mouse_event)
+
+
+class _TranscriptScrollbarControl(FormattedTextControl):
+    """Transcript 右侧滚动条 control，支持点击轨道和拖动滑块。"""
+
+    def __init__(self, app: TuiApp) -> None:
+        self.app = app
+        super().__init__(app._formatted_scrollbar)
+
+    def invalidate_content(self) -> None:
+        """清理滚动条渲染缓存，确保高度和滑块位置立即刷新。"""
+        self.reset()
+        self._fragment_cache.clear()
+        self._content_cache.clear()
+
+    def create_content(self, width: int, height: int | None):  # type: ignore[no-untyped-def]
+        self.invalidate_content()
+        return super().create_content(width, height)
+
+    def mouse_handler(self, mouse_event: MouseEvent):  # type: ignore[no-untyped-def]
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            self.app.scroll_transcript(3)
+            return None
+        if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            self.app.scroll_transcript(-3)
+            return None
+        if mouse_event.event_type == MouseEventType.MOUSE_DOWN and mouse_event.button == MouseButton.LEFT:
+            self.app.start_scrollbar_drag(mouse_event.position.y)
+            return None
+        if mouse_event.event_type == MouseEventType.MOUSE_MOVE:
+            self.app.drag_scrollbar(mouse_event.position.y)
+            return None
+        if mouse_event.event_type == MouseEventType.MOUSE_UP:
+            self.app.stop_scrollbar_drag()
             return None
         return super().mouse_handler(mouse_event)
 
@@ -118,6 +179,10 @@ class _TuiConsoleProxy:
         self.ui.show_system_message(text)
 
 
+class _TuiExitRequested(Exception):
+    """Internal signal used to stop the worker after the TUI is shutting down."""
+
+
 class TuiApp:
     """Owns the fullscreen prompt_toolkit application and worker queue."""
 
@@ -142,20 +207,29 @@ class TuiApp:
             daemon=False,
         )
         self._running = False
+        self._shutdown_requested = False
         self._busy = False
         self._follow_bottom = True
         self._scroll_offset = 0
+        self._scroll_view_end_line: int | None = None
         self._transcript_total_line_count = 1
         self._transcript_cursor_line = 0
+        self._transcript_viewport_height = 1
+        self._scrollbar_drag_offset: int | None = None
+        # 默认不捕获鼠标，让终端原生拖选复制优先于 TUI 滚动条交互。
+        self._mouse_capture_enabled = False
         self._last_ctrl_c = 0.0
         self._render_width_override: int | None = None
+        self._completion_cache: list[str] = []
+        self._completion_cache_at = 0.0
         self._confirmation: ConfirmationRequest | None = None
         self._transcript: list[TranscriptItem] = []
         self._status = StatusState()
+        self._context_usage: ContextUsageState | None = None
 
         self.composer = TextArea(
             multiline=True,
-            completer=_DynamicSlashCompleter(self.completion_provider),
+            completer=_DynamicSlashCompleter(self._completion_words),
             complete_while_typing=True,
             history=InMemoryHistory(),
             prompt="dong > ",
@@ -167,15 +241,23 @@ class TuiApp:
         self.key_bindings = self._key_bindings()
         self.composer.control.key_bindings = self.key_bindings
         self.transcript_control = _TranscriptControl(self)
+        self.scrollbar_control = _TranscriptScrollbarControl(self)
         self.status_control = FormattedTextControl(self._formatted_status)
         self.application = Application(
             layout=Layout(
                 HSplit([
-                    Window(
-                        content=self.transcript_control,
-                        wrap_lines=True,
-                        always_hide_cursor=True,
-                    ),
+                    VSplit([
+                        Window(
+                            content=self.transcript_control,
+                            wrap_lines=True,
+                            always_hide_cursor=True,
+                        ),
+                        Window(
+                            content=self.scrollbar_control,
+                            width=1,
+                            always_hide_cursor=True,
+                        ),
+                    ]),
                     Window(
                         content=self.status_control,
                         height=1,
@@ -188,7 +270,7 @@ class TuiApp:
             ),
             key_bindings=self.key_bindings,
             full_screen=True,
-            mouse_support=True,
+            mouse_support=Condition(lambda: self._mouse_capture_enabled),
         )
 
     @property
@@ -217,21 +299,34 @@ class TuiApp:
             columns = self.application.output.get_size().columns
         except Exception:
             columns = 80
-        return max(20, columns - 2)
+        return max(20, columns - 3)
 
     def run(self) -> None:
         """Run the fullscreen TUI until the user exits."""
         self._running = True
+        self._shutdown_requested = False
         self._worker_thread.start()
         try:
             self.application.run()
         finally:
             self._running = False
+            self.request_exit()
             self._discard_pending_inputs()
             self._input_queue.put(None)
             self._worker_thread.join(timeout=2.0)
             if self._worker_errors:
                 raise self._worker_errors[0]
+
+    def request_exit(self) -> None:
+        """Request TUI shutdown and unblock any synchronous confirmation prompt."""
+        with self._lock:
+            self._shutdown_requested = True
+            self._status.cancellation_requested = True
+            request = self._confirmation
+            if request is not None and not request.done.is_set():
+                request.result = False
+                request.done.set()
+        self.invalidate()
 
     def submit_text(self, text: str) -> None:
         """Submit composer text to the worker queue."""
@@ -243,6 +338,10 @@ class TuiApp:
             self._status.queued = self._input_queue.qsize()
             self._status.new_output = False
             self._follow_bottom = True
+            self._scroll_view_end_line = None
+            self._scroll_offset = 0
+            self.transcript_control.invalidate_content()
+            self.scrollbar_control.invalidate_content()
         self.invalidate()
 
     def append_item(self, kind: str, title: str, ansi: str, raw: str | None = None) -> TranscriptItem:
@@ -253,6 +352,7 @@ class TuiApp:
             if not self._follow_bottom:
                 self._status.new_output = True
             self.transcript_control.invalidate_content()
+            self.scrollbar_control.invalidate_content()
         self.invalidate()
         return item
 
@@ -265,12 +365,31 @@ class TuiApp:
             if not self._follow_bottom:
                 self._status.new_output = True
             self.transcript_control.invalidate_content()
+            self.scrollbar_control.invalidate_content()
         self.invalidate()
 
     def update_status(self, label: str) -> None:
         """Update the status bar text."""
         with self._lock:
             self._status.label = label
+        self.invalidate()
+
+    def update_context_usage(
+        self,
+        *,
+        estimated_tokens: int,
+        budget_limit: int,
+        context_window_tokens: int | None,
+        compacted: bool,
+    ) -> None:
+        """更新 TUI status bar 中的上下文预算使用量。"""
+        with self._lock:
+            self._context_usage = ContextUsageState(
+                estimated_tokens=max(0, estimated_tokens),
+                budget_limit=max(0, budget_limit),
+                context_window_tokens=max(0, context_window_tokens or 0),
+                compacted=compacted,
+            )
         self.invalidate()
 
     def clear_status(self) -> None:
@@ -284,6 +403,8 @@ class TuiApp:
         """Show a synchronous dangerous-command confirmation prompt."""
         request = ConfirmationRequest(command=command, default=default.lower())
         with self._lock:
+            if self._shutdown_requested:
+                raise _TuiExitRequested()
             self._confirmation = request
             self._status.label = f"Dangerous command: {command}  Run command? [y/N]"
         self.invalidate()
@@ -291,6 +412,8 @@ class TuiApp:
         with self._lock:
             self._confirmation = None
             self._status.label = "idle" if not self._busy else "working"
+            if self._shutdown_requested:
+                raise _TuiExitRequested()
         self.invalidate()
         return bool(request.result)
 
@@ -328,17 +451,120 @@ class TuiApp:
         if lines == 0:
             return
         with self._lock:
-            max_offset = max(0, self._transcript_total_line_count - 1)
-            if lines > 0:
-                self._follow_bottom = False
-                self._scroll_offset = min(max_offset, self._scroll_offset + lines)
-            else:
-                self._scroll_offset = max(0, self._scroll_offset + lines)
-                if self._scroll_offset == 0:
-                    self._follow_bottom = True
-                    self._status.new_output = False
+            view_end = self._current_view_end_locked()
+            self._set_manual_view_end_locked(view_end - lines)
             self.transcript_control.invalidate_content()
+            self.scrollbar_control.invalidate_content()
         self.invalidate()
+
+    def set_transcript_viewport_height(self, height: int) -> None:
+        """记录 transcript 可视高度，供滚动条和滚动边界计算使用。"""
+        with self._lock:
+            self._transcript_viewport_height = max(1, height)
+            if self._follow_bottom:
+                self._scroll_offset = 0
+                self._scroll_view_end_line = None
+            else:
+                self._set_manual_view_end_locked(self._current_view_end_locked())
+            if self._max_scroll_offset_locked() == 0:
+                self._follow_bottom = True
+                self._scroll_offset = 0
+                self._scroll_view_end_line = None
+
+    def start_scrollbar_drag(self, row: int) -> None:
+        """处理滚动条鼠标按下：滑块内开始拖动，轨道上直接跳转。"""
+        with self._lock:
+            state = self._scrollbar_state_locked()
+            if not state.visible:
+                return
+            if state.thumb_top <= row < state.thumb_top + state.thumb_height:
+                self._scrollbar_drag_offset = row - state.thumb_top
+            else:
+                self._scrollbar_drag_offset = state.thumb_height // 2
+                self._scrollbar_scroll_to_row_locked(row)
+            self.transcript_control.invalidate_content()
+            self.scrollbar_control.invalidate_content()
+        self.invalidate()
+
+    def drag_scrollbar(self, row: int) -> None:
+        """拖动滚动条滑块并实时更新 transcript 视图。"""
+        with self._lock:
+            if self._scrollbar_drag_offset is None:
+                return
+            self._scrollbar_scroll_to_row_locked(row)
+            self.transcript_control.invalidate_content()
+            self.scrollbar_control.invalidate_content()
+        self.invalidate()
+
+    def stop_scrollbar_drag(self) -> None:
+        """结束滚动条拖动状态。"""
+        with self._lock:
+            self._scrollbar_drag_offset = None
+        self.invalidate()
+
+    def toggle_mouse_capture(self) -> bool:
+        """切换鼠标捕获；关闭时终端可以直接拖选 transcript 文本复制。"""
+        with self._lock:
+            self._mouse_capture_enabled = not self._mouse_capture_enabled
+            enabled = self._mouse_capture_enabled
+            self._scrollbar_drag_offset = None
+        self.invalidate()
+        return enabled
+
+    def _max_scroll_offset_locked(self) -> int:
+        return max(0, self._transcript_total_line_count - self._transcript_viewport_height)
+
+    def _current_view_end_locked(self) -> int:
+        """返回当前 transcript 视口底部对应的绝对行号。"""
+        total = max(1, self._transcript_total_line_count)
+        if self._follow_bottom:
+            return total
+        if self._scroll_view_end_line is not None:
+            return max(1, min(total, self._scroll_view_end_line))
+        return max(1, min(total, total - min(self._scroll_offset, self._max_scroll_offset_locked())))
+
+    def _set_manual_view_end_locked(self, end_line: int) -> None:
+        """设置手动滚动视口底部行；到底部时恢复自动跟随。"""
+        total = max(1, self._transcript_total_line_count)
+        viewport_height = max(1, self._transcript_viewport_height)
+        if total <= viewport_height or end_line >= total:
+            self._follow_bottom = True
+            self._scroll_view_end_line = None
+            self._scroll_offset = 0
+            self._status.new_output = False
+            return
+
+        clamped_end = max(viewport_height, min(total, end_line))
+        self._follow_bottom = False
+        self._scroll_view_end_line = clamped_end
+        self._scroll_offset = max(0, total - clamped_end)
+
+    def _scrollbar_state_locked(self) -> ScrollbarState:
+        track_height = max(1, self._transcript_viewport_height)
+        max_offset = self._max_scroll_offset_locked()
+        if max_offset <= 0:
+            return ScrollbarState(False, track_height, 0, track_height, 0)
+        visible_ratio = self._transcript_viewport_height / self._transcript_total_line_count
+        thumb_height = max(1, min(track_height, int(track_height * visible_ratio)))
+        max_thumb_top = max(0, track_height - thumb_height)
+        view_end = self._current_view_end_locked()
+        top_line = max(0, min(max_offset, view_end - self._transcript_viewport_height))
+        thumb_top = 0 if max_offset == 0 else round(max_thumb_top * top_line / max_offset)
+        return ScrollbarState(True, track_height, thumb_top, thumb_height, max_offset)
+
+    def _scrollbar_scroll_to_row_locked(self, row: int) -> None:
+        state = self._scrollbar_state_locked()
+        if not state.visible:
+            self._follow_bottom = True
+            self._scroll_offset = 0
+            return
+        max_thumb_top = max(0, state.track_height - state.thumb_height)
+        desired_top = max(0, min(max_thumb_top, row - (self._scrollbar_drag_offset or 0)))
+        if max_thumb_top == 0:
+            top_line = 0
+        else:
+            top_line = round(state.max_scroll_offset * desired_top / max_thumb_top)
+        self._set_manual_view_end_locked(top_line + self._transcript_viewport_height)
 
     def _worker(self) -> None:
         while True:
@@ -355,6 +581,12 @@ class TuiApp:
                 if exit_requested:
                     self.application.exit()
                     return
+            except _TuiExitRequested:
+                try:
+                    self.application.exit()
+                except Exception:
+                    pass
+                return
             except BaseException as exc:  # pragma: no cover - surfaced by run()
                 self._worker_errors.append(exc)
                 try:
@@ -391,6 +623,29 @@ class TuiApp:
                 self._transcript_cursor_line = 0
         return ANSI(text)
 
+    def _formatted_scrollbar(self) -> list[tuple[str, str]]:
+        """渲染 light 风格的 1 列 transcript 滚动条。"""
+        with self._lock:
+            state = self._scrollbar_state_locked()
+        if not state.visible:
+            fragments: list[tuple[str, str]] = []
+            for row in range(state.track_height):
+                fragments.append(("", " "))
+                if row < state.track_height - 1:
+                    fragments.append(("", "\n"))
+            return fragments
+
+        fragments = []
+        for row in range(state.track_height):
+            in_thumb = state.thumb_top <= row < state.thumb_top + state.thumb_height
+            if in_thumb:
+                fragments.append(("fg:#6b7280", "█"))
+            else:
+                fragments.append(("fg:#d1d5db", "│"))
+            if row < state.track_height - 1:
+                fragments.append(("", "\n"))
+        return fragments
+
     def _transcript_cursor_position(self) -> Point:
         """Keep prompt_toolkit's window anchored to the bottom of the current transcript slice."""
         with self._lock:
@@ -399,6 +654,9 @@ class TuiApp:
     def _formatted_status(self) -> ANSI:
         with self._lock:
             parts = [self._status.label]
+            context_usage = self._formatted_context_usage_locked()
+            if context_usage:
+                parts.append(context_usage)
             if self._busy:
                 parts.append("working")
             if self._status.queued:
@@ -409,31 +667,80 @@ class TuiApp:
                 parts.append("cancel requested")
             if self._confirmation is not None:
                 parts.append("confirm y/N")
+            parts.append("mouse" if self._mouse_capture_enabled else "copy")
             completion_hint = self._completion_hint()
             if completion_hint:
                 parts.append(completion_hint)
         return ANSI("  " + _fit_to_width(" · ".join(parts), self.render_width))
 
+    def _formatted_context_usage_locked(self) -> str:
+        """把上下文 token 预算压缩成 status bar 的短文本。"""
+        usage = self._context_usage
+        if usage is None or usage.budget_limit <= 0:
+            return ""
+        denominator = usage.context_window_tokens or usage.budget_limit
+        percent = min(999, round(usage.estimated_tokens * 100 / denominator))
+        compact_at = ""
+        if usage.context_window_tokens and usage.budget_limit < usage.context_window_tokens:
+            compact_at = f" · compact at {_format_token_count(usage.budget_limit)}"
+        compacted = " compacted" if usage.compacted else ""
+        return (
+            f"ctx {_format_token_count(usage.estimated_tokens)}/"
+            f"{_format_token_count(denominator)} {percent}%"
+            f"{compact_at}{compacted}"
+        )
+
     def _completion_hint(self) -> str:
         text = self.composer.text
         if not text.startswith("/"):
             return ""
-        completer = _SlashAwareCompleter(sorted({item for item in self.completion_provider() if item}))
+        completer = _SlashAwareCompleter(self._completion_words())
         candidates = [
             completion.text
             for completion in completer.get_completions(Document(text), None)
         ][:6]
         return " ".join(candidates)
 
+    def _completion_words(self) -> list[str]:
+        """Return completion words with a short cache to avoid redraw-time filesystem scans."""
+        now = time.monotonic()
+        with self._lock:
+            if self._completion_cache and now - self._completion_cache_at < 1.0:
+                return list(self._completion_cache)
+        try:
+            words = sorted({item for item in self.completion_provider() if item})
+        except Exception:
+            with self._lock:
+                return list(self._completion_cache)
+        with self._lock:
+            self._completion_cache = words
+            self._completion_cache_at = now
+        return list(words)
+
     def _render_transcript_lines(self) -> list[str]:
         text = "\n\n".join(item.ansi.rstrip() for item in self._transcript if item.ansi.strip())
         lines = text.splitlines()
         self._transcript_total_line_count = max(1, len(lines))
+        max_offset = self._max_scroll_offset_locked()
+        if max_offset == 0:
+            self._follow_bottom = True
+            self._scroll_offset = 0
+            self._scroll_view_end_line = None
         if self._follow_bottom:
+            self._scroll_offset = 0
+            self._scroll_view_end_line = None
             return lines[-2000:]
-        if self._scroll_offset <= 0:
+
+        end = self._current_view_end_locked()
+        if end >= len(lines):
+            self._follow_bottom = True
+            self._scroll_offset = 0
+            self._scroll_view_end_line = None
+            self._status.new_output = False
             return lines[-2000:]
-        end = max(0, len(lines) - self._scroll_offset)
+
+        self._scroll_view_end_line = end
+        self._scroll_offset = max(0, self._transcript_total_line_count - end)
         return lines[max(0, end - 2000):end]
 
     def _key_bindings(self) -> KeyBindings:
@@ -482,6 +789,7 @@ class TuiApp:
 
         @bindings.add("c-d", eager=True)
         def _(event) -> None:  # type: ignore[no-untyped-def]
+            self.request_exit()
             event.app.exit()
 
         @bindings.add("c-y")
@@ -522,8 +830,9 @@ class TuiApp:
         @bindings.add("home")
         def _(event) -> None:  # type: ignore[no-untyped-def]
             with self._lock:
-                self._follow_bottom = False
-                self._scroll_offset = max(0, self._transcript_total_line_count - 1)
+                self._set_manual_view_end_locked(self._transcript_viewport_height)
+                self.transcript_control.invalidate_content()
+                self.scrollbar_control.invalidate_content()
             self.invalidate()
 
         @bindings.add("end")
@@ -531,8 +840,15 @@ class TuiApp:
             with self._lock:
                 self._follow_bottom = True
                 self._scroll_offset = 0
+                self._scroll_view_end_line = None
                 self._status.new_output = False
+                self.transcript_control.invalidate_content()
+                self.scrollbar_control.invalidate_content()
             self.invalidate()
+
+        @bindings.add("f2")
+        def _(event) -> None:  # type: ignore[no-untyped-def]
+            self.toggle_mouse_capture()
 
         return bindings
 
@@ -586,6 +902,32 @@ class TuiUI:
             render_text("skill", f"Loaded skill: {name} ({source})", width=self.app.render_width),
         )
 
+    def show_auto_skill(self, name: str, reason: str) -> None:
+        """展示本轮自动选择的 skill，保持 TUI 与普通终端 UI 接口一致。"""
+        self.show_skill_match(name, mode="auto", reason=reason)
+
+    def show_skill_match(
+        self,
+        name: str,
+        *,
+        mode: str,
+        source: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """展示本轮实际命中的 skill，让 TUI transcript 明确标记上下文选择。"""
+        lines = [f"Matched skill: {name}", f"mode      {mode}"]
+        if source:
+            lines.append(f"source    {source}")
+        if reason:
+            lines.append(f"reason    {reason}")
+        text = "\n".join(lines)
+        self.app.append_item(
+            "system",
+            "skill",
+            render_text("skill", text, width=self.app.render_width),
+            raw=text,
+        )
+
     def show_skill_already_loaded(self, name: str, source: str) -> None:
         self.show_system_message(f"Skill already loaded: {name} ({source})")
 
@@ -603,6 +945,28 @@ class TuiUI:
 
     def show_context_cleared(self) -> None:
         self.show_system_message("(context cleared)")
+        self.app.update_context_usage(
+            estimated_tokens=0,
+            budget_limit=0,
+            context_window_tokens=None,
+            compacted=False,
+        )
+
+    def show_context_usage(
+        self,
+        *,
+        estimated_tokens: int,
+        budget_limit: int,
+        context_window_tokens: int | None = None,
+        compacted: bool,
+    ) -> None:
+        """把本轮上下文预算使用量写入 TUI status bar。"""
+        self.app.update_context_usage(
+            estimated_tokens=estimated_tokens,
+            budget_limit=budget_limit,
+            context_window_tokens=context_window_tokens,
+            compacted=compacted,
+        )
 
     def show_workdir(self, workdir: str) -> None:
         self.show_system_message(f"workdir -> {workdir}")
@@ -628,6 +992,7 @@ class TuiUI:
         return self.app.request_confirmation(command, default)
 
     def show_tool_cancelled(self, name: str, args_raw: str) -> None:
+        self._finish_active_streaming_items()
         self.app.append_item(
             "tool_result",
             "cancelled",
@@ -635,6 +1000,7 @@ class TuiUI:
         )
 
     def show_tool_result(self, name: str, args_raw: str, result: ToolResult) -> None:
+        self._finish_active_streaming_items()
         display_args = _display_args(args_raw)
         status = "ok" if result.success else "failed"
         summary = result.summary or result.error or "(no summary)"
@@ -716,6 +1082,15 @@ class TuiUI:
     def blank_line(self) -> None:
         self.app.append_item("system", "blank", "\n", raw="")
 
+    def _finish_active_streaming_items(self) -> None:
+        """结束当前 streaming 标记，避免下一轮最终答复覆盖已有 transcript。"""
+        if self._active_assistant_item is not None:
+            self._active_assistant_item.streaming = False
+            self._active_assistant_item = None
+        if self._active_reasoning_item is not None:
+            self._active_reasoning_item.streaming = False
+            self._active_reasoning_item = None
+
 
 class _TuiWorkingStatus(AbstractContextManager[None]):
     """Status-bar context manager for long-running TUI work."""
@@ -788,6 +1163,8 @@ class _StreamingTranscriptContext(AbstractContextManager[Callable[[str], None]])
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
         self._render(force=True)
+        if self.item is not None:
+            self.item.streaming = False
         return False
 
     def write(self, delta: str) -> None:
@@ -848,7 +1225,7 @@ def render_text(title: str, text: str, *, width: int = 100) -> str:
     )
     console.print(Text(title, style="bold #0b5cad"))
     if text:
-        console.print(text)
+        console.print(Text(text))
     return output.getvalue().rstrip()
 
 
@@ -874,6 +1251,18 @@ def _fit_to_width(text: str, width: int) -> str:
         result.append(char)
         used += char_width
     return "".join(result).rstrip() + marker
+
+
+def _format_token_count(value: int) -> str:
+    """把 token 数压成 status bar 友好的短格式。"""
+    value = max(0, value)
+    if value >= 1_000_000:
+        rendered = f"{value / 1_000_000:.1f}M"
+    elif value >= 1_000:
+        rendered = f"{value / 1_000:.1f}k"
+    else:
+        rendered = str(value)
+    return rendered.replace(".0", "")
 
 
 def _plain_working_message(

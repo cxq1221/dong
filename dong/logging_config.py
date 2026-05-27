@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +14,13 @@ FALSE_VALUES = {"0", "false", "no", "off"}
 DEFAULT_LOG_DIRNAME = "logs"
 DEFAULT_LOG_FILENAME = "dong.log"
 DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_LOG_MAX_BYTES = 5 * 1024 * 1024
+DEFAULT_LOG_BACKUP_COUNT = 5
 PAYLOAD_PREVIEW_LIMIT = 300
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)(api[_-]?key|password|secret|token)([\"']?\s*[:=]\s*[\"']?)([^\"'\s,}]+)"
+)
+_BEARER_RE = re.compile(r"(?i)(bearer\s+)[a-z0-9._\-]+")
 
 _configured = False
 _log_path: Path | None = None
@@ -64,6 +72,36 @@ def _log_level() -> int:
     if isinstance(level, int):
         return level
     return logging.INFO
+
+
+def _env_int(name: str, *, default: int, minimum: int) -> int:
+    """读取整数环境变量；非法或过小值回退到默认值。"""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= minimum else default
+
+
+def _log_max_bytes() -> int:
+    """读取日志轮转大小；默认 5MiB。"""
+    return _env_int(
+        "DONG_LOG_MAX_BYTES",
+        default=DEFAULT_LOG_MAX_BYTES,
+        minimum=1024,
+    )
+
+
+def _log_backup_count() -> int:
+    """读取保留的轮转文件数量；至少保留 1 个历史分片。"""
+    return _env_int(
+        "DONG_LOG_BACKUP_COUNT",
+        default=DEFAULT_LOG_BACKUP_COUNT,
+        minimum=1,
+    )
 
 
 def _validate_log_path(root: Path, path: Path) -> Path:
@@ -137,7 +175,12 @@ def configure_logging(
 
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    handler = logging.FileHandler(path, encoding="utf-8")
+    handler = RotatingFileHandler(
+        path,
+        encoding="utf-8",
+        maxBytes=_log_max_bytes(),
+        backupCount=_log_backup_count(),
+    )
     handler._dong_handler = True  # type: ignore[attr-defined]
     handler.addFilter(_DongRecordFilter())
     handler.setFormatter(logging.Formatter(
@@ -157,6 +200,8 @@ def configure_logging(
         "logging_configured",
         path=str(path),
         log_level=logging.getLevelName(logger.level),
+        max_bytes=handler.maxBytes,
+        backup_count=handler.backupCount,
         payloads=payload_logging_enabled(),
     )
     return path
@@ -175,13 +220,19 @@ def get_logger(name: str) -> logging.Logger:
 
 
 def preview_payload(value: Any, *, limit: int = PAYLOAD_PREVIEW_LIMIT) -> str:
-    """在显式启用 payload 日志时，生成长度受控的正文预览。"""
+    """在显式启用 payload 日志时，生成脱敏且长度受控的正文预览。"""
     if not payload_logging_enabled():
         return "<disabled>"
-    text = str(value)
+    text = _redact_payload_text(str(value))
     if len(text) <= limit:
         return text
     return text[:limit] + f"...({len(text)} chars)"
+
+
+def _redact_payload_text(text: str) -> str:
+    """对日志预览中的常见密钥赋值和 Bearer token 做轻量脱敏。"""
+    redacted = _SECRET_ASSIGNMENT_RE.sub(r"\1\2[redacted]", text)
+    return _BEARER_RE.sub(r"\1[redacted]", redacted)
 
 
 def log_event(

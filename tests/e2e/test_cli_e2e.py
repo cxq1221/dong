@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-import sys
-import subprocess
 import signal
+import subprocess
+import sys
 from contextlib import contextmanager
 from io import StringIO
-from types import SimpleNamespace
 
 import pytest
 
 from dong import cli
 from dong.mcp import mcp_tool_name
 from dong.ui import TerminalUI
+from e2e.helpers import assistant_message as _assistant_message
+from e2e.helpers import tool_call as _tool_call
 
 from mcp_helpers import write_fake_mcp_server, write_mcp_config
 
@@ -57,24 +58,20 @@ def test_build_agent_prompt_ignores_dot_dong_agents_md(tmp_path) -> None:
     assert "旧入口规则" not in agent_prompt.instructions
 
 
-def _assistant_message(
-    content: str = "",
-    tool_calls: list | None = None,
-    reasoning_content: str | None = None,
-):
-    """构造模拟的 assistant 消息，避免测试依赖真实 LLM。"""
-    message = SimpleNamespace(role="assistant", content=content, tool_calls=tool_calls or [])
-    if reasoning_content is not None:
-        message.reasoning_content = reasoning_content
-    return message
-
-
-def _tool_call(call_id: str, name: str, arguments: str):
-    """构造模拟 tool_call，驱动 CLI 执行指定工具。"""
-    return SimpleNamespace(
-        id=call_id,
-        function=SimpleNamespace(name=name, arguments=arguments),
+def test_resolve_workdir_uses_repo_root_when_default_starts_in_package_dir(
+    tmp_path,
+) -> None:
+    """未显式传 -d 且从 dong 包目录启动时，应把工具根目录归一到仓库根。"""
+    package_dir = tmp_path / "dong"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "dong"\n',
+        encoding="utf-8",
     )
+
+    assert cli._resolve_workdir(str(package_dir), explicit=False) == str(tmp_path.resolve())
+    assert cli._resolve_workdir(str(package_dir), explicit=True) == str(package_dir.resolve())
 
 
 @contextmanager
@@ -191,11 +188,73 @@ def test_single_prompt_mode_runs_through_tool_call_and_final_answer(
     assert "Read complete." in captured.out
 
 
-def test_single_prompt_mode_auto_injects_matching_skill(
+def test_single_prompt_mode_persists_session_jsonl(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """单次 prompt 模式也应按用户意图临时注入自动选择的 skill。"""
+    """单次 prompt 应创建 session，并把用户和 assistant 消息写入 JSONL。"""
+    monkeypatch.setattr(
+        cli,
+        "chat",
+        lambda _messages, _tools, instructions="", **_kwargs: _assistant_message(
+            content="Done."
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["dong", "-d", str(tmp_path), "hello"],
+    )
+
+    cli.main()
+
+    session_files = list((tmp_path / ".dong" / "sessions").glob("*/*.jsonl"))
+    assert len(session_files) == 1
+    rendered = session_files[0].read_text(encoding="utf-8")
+    assert '"type":"session_meta"' in rendered
+    assert '"content":"hello"' in rendered
+    assert '"content":"Done."' in rendered
+
+
+def test_resume_latest_reuses_previous_session_messages(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--resume latest` 应把旧 session 消息带入下一轮模型请求。"""
+    from dong.session import SessionStore
+
+    store = SessionStore(str(tmp_path))
+    session = store.create(model="deepseek-v4-pro")
+    session.append_message({"role": "user", "content": "previous question"})
+    session.append_message({"role": "assistant", "content": "previous answer"})
+    seen_messages: list[list] = []
+
+    def fake_chat(messages, _tools, instructions="", **_kwargs):  # type: ignore[no-untyped-def]
+        seen_messages.append(list(messages))
+        return _assistant_message(content="continued")
+
+    monkeypatch.setattr(cli, "chat", fake_chat)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["dong", "-d", str(tmp_path), "--resume", "latest", "next question"],
+    )
+
+    cli.main()
+
+    contents = [
+        message.get("content")
+        for message in seen_messages[0]
+        if isinstance(message, dict)
+    ]
+    assert contents == ["previous question", "previous answer", "next question"]
+
+
+def test_single_prompt_mode_does_not_preselect_matching_skill(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单次 prompt 模式不再按关键词预选 skill，避免干扰模型注意力。"""
 
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     skill_path = tmp_path / ".dong" / "skills" / "chrome-cdp" / "SKILL.md"
@@ -213,7 +272,7 @@ def test_single_prompt_mode_auto_injects_matching_skill(
     )
     seen_instructions: list[str] = []
 
-    def fake_run_loop(base_sys, working, _workdir, *, max_turns, ui, enable_mcp):  # type: ignore[no-untyped-def]
+    def fake_run_loop(base_sys, working, _workdir, *, max_turns, ui, enable_mcp, session=None):  # type: ignore[no-untyped-def]
         seen_instructions.append(base_sys.instructions)
 
     monkeypatch.setattr(cli, "run_loop", fake_run_loop)
@@ -225,7 +284,80 @@ def test_single_prompt_mode_auto_injects_matching_skill(
 
     cli.main()
 
-    assert "Skill: chrome-cdp" in seen_instructions[0]
+    assert "Skill: chrome-cdp" not in seen_instructions[0]
+
+
+def test_skill_load_injects_skill_on_next_model_request(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """模型调用 skill_load 后，下一次 LLM 请求应注入对应 SKILL.md 内容。"""
+    skill_path = tmp_path / ".dong" / "skills" / "chrome-cdp" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True, exist_ok=True)
+    skill_path.write_text("# Chrome CDP\n\nUse browser inspection.", encoding="utf-8")
+    responses = iter([
+        _assistant_message(tool_calls=[
+            _tool_call("call-1", "skill_load", '{"skill": "chrome-cdp"}')
+        ]),
+        _assistant_message(content="ready"),
+    ])
+    seen_instructions: list[str] = []
+
+    def fake_chat(messages, _tools, instructions="", **_kwargs):  # type: ignore[no-untyped-def]
+        seen_instructions.append(instructions)
+        return next(responses)
+
+    monkeypatch.setattr(cli, "chat", fake_chat)
+
+    working = [{"role": "user", "content": "inspect browser"}]
+    cli.run_loop(cli.build_agent_prompt([], str(tmp_path)), working, str(tmp_path), max_turns=3)
+
+    assert "Skill: chrome-cdp" not in seen_instructions[0]
+    assert "Skill: chrome-cdp" in seen_instructions[1]
+    tool_messages = [
+        item["content"]
+        for item in working
+        if isinstance(item, dict) and item.get("role") == "tool"
+    ]
+    assert "Use browser inspection." not in tool_messages[0]
+
+
+def test_skill_load_caps_model_loaded_skills_at_five(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """模型每个 user turn 最多临时加载 5 个 skill，超过部分返回失败。"""
+    for index in range(6):
+        skill_path = tmp_path / ".dong" / "skills" / f"s{index}" / "SKILL.md"
+        skill_path.parent.mkdir(parents=True, exist_ok=True)
+        skill_path.write_text(f"# Skill {index}\n\nbody {index}", encoding="utf-8")
+    responses = iter([
+        _assistant_message(tool_calls=[
+            _tool_call(f"call-{index}", "skill_load", f'{{"skill": "s{index}"}}')
+            for index in range(6)
+        ]),
+        _assistant_message(content="ready"),
+    ])
+    seen_instructions: list[str] = []
+
+    def fake_chat(messages, _tools, instructions="", **_kwargs):  # type: ignore[no-untyped-def]
+        seen_instructions.append(instructions)
+        return next(responses)
+
+    monkeypatch.setattr(cli, "chat", fake_chat)
+
+    working = [{"role": "user", "content": "load skills"}]
+    cli.run_loop(cli.build_agent_prompt([], str(tmp_path)), working, str(tmp_path), max_turns=3)
+
+    assert "Skill: s0" in seen_instructions[1]
+    assert "Skill: s4" in seen_instructions[1]
+    assert "Skill: s5" not in seen_instructions[1]
+    tool_messages = [
+        item["content"]
+        for item in working
+        if isinstance(item, dict) and item.get("role") == "tool"
+    ]
+    assert "Model-loaded skill limit reached" in tool_messages[-1]
 
 
 def test_run_loop_shows_working_status_for_model_and_tools(
@@ -327,6 +459,114 @@ def test_run_loop_streams_reasoning_deltas(
     )
 
     assert ui.reasoning_deltas == ["先分析", "代码。"]
+
+
+def test_run_loop_logs_ai_metadata_without_payloads_by_default(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认运行日志只记录长度和状态，不落 AI/工具正文。"""
+    monkeypatch.delenv("DONG_LOG_PAYLOADS", raising=False)
+    (tmp_path / "note.txt").write_text("api_key=secret-value\n", encoding="utf-8")
+    cli.configure_logging(tmp_path, force=True)
+    responses = iter([
+        _assistant_message(
+            content="我先读取 note。",
+            reasoning_content="需要先看文件，password=bad-value。",
+            tool_calls=[_tool_call("call-1", "read", '{"filepath": "note.txt"}')],
+        ),
+        _assistant_message(
+            content="Read complete token=final-secret.",
+            reasoning_content="已经拿到文件内容。",
+        ),
+    ])
+
+    monkeypatch.setattr(
+        cli,
+        "chat",
+        lambda _messages, _tools, instructions="", **_kwargs: next(responses),
+    )
+
+    cli.run_loop(
+        cli.build_agent_prompt([], str(tmp_path)),
+        [{"role": "user", "content": "inspect note"}],
+        str(tmp_path),
+        max_turns=3,
+    )
+
+    for handler in cli.logging.getLogger("dong").handlers:
+        handler.flush()
+    rendered = (tmp_path / "logs" / "dong.log").read_text(encoding="utf-8")
+    assert "event=ai_message_received" in rendered
+    assert '"content_chars":' in rendered
+    assert '"reasoning_chars":' in rendered
+    assert "需要先看文件" not in rendered
+    assert "Read complete" not in rendered
+    assert "event=ai_tool_call_requested" in rendered
+    assert '"arguments_chars":' in rendered
+    assert "arguments_preview" not in rendered
+    assert "event=ai_tool_result_received" in rendered
+    assert "secret-value" not in rendered
+    assert "bad-value" not in rendered
+    assert "final-secret" not in rendered
+
+
+def test_run_loop_payload_logging_uses_redacted_previews(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """显式开启 payload 日志时，只记录脱敏截断预览。"""
+    monkeypatch.setenv("DONG_LOG_PAYLOADS", "1")
+    cli.configure_logging(tmp_path, force=True)
+    responses = iter([
+        _assistant_message(
+            content="准备执行。",
+            reasoning_content="authorization: Bearer rawtoken",
+            tool_calls=[
+                _tool_call(
+                    "call-1",
+                    "read",
+                    '{"filepath": "note.txt", "api_key": "raw-secret"}',
+                )
+            ],
+        ),
+        _assistant_message(content="Done token=final-secret."),
+    ])
+
+    monkeypatch.setattr(
+        cli,
+        "chat",
+        lambda _messages, _tools, instructions="", **_kwargs: next(responses),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_execute_registered_tool",
+        lambda _name, _args_raw, _workdir, _mcp_manager: cli.ToolResult(
+            success=True,
+            summary="ok",
+            detail="authorization: Bearer tooltoken",
+        ),
+    )
+
+    cli.run_loop(
+        cli.build_agent_prompt([], str(tmp_path)),
+        [{"role": "user", "content": "inspect note"}],
+        str(tmp_path),
+        max_turns=3,
+    )
+
+    for handler in cli.logging.getLogger("dong").handlers:
+        handler.flush()
+    rendered = (tmp_path / "logs" / "dong.log").read_text(encoding="utf-8")
+    assert "content_preview" in rendered
+    assert "reasoning_preview" in rendered
+    assert "arguments_preview" in rendered
+    assert "detail_preview" in rendered
+    assert "raw-secret" not in rendered
+    assert "rawtoken" not in rendered
+    assert "tooltoken" not in rendered
+    assert "final-secret" not in rendered
+    assert "[redacted]" in rendered
 
 
 def test_run_loop_stops_working_status_before_streaming_text(
@@ -604,7 +844,7 @@ def test_trim_context_compacts_old_messages_to_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """上下文过大时应生成系统摘要，并把完整摘要写入项目文件。"""
-    monkeypatch.setenv("DONG_CONTEXT_MAX_CHARS", "1000")
+    monkeypatch.setenv("DONG_CONTEXT_MAX_TOKENS", "1000")
     messages = [
         {"role": "user", "content": "请记住最初目标：优化上下文策略"},
         {"role": "assistant", "content": "我会先分析现状"},
@@ -622,6 +862,48 @@ def test_trim_context_compacts_old_messages_to_file(
     summaries = list((tmp_path / ".dong" / "context").glob("compact-*.md"))
     assert len(summaries) == 1
     assert "优化上下文策略" in summaries[0].read_text(encoding="utf-8")
+
+
+def test_trim_context_carries_user_goal_across_nested_summaries(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """二次压缩旧摘要时，当前用户目标不能被工具尾部时间线挤掉。"""
+    monkeypatch.setenv("DONG_CONTEXT_MAX_TOKENS", "1000")
+    prior_summary = "\n".join([
+        cli.CONTEXT_SUMMARY_PREFIX,
+        "说明：以下内容由 dong 在本地根据旧消息自动压缩生成，不依赖数据库或额外 LLM 调用。",
+        "- 很长的旧工具轨迹：" + "x" * 500,
+        "- 压缩消息数：4",
+        "- 角色分布：assistant=1, tool=2, user=1",
+        "- 最近用户请求：",
+        "  - user: 挖掘项目优化点",
+        "- 压缩前尾部时间线：",
+        "  - user: 挖掘项目优化点",
+    ])
+    messages = [
+        {"role": "system", "content": prior_summary},
+        _assistant_message(tool_calls=[
+            _tool_call("call-1", "read", '{"filepath":"dong/cli.py"}')
+        ]),
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "cli.py " + "x" * 2000,
+        },
+        _assistant_message(tool_calls=[
+            _tool_call("call-2", "bash", '{"command":"ls dong/cli.py"}')
+        ]),
+        {"role": "tool", "tool_call_id": "call-2", "content": "dong/cli.py"},
+        _assistant_message(content="已成功读取 cli.py"),
+    ]
+
+    trimmed = cli.trim_context(messages, max_len=4, workdir=str(tmp_path))
+
+    assert trimmed[0]["role"] == "system"
+    assert "挖掘项目优化点" in trimmed[0]["content"]
+    summaries = sorted((tmp_path / ".dong" / "context").glob("compact-*.md"))
+    assert "挖掘项目优化点" in summaries[-1].read_text(encoding="utf-8")
 
 
 def test_trim_context_keeps_tool_call_result_pair(tmp_path) -> None:
@@ -649,7 +931,7 @@ def test_trim_context_does_not_loop_inside_multi_tool_result_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """连续多个 tool result 超预算时，裁剪边界必须继续前进而不是卡住。"""
-    monkeypatch.setenv("DONG_CONTEXT_MAX_CHARS", "1000")
+    monkeypatch.setenv("DONG_CONTEXT_MAX_TOKENS", "1000")
     messages = [
         {"role": "user", "content": "分析这个项目"},
         _assistant_message(tool_calls=[

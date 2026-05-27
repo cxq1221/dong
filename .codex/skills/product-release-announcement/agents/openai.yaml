@@ -1,0 +1,7 @@
+interface:
+  display_name: "Product Release Announcement"
+  short_description: "Turn git work into Chinese product announcements"
+  default_prompt: "Use $product-release-announcement to summarize the last two weeks of commits as a WeChat-ready product release announcement."
+
+policy:
+  allow_implicit_invocation: true

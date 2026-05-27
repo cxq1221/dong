@@ -22,10 +22,13 @@ dong/
 └── log_viewer.py        # 日志查看器：dong logs 子命令，按级别/事件/关键词过滤（184 行）
 
 tests/
-├── test_cli_e2e.py      # CLI 端到端自动化回归测试
+├── e2e/
+│   ├── test_cli_e2e.py  # CLI 单次 prompt/run_loop 端到端自动化回归测试
+│   ├── test_cli_tty_e2e.py  # TTY 模式下 CLI 端到端测试
+│   ├── test_cli_operational_e2e.py  # logs/MCP 子命令与多工具链端到端测试
+│   └── test_session_business_e2e.py  # session 业务端到端测试
 ├── test_cli_repl_commands.py  # 交互模式命令测试（exit/clear/dir）
 ├── test_cli_skills.py   # Skill 发现、加载、别名解析测试
-├── test_cli_tty_e2e.py  # TTY 模式下 CLI 端到端测试
 ├── test_llm.py           # LLM 适配层单元测试（含 prompt 构建、流式、JSON 模式）
 ├── test_tools_*.py       # 各内置工具单元测试（read/write/edit/bash/grep/plan）
 ├── test_tool_schema.py   # 工具注册与 schema 生成测试
@@ -82,8 +85,9 @@ tests/
 
 **`logging_config.py`** —— 结构化日志
 - 一行一条 JSON 事件，写入 `logs/dong.log`
-- 事件类型：`tool_executed` / `llm_request` / `skill_loaded` / `agent_turn` 等
-- `DONG_LOG_PAYLOADS=1` 时记录完整 payload，否则仅记录长度和关键字段
+- 事件类型：`ai_message_received` / `ai_tool_call_requested` / `ai_tool_result_received` / `tool_executed` 等
+- 默认只记录 AI/工具交互的长度、状态和摘要；`DONG_LOG_PAYLOADS=1` 时才记录脱敏截断预览
+- 超过 5MiB 后自动轮转分片
 
 **`log_viewer.py`** —— `dong logs` 子命令
 - 支持 `--limit` / `--level` / `--event` / `--logger` / `--follow` 过滤
@@ -152,11 +156,16 @@ DONG_API_KEY=sk-你的API密钥
 | `DONG_ANTHROPIC_BASE_URL` | Anthropic API 地址 | `https://api.deepseek.com/anthropic` |
 | `DONG_ANTHROPIC_API_KEY` | Anthropic 专用 Key | 未设置时复用 `DONG_API_KEY` |
 | `DONG_MAX_TOKENS` | 最大输出 token | `4096` |
+| `DONG_CONTEXT_AUTO_COMPACT_PERCENT` | 模型窗口自动压缩百分比 | `80` |
+| `DONG_CONTEXT_MAX_TOKENS` | 覆盖模型感知压缩 token 阈值 | 不设置 |
+| `DONG_DEEPSEEK_TOKENIZER_DIR` | DeepSeek 官方 tokenizer 本地目录 | `dong/tokenizers/deepseek_v3`（存在时） |
 | `DONG_THINKING` | DeepSeek thinking 模式 | `disabled` |
 | `DONG_REASONING_EFFORT` | 思考深度 | 不设置 |
 | `DONG_RESPONSE_FORMAT` | 响应格式 | `text` |
 | `DONG_TOOL_STRICT` | 工具严格模式 | `0`（关闭） |
-| `DONG_LOG_PAYLOADS` | 日志记录完整 payload | 不设置（仅记录摘要） |
+| `DONG_LOG_MAX_BYTES` | 单个日志文件轮转大小 | `5242880`（5MiB） |
+| `DONG_LOG_BACKUP_COUNT` | 保留的日志分片数量 | `5` |
+| `DONG_LOG_PAYLOADS` | AI/工具正文和参数的脱敏预览开关 | 不设置（预览隐藏） |
 
 ### Provider 配置示例
 
@@ -302,7 +311,7 @@ dong logs --event tool_executed   # 只看工具调用
 dong logs --follow --event tool_executed  # 实时监控
 ```
 
-`DONG_LOG_PAYLOADS=1` 时记录完整输入输出内容，用于调试。
+AI 的回复长度、思考长度、工具参数长度和工具结果长度会写入 `ai_message_received`、`ai_tool_call_requested`、`ai_tool_result_received` 事件。需要排查正文时显式设置 `DONG_LOG_PAYLOADS=1`，日志只写脱敏截断预览。日志文件默认超过 5MiB 后轮转为 `dong.log.1` 等分片。
 
 ---
 
@@ -319,8 +328,9 @@ uv run ruff check --fix # 代码风格检查
 | 层级 | 说明 | 运行方式 |
 |------|------|----------|
 | 单元测试 | 工具、LLM 适配、日志等模块独立测试 | `pytest tests/test_tools_*.py tests/test_llm.py` |
-| CLI 自动化回归 | CLI 命令、REPL 行为、skill 管理 | `pytest tests/test_cli_*.py` |
-| 端到端验证 | 用真实 API 配置完成一轮完整对话 | 手动执行：`dong "简单任务"` |
+| CLI/REPL 自动化回归 | CLI 命令、REPL 行为、skill 管理 | `pytest tests/test_cli_*.py` |
+| 端到端自动化回归 | 从 CLI/TTY/session 用户入口贯穿 agent loop、工具和持久化边界 | `pytest tests/e2e` |
+| 真实 LLM/API 端到端验证 | 用真实 API 配置完成一轮完整对话 | 手动执行：`uv run dong "简单任务"` |
 
 ### 编码约定
 
@@ -328,7 +338,8 @@ uv run ruff check --fix # 代码风格检查
 - Import 顺序：stdlib → third-party → local
 - 工具通过 `@registry.register()` 装饰器注册
 - 所有文件 I/O 必须经过 `_validate_path()`
-- 测试文件与模块一一对应：`dong/xxx.py` → `tests/test_xxx.py`
+- 模块级测试尽量与模块一一对应：`dong/xxx.py` → `tests/test_xxx.py`
+- 端到端自动化测试统一放在 `tests/e2e/`，避免和模块级回归混在一起
 - 所有代码需添加中文注释
 
 ---

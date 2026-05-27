@@ -184,7 +184,9 @@ def chat(messages, tools, *, model=None, instructions="") -> ChatCompletionMessa
 
 - 日志写入 `<workdir>/logs/dong.log`（可通过环境变量调整）
 - 格式：`时间 级别 pid=xxx logger名称 event=事件名 fields={JSON}`
-- 默认不记录 prompt/工具参数正文，需 `DONG_LOG_PAYLOADS=1` 显式启用
+- AI 思考、回复、工具调用参数和工具结果默认只记录长度、状态和摘要
+- `DONG_LOG_PAYLOADS=1` 时才记录脱敏截断预览
+- 单个日志文件默认超过 5MiB 后轮转成 `dong.log.1` 等分片
 - 日志目录/文件强制限制在 workdir 内，防止路径穿越
 
 ### 可控环境变量
@@ -194,7 +196,9 @@ def chat(messages, tools, *, model=None, instructions="") -> ChatCompletionMessa
 | `DONG_LOG_LEVEL` | INFO | DEBUG/INFO/WARNING/ERROR |
 | `DONG_LOG_DIR` | logs | 日志目录 |
 | `DONG_LOG_FILE` | dong.log | 日志文件名 |
-| `DONG_LOG_PAYLOADS` | 0 | 是否记录正文 |
+| `DONG_LOG_MAX_BYTES` | 5242880 | 单文件轮转大小 |
+| `DONG_LOG_BACKUP_COUNT` | 5 | 保留的历史分片数量 |
+| `DONG_LOG_PAYLOADS` | 0 | AI/工具正文和参数的脱敏预览开关 |
 
 ### log_event() 辅助函数
 ```python
@@ -205,7 +209,7 @@ log_event(logger, logging.INFO, "event_name", key=value, ...)
 
 ### 后果
 - 可通过 `dong logs` 子命令按事件名/级别/logger 过滤
-- 排查问题时开启 `DONG_LOG_LEVEL=DEBUG DONG_LOG_PAYLOADS=1` 获取完整上下文
+- 排查模型行为时可按 `ai_message_received` / `ai_tool_call_requested` / `ai_tool_result_received` 检索长度、状态和可选脱敏预览
 
 ---
 
@@ -318,12 +322,13 @@ dong logs [选项]          # 日志查看
 
 ### 决策：预算感知压缩 + 最近消息原样保留
 
-`cli.py` 的 `trim_context()` 不再只依赖固定消息条数。它会同时检查：
+`dong/context_compaction.py` 的上下文压缩 Module 不再只依赖固定消息条数。它会同时检查：
 
-- 最近消息条数预算：默认保留 14 条 working 消息
-- 上下文字符预算：默认 `DONG_CONTEXT_MAX_CHARS=24000`
+- 最近消息条数预算：默认保留 20 条 working 消息
+- 模型感知 token 预算：已知模型按上下文窗口的 `DONG_CONTEXT_AUTO_COMPACT_PERCENT`（默认 80%）触发
+- 手动 token 阈值：显式设置 `DONG_CONTEXT_MAX_TOKENS` 时直接使用该阈值；未知模型未配置时使用保守 token 阈值
 
-当任一预算超限时，dong 会把旧消息压缩成一条合成 `system` 摘要，并保留最近消息原文继续对话。摘要生成是本地确定性规则，不额外调用 LLM，也不引入 tokenizer 或数据库。
+当任一预算超限时，dong 会把旧消息压缩成一条合成 `system` 摘要，并保留最近消息原文继续对话。摘要生成是本地确定性规则，不额外调用 LLM。请求体 token 估算由 `dong/token_counter.py` 统一负责：DeepSeek 优先使用官方 tokenizer，Claude 优先使用 Anthropic `count_tokens`，其他非官方路径退到 `tiktoken` 近似并写 approximate 日志；估算覆盖 instructions、messages、tools 和输出预算。
 
 ### 文件存储
 
@@ -341,4 +346,4 @@ dong logs [选项]          # 日志查看
 
 ### 参考来源
 
-该策略参考了 `../Projects/claw-code/rust/crates/runtime/src/compact.rs` 的核心做法：旧上下文摘要化、最近消息原样保留、tool-use/tool-result 边界保护、重复压缩时避免摘要无限嵌套。dong 采用更小的实现：字符预算近似 token，摘要文件落盘，不做跨进程会话恢复。
+该策略参考了 `../Projects/claw-code/rust/crates/runtime/src/compact.rs` 与 runtime 自动压缩流程的核心做法：旧上下文摘要化、最近消息原样保留、tool-use/tool-result 边界保护、模型窗口预算、重复压缩时避免摘要无限嵌套。dong 采用更小的实现：轻量 token 估算、摘要文件落盘，不做跨进程会话恢复。

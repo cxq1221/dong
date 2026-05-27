@@ -157,7 +157,7 @@ Do not kill subprocesses or threads destructively in phase 1 unless the existing
 - `dong/ui.py`: keep line-mode UI; share theme/rendering helpers where useful.
 - `dong/llm.py`: no provider rewrite expected; reasoning streaming already exists.
 - `tests/test_tui.py`: new unit tests for TUI state, rendering, queueing, and status.
-- `tests/test_cli_tty_e2e.py`: add a lightweight PTY test for persistent composer + queued input.
+- `tests/e2e/test_cli_tty_e2e.py`: add a lightweight PTY test for persistent composer + queued input.
 
 ## Implementation Steps
 
@@ -196,4 +196,3 @@ Required before claiming phase 1 complete:
   - second input is queued
   - second input executes after first task finishes
   - output does not overwrite composer
-
