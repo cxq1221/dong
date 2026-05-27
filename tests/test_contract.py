@@ -139,7 +139,7 @@ def test_pressure_summary_handles_absent_historical_score(tmp_path) -> None:
 
 
 def test_evidence_hash_is_stable_for_same_payload() -> None:
-    """证据包 hash 应使用规范化 JSON，字段顺序不能影响结果。"""
+    """证据包 hash 应稳定，且签名和 scorer 结果不参与签名前 hash。"""
     evidence = ContractEvidence(
         contract_version=1,
         session_id="session-1",
@@ -154,8 +154,25 @@ def test_evidence_hash_is_stable_for_same_payload() -> None:
         known_risks=[],
         unverified_items=[],
     )
+    reviewed = ContractEvidence(
+        contract_version=1,
+        session_id="session-1",
+        trigger_reasons=["file_change"],
+        user_objective="修改 README",
+        tool_summary=[{"name": "edit", "success": True}],
+        file_changes=[{"path": "README.md", "operation": "edit"}],
+        verification_evidence=[
+            {"command": "uv run pytest tests/test_contract.py -q", "success": True}
+        ],
+        final_answer="已完成",
+        known_risks=[],
+        unverified_items=[],
+        signature={"signature_hash": "different"},
+        scorer_result={"score": 99},
+    )
 
     assert build_evidence_hash(evidence) == build_evidence_hash(evidence)
+    assert build_evidence_hash(evidence) == build_evidence_hash(reviewed)
 
 
 def test_sign_evidence_produces_verifiable_hash() -> None:
