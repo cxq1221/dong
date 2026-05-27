@@ -74,6 +74,7 @@ class Session:
     messages: list[Any] = field(default_factory=list)
     prompt_history: list[dict[str, Any]] = field(default_factory=list)
     compactions: list[dict[str, Any]] = field(default_factory=list)
+    events: list[dict[str, Any]] = field(default_factory=list)
     model: str | None = None
     persistence_path: Path | None = None
 
@@ -90,6 +91,29 @@ class Session:
             self.messages.pop()
             raise SessionPersistenceError(
                 f"Failed to append session message: {exc}"
+            ) from exc
+
+    def record_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """记录 session 级契约事件；写盘失败时回滚内存事件列表。"""
+        event_type = event_type.strip()
+        if not event_type or event_type == "session_meta":
+            raise SessionError(f"Invalid session event type: {event_type!r}")
+        timestamp_ms = _now_ms()
+        entry = {
+            **_sanitize_for_json(payload),
+            "type": event_type,
+            "timestamp_ms": timestamp_ms,
+        }
+        previous_updated_at_ms = self.updated_at_ms
+        self.events.append(entry)
+        self.updated_at_ms = timestamp_ms
+        try:
+            self._append_jsonl_record(entry)
+        except Exception as exc:
+            self.events.pop()
+            self.updated_at_ms = previous_updated_at_ms
+            raise SessionPersistenceError(
+                f"Failed to append session event: {exc}"
             ) from exc
 
     def record_prompt(self, text: str) -> None:
@@ -169,6 +193,7 @@ class Session:
             {"type": "prompt_history", **_sanitize_for_json(item)}
             for item in self.prompt_history
         )
+        records.extend(_sanitize_for_json(item) for item in self.events)
         records.extend(
             {"type": "message", "message": _sanitize_for_json(_message_to_json(item))}
             for item in self.messages
@@ -201,6 +226,7 @@ class Session:
         messages: list[Any] = []
         prompt_history: list[dict[str, Any]] = []
         compactions: list[dict[str, Any]] = []
+        events: list[dict[str, Any]] = []
         with open(path, encoding="utf-8") as file:
             for line_number, line in enumerate(file, start=1):
                 stripped = line.strip()
@@ -221,6 +247,8 @@ class Session:
                     prompt_history.append(_record_payload(record))
                 elif record_type == "compaction":
                     compactions.append(_record_payload(record))
+                elif isinstance(record_type, str) and record_type.startswith("contract_"):
+                    events.append(record)
 
         if meta is None:
             raise SessionError(f"Session file has no session_meta: {path}")
@@ -234,6 +262,7 @@ class Session:
             messages=messages,
             prompt_history=prompt_history,
             compactions=compactions,
+            events=events,
             persistence_path=path,
         )
         log_event(

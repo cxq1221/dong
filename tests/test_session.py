@@ -107,6 +107,20 @@ def test_append_message_rolls_back_memory_when_persistence_fails(tmp_path, monke
     assert session.messages == []
 
 
+def test_session_records_contract_events(tmp_path) -> None:
+    """契约事件应写入 JSONL 并在恢复 session 时保留。"""
+    session = SessionStore(str(tmp_path)).create()
+
+    session.record_event("contract_lesson", {"lesson_for_session": "先跑测试"})
+
+    loaded = SessionStore(str(tmp_path)).load(session.session_id)
+    records = _records(session.persistence_path)
+
+    assert loaded.events[0]["type"] == "contract_lesson"
+    assert loaded.events[0]["lesson_for_session"] == "先跑测试"
+    assert any(record["type"] == "contract_lesson" for record in records)
+
+
 def test_session_snapshot_records_compaction_metadata(tmp_path) -> None:
     """replace_messages 应把压缩后上下文和 compaction metadata 一起写入 snapshot。"""
     session = SessionStore(str(tmp_path)).create()
