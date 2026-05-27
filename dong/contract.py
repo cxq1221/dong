@@ -9,6 +9,22 @@ from pathlib import Path
 TOOL_THRESHOLD = 5
 VERIFY_COMMAND_KEYWORDS = ("pytest", "ruff", "mypy", "test", "lint", "build", "uv run")
 FILE_CHANGE_TOOLS = {"write", "edit"}
+BEST_PRACTICES_RELPATH = ".dong/contracts/best-practices.md"
+DEFAULT_BEST_PRACTICES = """# dong 契约最佳实践
+
+这份材料是复杂开发交付的外部参考，不是强制流程。主 Agent 可以不参考，但交付后会被第三方 scorer 审计。
+
+## 交付原则
+
+交付目标：签名前确认复杂开发交付具备可审阅证据。
+
+- 先确认用户目标、约束和不可扩大范围。
+- 修改前读取相关代码、测试和项目规则。
+- 修改后保留真实验证证据，包括失败命令和未验证项。
+- 最终答复必须说明变更范围、验证结果、风险和下一步。
+- 不要用漂亮总结替代验收材料。
+- 签名前确认交付可审阅、可复现、可回滚。
+"""
 
 
 class ContractMode(str, Enum):
@@ -118,12 +134,53 @@ def _looks_like_verify_command(command: str) -> bool:
     return any(keyword in command_lower for keyword in VERIFY_COMMAND_KEYWORDS)
 
 
+def ensure_best_practices(workdir: str) -> Path:
+    """确保契约最佳实践材料存在；已有自定义文件必须原样保留。"""
+
+    path = Path(workdir) / BEST_PRACTICES_RELPATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(DEFAULT_BEST_PRACTICES, encoding="utf-8")
+    return path
+
+
+def pressure_summary(
+    controller: ContractController,
+    average_score: float,
+    pressure_level: str,
+    lesson_for_session: str = "",
+) -> str:
+    """生成短契约压力摘要；只在控制器激活时提醒交付风险。"""
+
+    if not controller.is_active():
+        return ""
+
+    ensure_best_practices(controller.workdir)
+    reasons = ", ".join(sorted(reason.value for reason in controller.trigger_reasons))
+    if not reasons:
+        reasons = "manual"
+
+    summary = (
+        "[Contract Pressure | 契约压力] "
+        f"level={pressure_level}; average_score={average_score:.1f}; "
+        f"trigger_reasons={reasons}; "
+        "交付后会被第三方审计，低分会降低本轮声誉并要求补齐验证证据。"
+    )
+    if lesson_for_session:
+        summary = f"{summary} session教训：{lesson_for_session}"
+    return summary
+
+
 __all__ = [
+    "BEST_PRACTICES_RELPATH",
     "ContractController",
     "ContractMode",
     "ContractSignal",
+    "DEFAULT_BEST_PRACTICES",
     "FILE_CHANGE_TOOLS",
     "TOOL_THRESHOLD",
     "TriggerReason",
     "VERIFY_COMMAND_KEYWORDS",
+    "ensure_best_practices",
+    "pressure_summary",
 ]

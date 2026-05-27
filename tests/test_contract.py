@@ -7,6 +7,8 @@ from dong.contract import (
     ContractMode,
     ContractSignal,
     TriggerReason,
+    ensure_best_practices,
+    pressure_summary,
 )
 
 
@@ -80,3 +82,36 @@ def test_contract_controller_compaction_triggers_pressure(tmp_path) -> None:
 
     assert controller.is_active() is True
     assert TriggerReason.COMPACTION in controller.trigger_reasons
+
+
+def test_best_practices_material_is_created_once(tmp_path) -> None:
+    """契约最佳实践应落在工作区，并且已有文件不被覆盖。"""
+    path = ensure_best_practices(str(tmp_path))
+    original = path.read_text(encoding="utf-8")
+    path.write_text("custom contract\n", encoding="utf-8")
+
+    second = ensure_best_practices(str(tmp_path))
+
+    assert second == path
+    assert "custom contract" in second.read_text(encoding="utf-8")
+    assert "交付目标" in original
+
+
+def test_pressure_summary_includes_reputation_and_lesson(tmp_path) -> None:
+    """提示词压力摘要应短而具体，包含声誉、触发原因和 session 教训。"""
+    controller = ContractController(workdir=str(tmp_path))
+    controller.set_mode(ContractMode.ON)
+    controller.record_signal(ContractSignal.tool_call("edit", "a.py"))
+
+    summary = pressure_summary(
+        controller,
+        average_score=61.2,
+        pressure_level="watch",
+        lesson_for_session="上次因为没有运行测试被扣分。",
+    )
+
+    assert "契约压力" in summary
+    assert "watch" in summary
+    assert "61.2" in summary
+    assert "上次因为没有运行测试被扣分" in summary
+    assert "第三方审计" in summary
