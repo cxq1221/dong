@@ -241,8 +241,8 @@ class TuiApp:
         self._transcript_cursor_line = 0
         self._transcript_viewport_height = 1
         self._scrollbar_drag_offset: int | None = None
-        # 默认不捕获鼠标，让终端原生拖选复制优先于 TUI 滚动条交互。
-        self._mouse_capture_enabled = False
+        # 默认捕获鼠标：滚轮滚动 transcript，拖拽选择文本可切回 copy 模式（F2）。
+        self._mouse_capture_enabled = True
         self._last_ctrl_c = 0.0
         self._exit_resume_printed = False
         self._render_width_override: int | None = None
