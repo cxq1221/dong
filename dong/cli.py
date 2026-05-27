@@ -1359,6 +1359,15 @@ def run_loop(
                         _last_user_prompt(working),
                         msg.content,
                     )
+                    log_event(
+                        LOGGER,
+                        logging.INFO,
+                        "contract_evidence_created",
+                        session_id=evidence.session_id,
+                        file_change_count=len(evidence.file_changes),
+                        verification_count=len(evidence.verification_evidence),
+                        unverified_count=len(evidence.unverified_items),
+                    )
                     signature_started_at = time.perf_counter()
                     log_event(
                         LOGGER,
@@ -1367,7 +1376,20 @@ def run_loop(
                         session_id=evidence.session_id,
                         difficulty=1,
                     )
-                    signature: ContractSignature = sign_evidence(evidence, difficulty=1)
+                    try:
+                        signature: ContractSignature = sign_evidence(
+                            evidence,
+                            difficulty=1,
+                        )
+                    except Exception as exc:
+                        log_event(
+                            LOGGER,
+                            logging.WARNING,
+                            "contract_signature_failed",
+                            session_id=evidence.session_id,
+                            error=str(exc),
+                        )
+                        return
                     artifact_path = write_contract_artifact(
                         workdir,
                         evidence,
@@ -1401,6 +1423,13 @@ def run_loop(
                             workdir,
                             evidence,
                             signature,
+                        )
+                        log_event(
+                            LOGGER,
+                            logging.INFO,
+                            "contract_scorer_finished",
+                            session_id=evidence.session_id,
+                            score=scorer_result.score,
                         )
                         scoreboard = apply_score(
                             workdir,

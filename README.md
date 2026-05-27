@@ -228,6 +228,9 @@ dong
 | `/skill <name>` | 加载指定 skill |
 | `/sessions` | 查看当前工作区历史 session；全屏 TUI 中可用 ↑/↓、鼠标点击选择并直接恢复 |
 | `/unskill <name>` | 卸载指定 skill |
+| `/contract on` | 手动开启本轮契约压力 |
+| `/contract off` | 手动关闭本轮契约压力 |
+| `/contract status` | 查看契约模式、触发原因和历史平均分 |
 | `/<skill-name>` | 快捷方式：加载 skill 并以后续内容为 prompt |
 
 输入 `/` 回车会展示可用 slash 命令；只输入 `/` 但不回车时，会自动弹出命令和 skill 补全菜单。通过 `exit`、`quit`、`/bye`、Ctrl-C 或 Ctrl-D 退出交互 session 时，dong 会打印完整恢复命令，例如：
@@ -235,6 +238,10 @@ dong
 ```bash
 dong -d /path/to/project --resume session-1779874198099-1
 ```
+
+### 契约压力模式
+
+复杂开发任务触发文件修改、验证命令、多工具调用或上下文压缩后，dong 会自动进入契约压力模式。模型交付最终答复后会生成 `.dong/contracts/*.json` 证据包并执行本地签名，再由第三方 scorer 根据 `.dong/contracts/best-practices.md`、规则底座和证据包评分。评分会写入 `.dong/scoreboard.json`，同一 session 的后续请求会注入最近一次 scorer 给出的改进教训。
 
 ---
 

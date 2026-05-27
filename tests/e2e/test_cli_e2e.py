@@ -412,6 +412,81 @@ def test_contract_scorer_updates_scoreboard_and_session_lesson(tmp_path, monkeyp
     assert "后续修改必须先运行相关测试" in seen_instructions[-1]
 
 
+def test_contract_flow_logs_required_audit_events(tmp_path, monkeypatch) -> None:
+    """契约签订和 scorer 成功路径必须留下可 grep 的审计事件。"""
+    (tmp_path / "a.py").write_text("x", encoding="utf-8")
+    responses = iter([
+        _assistant_message(tool_calls=[
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "x", "new": "y"}')
+        ]),
+        _assistant_message(content="已修改 a.py。"),
+        _assistant_message(content='{"score": 58, "deductions": ["missing_verification"], "risk_flags": [], "lesson_for_session": "先运行测试。", "workspace_summary": "缺少验证"}'),
+    ])
+    events: list[str] = []
+
+    def fake_chat(_messages, _tools, instructions="", **_kwargs):  # type: ignore[no-untyped-def]
+        return next(responses)
+
+    def fake_log_event(_logger, _level, event, **_fields):  # type: ignore[no-untyped-def]
+        events.append(event)
+
+    monkeypatch.setattr(cli, "chat", fake_chat)
+    monkeypatch.setattr(cli, "log_event", fake_log_event)
+
+    cli.run_loop(
+        cli.build_agent_prompt([], str(tmp_path)),
+        [{"role": "user", "content": "edit file"}],
+        str(tmp_path),
+        max_turns=3,
+    )
+
+    required_events = {
+        "contract_triggered",
+        "contract_pressure_injected",
+        "contract_evidence_created",
+        "contract_signature_started",
+        "contract_signature_finished",
+        "contract_rule_floor_created",
+        "contract_scorer_started",
+        "contract_scorer_finished",
+        "contract_scoreboard_updated",
+    }
+    assert required_events.issubset(events)
+
+
+def test_contract_signature_failure_is_logged_without_crashing(tmp_path, monkeypatch) -> None:
+    """签名计算失败时只记录失败事件，不影响已展示的最终答复收尾。"""
+    (tmp_path / "a.py").write_text("x", encoding="utf-8")
+    responses = iter([
+        _assistant_message(tool_calls=[
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "x", "new": "y"}')
+        ]),
+        _assistant_message(content="已修改 a.py。"),
+    ])
+    events: list[str] = []
+
+    def fake_log_event(_logger, _level, event, **_fields):  # type: ignore[no-untyped-def]
+        events.append(event)
+
+    monkeypatch.setattr(
+        cli,
+        "chat",
+        lambda _messages, _tools, instructions="", **_kwargs: next(responses),
+    )
+    monkeypatch.setattr(cli, "sign_evidence", lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("pow timeout")))
+    monkeypatch.setattr(cli, "log_event", fake_log_event)
+
+    cli.run_loop(
+        cli.build_agent_prompt([], str(tmp_path)),
+        [{"role": "user", "content": "edit file"}],
+        str(tmp_path),
+        max_turns=3,
+    )
+
+    assert "contract_signature_failed" in events
+    assert not list((tmp_path / ".dong" / "contracts").glob("session-*.json"))
+
+
 def test_skill_load_caps_model_loaded_skills_at_five(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
