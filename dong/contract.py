@@ -371,6 +371,36 @@ def validate_scorer_result(raw: dict, rule_floor: RuleFloor) -> ScorerResult:
     )
 
 
+def scorer_instructions() -> str:
+    """生成第三方 scorer 系统提示词；要求 JSON 输出并禁止主 Agent 自评。"""
+
+    return (
+        "你是 dong 的第三方交付评分 Agent。"
+        "你只根据证据包、契约最佳实践和规则底座评分。"
+        "主 Agent 不能自评，你也不能因为总结写得好就给高分。"
+        "只输出一个 JSON object，字段必须是 score, deductions, risk_flags, "
+        "lesson_for_session, workspace_summary。"
+    )
+
+
+def scorer_user_payload(
+    *,
+    best_practices: str,
+    evidence: ContractEvidence,
+    rule_floor: RuleFloor,
+    scoreboard: Scoreboard,
+) -> str:
+    """生成 scorer 用户输入，包含证据、规则底座和长期声誉摘要。"""
+
+    payload = {
+        "best_practices": best_practices,
+        "evidence": evidence.to_dict(),
+        "rule_floor": asdict(rule_floor),
+        "scoreboard": scoreboard.to_dict(),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
 def load_scoreboard(workdir: str) -> Scoreboard:
     """读取工作区评分表；不存在时返回空评分表。"""
 
@@ -568,6 +598,8 @@ __all__ = [
     "ensure_best_practices",
     "load_scoreboard",
     "pressure_summary",
+    "scorer_instructions",
+    "scorer_user_payload",
     "sign_evidence",
     "validate_scorer_result",
     "verify_signature",

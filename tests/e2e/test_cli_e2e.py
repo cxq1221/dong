@@ -383,6 +383,35 @@ def test_contract_artifact_created_after_complex_final_answer(tmp_path, monkeypa
     assert payload["unverified_items"]
 
 
+def test_contract_scorer_updates_scoreboard_and_session_lesson(tmp_path, monkeypatch) -> None:
+    """第三方 scorer 结果应更新评分表，并让同 session 后续轮次看到教训。"""
+    (tmp_path / "a.py").write_text("x", encoding="utf-8")
+    responses = iter([
+        _assistant_message(tool_calls=[
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "x", "new": "y"}')
+        ]),
+        _assistant_message(content="已修改 a.py。"),
+        _assistant_message(content='{"score": 58, "deductions": ["missing_verification"], "risk_flags": ["unstable_delivery"], "lesson_for_session": "后续修改必须先运行相关测试。", "workspace_summary": "缺少验证"}'),
+        _assistant_message(content="下一轮我会先补测试。"),
+    ])
+    seen_instructions: list[str] = []
+
+    def fake_chat(_messages, _tools, instructions="", **_kwargs):  # type: ignore[no-untyped-def]
+        seen_instructions.append(instructions)
+        return next(responses)
+
+    monkeypatch.setattr(cli, "chat", fake_chat)
+    monkeypatch.setattr(sys, "argv", ["dong", "-d", str(tmp_path), "edit file"])
+    cli.main()
+    monkeypatch.setattr(sys, "argv", ["dong", "-d", str(tmp_path), "--resume", "latest", "continue"])
+    cli.main()
+
+    scoreboard = json.loads((tmp_path / ".dong" / "scoreboard.json").read_text(encoding="utf-8"))
+    assert scoreboard["average_score"] == 58
+    assert scoreboard["pressure_level"] == "watch"
+    assert "后续修改必须先运行相关测试" in seen_instructions[-1]
+
+
 def test_skill_load_caps_model_loaded_skills_at_five(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

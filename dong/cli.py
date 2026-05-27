@@ -26,14 +26,22 @@ from dong.context_compaction import (
 )
 from dong.contract import (
     CONTRACT_VERSION,
-    ContractEvidence,
     ContractController,
+    ContractEvidence,
     ContractMode,
     ContractSignature,
     ContractSignal,
+    ScorerResult,
+    apply_score,
+    build_rule_floor,
+    ensure_best_practices,
     load_scoreboard,
     pressure_summary,
+    scorer_instructions,
+    scorer_user_payload,
     sign_evidence,
+    validate_scorer_result,
+    verify_signature,
     write_contract_artifact,
 )
 from dong.llm import chat, get_model_name
@@ -501,12 +509,21 @@ def _instructions_for_contract_pressure(
 ) -> str:
     """按当前契约状态追加压力摘要；未激活时保持原 instructions 不变。"""
     scoreboard = load_scoreboard(workdir)
+    lesson_for_session = _latest_contract_lesson(session)
     summary = pressure_summary(
         contract_controller,
         average_score=scoreboard.average_score,
         pressure_level=scoreboard.pressure_level,
-        lesson_for_session=_latest_contract_lesson(session),
+        lesson_for_session=lesson_for_session,
     )
+    if not summary and lesson_for_session:
+        # session 教训来自第三方 scorer，恢复同一 session 时也应注入下一轮上下文。
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "contract_lesson_injected",
+        )
+        return f"{base_instructions}\n\n[Contract Lesson | 契约教训] {lesson_for_session}"
     if not summary:
         return base_instructions
     log_event(
@@ -613,6 +630,46 @@ def _build_contract_evidence(
         known_risks=[],
         unverified_items=unverified_items,
     )
+
+
+def _run_contract_scorer(
+    workdir: str,
+    evidence: ContractEvidence,
+    signature: ContractSignature,
+) -> ScorerResult:
+    """调用第三方 scorer LLM，按规则底座校验并返回本轮评分。"""
+
+    best_practices_path = ensure_best_practices(workdir)
+    best_practices = best_practices_path.read_text(encoding="utf-8")
+    scoreboard = load_scoreboard(workdir)
+    signature_valid = verify_signature(evidence, signature)
+    rule_floor = build_rule_floor(evidence, signature_valid=signature_valid)
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "contract_rule_floor_created",
+        ceiling=rule_floor.base_score_ceiling,
+        signature_valid=signature_valid,
+    )
+    scorer_message = chat(
+        [
+            {
+                "role": "user",
+                "content": scorer_user_payload(
+                    best_practices=best_practices,
+                    evidence=evidence,
+                    rule_floor=rule_floor,
+                    scoreboard=scoreboard,
+                ),
+            }
+        ],
+        [],
+        instructions=scorer_instructions(),
+    )
+    raw = json.loads(scorer_message.content or "{}")
+    if not isinstance(raw, dict):
+        raise ValueError("contract scorer output must be a JSON object")
+    return validate_scorer_result(raw, rule_floor)
 
 
 def _record_model_loaded_skill(
@@ -1332,6 +1389,54 @@ def run_loop(
                         artifact_path=str(artifact_path),
                         elapsed_ms=int((time.perf_counter() - signature_started_at) * 1000),
                     )
+                    try:
+                        # scorer 失败不能影响主交付完成，只记录失败事件供排查。
+                        log_event(
+                            LOGGER,
+                            logging.INFO,
+                            "contract_scorer_started",
+                            session_id=evidence.session_id,
+                        )
+                        scorer_result = _run_contract_scorer(
+                            workdir,
+                            evidence,
+                            signature,
+                        )
+                        scoreboard = apply_score(
+                            workdir,
+                            load_scoreboard(workdir),
+                            evidence.session_id,
+                            scorer_result,
+                        )
+                        if session is not None:
+                            session.record_event(
+                                "contract_scored",
+                                {
+                                    "score": scorer_result.score,
+                                    "deductions": scorer_result.deductions,
+                                    "risk_flags": scorer_result.risk_flags,
+                                },
+                            )
+                            session.record_event(
+                                "contract_lesson",
+                                {
+                                    "lesson_for_session": scorer_result.lesson_for_session,
+                                },
+                            )
+                        log_event(
+                            LOGGER,
+                            logging.INFO,
+                            "contract_scoreboard_updated",
+                            score=scorer_result.score,
+                            pressure_level=scoreboard.pressure_level,
+                        )
+                    except Exception as exc:
+                        log_event(
+                            LOGGER,
+                            logging.WARNING,
+                            "contract_scorer_failed",
+                            error=str(exc),
+                        )
                 return
 
             # 控制上下文长度，避免长时间 REPL 或多轮工具调用导致 messages 过大。
