@@ -415,6 +415,47 @@ def test_tui_transcript_ctrl_c_copies_visible_selection(monkeypatch) -> None:
     )
 
     assert app._transcript_selection is None
+    assert "selected" not in app.status.label
+
+
+def test_tui_transcript_click_without_drag_does_not_select_text() -> None:
+    """内容区单击只清除选区，不应自动选中最后一个字符。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "alpha")
+    app.transcript_control.create_content(width=80, height=20)
+
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_DOWN, x=4)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_UP, x=4)
+    )
+
+    assert app._transcript_selection is None
+    assert app.copy_transcript_selection() is False
+
+
+def test_tui_composer_click_clears_transcript_selection() -> None:
+    """点击输入区应取消 transcript 选区，让 Ctrl-C 恢复退出/取消语义。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "alpha\nbeta")
+    app.transcript_control.create_content(width=80, height=20)
+
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_DOWN, x=1)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(1, MouseEventType.MOUSE_MOVE, x=2)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(1, MouseEventType.MOUSE_UP, x=2)
+    )
+    assert app._transcript_selection is not None
+
+    app.composer.control.mouse_handler(_mouse_event(0, MouseEventType.MOUSE_DOWN))
+
+    assert app._transcript_selection is None
+    assert app.copy_transcript_selection() is False
 
 
 def test_tui_transcript_selection_survives_scroll_and_clears_on_submit(monkeypatch) -> None:
@@ -425,6 +466,9 @@ def test_tui_transcript_selection_survives_scroll_and_clears_on_submit(monkeypat
 
     app.transcript_control.mouse_handler(
         _mouse_event(19, MouseEventType.MOUSE_DOWN, x=0)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(19, MouseEventType.MOUSE_MOVE, x=4)
     )
     app.transcript_control.mouse_handler(
         _mouse_event(19, MouseEventType.MOUSE_UP, x=4)
@@ -456,6 +500,9 @@ def test_tui_transcript_selection_uses_prompt_toolkit_text_columns(monkeypatch) 
 
     app.transcript_control.mouse_handler(
         _mouse_event(0, MouseEventType.MOUSE_DOWN, x=1)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_MOVE, x=3)
     )
     app.transcript_control.mouse_handler(
         _mouse_event(0, MouseEventType.MOUSE_UP, x=3)

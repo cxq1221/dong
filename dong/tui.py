@@ -111,6 +111,15 @@ class TranscriptSelection:
     active_col: int
 
 
+@dataclass(frozen=True)
+class TranscriptSelectionDraft:
+    """Transcript 鼠标按下后的候选起点；只有拖动后才变成选区。"""
+
+    row: int
+    col: int
+    pending_origin: bool = False
+
+
 @dataclass
 class SessionPickerState:
     """`/sessions` 会话选择器状态，供键盘和鼠标事件共享。"""
@@ -269,7 +278,7 @@ class TuiApp:
         self._transcript_viewport_height = 1
         self._transcript_visible_plain_lines: list[str] = []
         self._transcript_selection: TranscriptSelection | None = None
-        self._transcript_selection_pending_origin = False
+        self._transcript_selection_draft: TranscriptSelectionDraft | None = None
         self._last_copied_transcript_text = ""
         self._scrollbar_drag_offset: int | None = None
         # 默认捕获鼠标：TUI 自己处理内容区拖选复制、滚轮和滚动条拖拽。
@@ -815,26 +824,36 @@ class TuiApp:
         self.invalidate()
 
     def start_transcript_selection(self, row: int, col: int) -> None:
-        """开始内容区拖选；复制由 TUI 处理，避免和终端鼠标模式冲突。"""
+        """记录内容区候选拖选起点；单击只清除旧选区。"""
         with self._lock:
-            self._transcript_selection_pending_origin = row == 0 and col == 0
-            self._transcript_selection = TranscriptSelection(row, col, row, col)
+            self._transcript_selection_draft = TranscriptSelectionDraft(
+                row,
+                col,
+                pending_origin=row == 0 and col == 0,
+            )
+            self._transcript_selection = None
             self.transcript_control.invalidate_content()
         self.invalidate()
 
     def drag_transcript_selection(self, row: int, col: int) -> None:
         """更新内容区拖选终点。"""
         with self._lock:
+            draft = self._transcript_selection_draft
             selection = self._transcript_selection
-            if selection is None:
-                return
-            if self._transcript_selection_pending_origin and row != 0:
-                self._clear_transcript_selection_locked()
-                self.transcript_control.invalidate_content()
+            if draft is not None:
+                if draft.pending_origin and row != 0:
+                    self._clear_transcript_selection_locked()
+                    self.transcript_control.invalidate_content()
+                    return
+                if row == draft.row and col == draft.col:
+                    return
+                selection = TranscriptSelection(draft.row, draft.col, draft.row, draft.col)
+                self._transcript_selection = selection
+                self._transcript_selection_draft = None
+            elif selection is None:
                 return
             if self._is_transcript_mouse_fallback_locked(row, col, selection):
                 return
-            self._transcript_selection_pending_origin = False
             self._transcript_selection = TranscriptSelection(
                 selection.anchor_row,
                 selection.anchor_col,
@@ -847,15 +866,14 @@ class TuiApp:
     def finish_transcript_selection(self, row: int, col: int) -> None:
         """结束内容区拖选，只保留选区，等待 Ctrl-C 复制。"""
         with self._lock:
-            selection = self._transcript_selection
-            if selection is None:
-                return
-            pending_origin = self._transcript_selection_pending_origin
-            self._transcript_selection_pending_origin = False
-            if pending_origin and row != 0:
-                self._transcript_selection = None
+            draft = self._transcript_selection_draft
+            if draft is not None:
+                self._clear_transcript_selection_locked()
                 self.transcript_control.invalidate_content()
                 self.invalidate()
+                return
+            selection = self._transcript_selection
+            if selection is None:
                 return
             if self._is_transcript_mouse_fallback_locked(row, col, selection):
                 row = selection.active_row
@@ -903,7 +921,9 @@ class TuiApp:
     def _clear_transcript_selection_locked(self) -> None:
         """清除 transcript 选区；用于点击、滚动、提交等改变上下文的操作。"""
         self._transcript_selection = None
-        self._transcript_selection_pending_origin = False
+        self._transcript_selection_draft = None
+        if self._status.label.startswith("selected "):
+            self._status.label = "idle" if not self._busy else "working"
 
     def _record_input_history_locked(self, text: str) -> None:
         """记录用户已提交输入，并结束当前历史浏览状态。"""
@@ -919,6 +939,11 @@ class TuiApp:
         if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
             self.scroll_transcript(-3)
             return None
+        if mouse_event.event_type == MouseEventType.MOUSE_DOWN and mouse_event.button == MouseButton.LEFT:
+            with self._lock:
+                self._clear_transcript_selection_locked()
+                self.transcript_control.invalidate_content()
+            self.invalidate()
         return self._default_composer_mouse_handler(mouse_event)
 
     def toggle_mouse_capture(self) -> bool:
