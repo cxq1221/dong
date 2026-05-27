@@ -115,3 +115,4 @@ def test_pressure_summary_includes_reputation_and_lesson(tmp_path) -> None:
     assert "61.2" in summary
     assert "上次因为没有运行测试被扣分" in summary
     assert "第三方审计" in summary
+    assert "声誉" in summary
