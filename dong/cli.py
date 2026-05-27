@@ -23,7 +23,13 @@ from dong.context_compaction import (
     message_reasoning_content,
     trim_context,
 )
-from dong.contract import ContractController, ContractMode, load_scoreboard
+from dong.contract import (
+    ContractController,
+    ContractMode,
+    ContractSignal,
+    load_scoreboard,
+    pressure_summary,
+)
 from dong.llm import chat, get_model_name
 from dong.log_viewer import LogFilter, stream_logs
 from dong.logging_config import (
@@ -460,6 +466,62 @@ def _instructions_for_turn_skills(
         if content:
             parts.append(content)
     return "\n\n".join(parts)
+
+
+def _latest_contract_lesson(session: Session | None) -> str:
+    """从 session 事件中取最近一条契约教训，供下一轮压力摘要注入。"""
+    if session is None:
+        return ""
+    for event in reversed(session.events):
+        if event.get("type") != "contract_lesson":
+            continue
+        lesson = event.get("lesson_for_session")
+        if isinstance(lesson, str):
+            return lesson
+    return ""
+
+
+def _contract_trigger_reasons(controller: ContractController) -> list[str]:
+    """把契约触发原因转成稳定日志字段，方便后续排查压力来源。"""
+    return sorted(reason.value for reason in controller.trigger_reasons)
+
+
+def _instructions_for_contract_pressure(
+    base_instructions: str,
+    *,
+    contract_controller: ContractController,
+    workdir: str,
+    session: Session | None,
+) -> str:
+    """按当前契约状态追加压力摘要；未激活时保持原 instructions 不变。"""
+    scoreboard = load_scoreboard(workdir)
+    summary = pressure_summary(
+        contract_controller,
+        average_score=scoreboard.average_score,
+        pressure_level=scoreboard.pressure_level,
+        lesson_for_session=_latest_contract_lesson(session),
+    )
+    if not summary:
+        return base_instructions
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "contract_pressure_injected",
+        reasons=_contract_trigger_reasons(contract_controller),
+    )
+    return f"{base_instructions}\n\n{summary}"
+
+
+def _record_contract_compaction(
+    contract_controller: ContractController,
+    compaction,
+) -> None:
+    """压缩上下文后记录契约信号，下一轮可据此注入交付压力。"""
+    if not compaction.compacted:
+        return
+    contract_controller.record_signal(
+        ContractSignal.compaction(compaction.summary_ref or "")
+    )
 
 
 def _record_model_loaded_skill(
@@ -924,9 +986,11 @@ def run_loop(
     ui: TerminalUI | None = None,
     enable_mcp: bool = False,
     session: Session | None = None,
+    contract_controller: ContractController | None = None,
 ):
     """执行多轮 agent 循环，直到模型给出最终文本或达到轮数上限。"""
     ui = ui or TerminalUI()
+    contract_controller = contract_controller or ContractController(workdir=workdir)
     agent_prompt = (
         base_sys
         if isinstance(base_sys, AgentPrompt)
@@ -951,10 +1015,16 @@ def run_loop(
         # Agent 主循环：模型可以多轮思考、调用工具、读取工具结果，再继续下一轮。
         for turn in range(max_turns):
             # 每轮都用固定 input 上下文 + 当前对话上下文，系统提示词单独走 instructions。
-            turn_instructions = _instructions_for_turn_skills(
+            skill_instructions = _instructions_for_turn_skills(
                 agent_prompt.instructions,
                 workdir=workdir,
                 turn_skills=turn_skills,
+            )
+            turn_instructions = _instructions_for_contract_pressure(
+                skill_instructions,
+                contract_controller=contract_controller,
+                workdir=workdir,
+                session=session,
             )
             compaction = compact_context(
                 working,
@@ -966,6 +1036,13 @@ def run_loop(
                 reason="preflight",
             )
             _apply_compaction_result(working, compaction, session=session)
+            _record_contract_compaction(contract_controller, compaction)
+            turn_instructions = _instructions_for_contract_pressure(
+                skill_instructions,
+                contract_controller=contract_controller,
+                workdir=workdir,
+                session=session,
+            )
             _show_context_usage(ui, compaction)
             messages = agent_prompt.context_messages + working
             log_event(
@@ -1011,6 +1088,9 @@ def run_loop(
                 name = tc.function.name
                 args_raw = tc.function.arguments
                 _log_ai_tool_call(tc, turn=turn + 1)
+                contract_controller.record_signal(
+                    ContractSignal.tool_call(name, args_raw)
+                )
                 log_event(
                     LOGGER,
                     logging.INFO,
@@ -1019,6 +1099,13 @@ def run_loop(
                     args_chars=len(args_raw),
                     turn=turn + 1,
                 )
+                if name in {"write", "edit"}:
+                    log_event(
+                        LOGGER,
+                        logging.INFO,
+                        "contract_triggered",
+                        reasons=_contract_trigger_reasons(contract_controller),
+                    )
 
                 if name == "bash":
                     # bash 工具风险最高，所以执行前先解析 command 并做危险命令确认。
@@ -1123,16 +1210,22 @@ def run_loop(
                 working,
                 workdir=workdir,
                 model=get_model_name(),
-                instructions=_instructions_for_turn_skills(
-                    agent_prompt.instructions,
+                instructions=_instructions_for_contract_pressure(
+                    _instructions_for_turn_skills(
+                        agent_prompt.instructions,
+                        workdir=workdir,
+                        turn_skills=turn_skills,
+                    ),
+                    contract_controller=contract_controller,
                     workdir=workdir,
-                    turn_skills=turn_skills,
+                    session=session,
                 ),
                 tools=tool_defs,
                 fixed_messages=agent_prompt.context_messages,
                 reason="post_turn",
             )
             _apply_compaction_result(working, compaction, session=session)
+            _record_contract_compaction(contract_controller, compaction)
             _show_context_usage(ui, compaction)
     finally:
         mcp_manager.close()
@@ -1519,6 +1612,8 @@ def _process_repl_input(
     }
     if session is not None:
         run_kwargs["session"] = session
+    if contract_controller is not None:
+        run_kwargs["contract_controller"] = contract_controller
     run_loop(base_sys, working, workdir, **run_kwargs)
     compaction = compact_context(
         working,

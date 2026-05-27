@@ -322,6 +322,35 @@ def test_skill_load_injects_skill_on_next_model_request(
     assert "Use browser inspection." not in tool_messages[0]
 
 
+def test_contract_pressure_injected_after_complex_signal(tmp_path, monkeypatch) -> None:
+    """复杂信号触发后，下一轮模型请求应看到契约压力摘要。"""
+    responses = iter([
+        _assistant_message(tool_calls=[
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "x", "new": "y"}')
+        ]),
+        _assistant_message(content="done"),
+    ])
+    (tmp_path / "a.py").write_text("x", encoding="utf-8")
+    seen_instructions: list[str] = []
+
+    def fake_chat(_messages, _tools, instructions="", **_kwargs):  # type: ignore[no-untyped-def]
+        seen_instructions.append(instructions)
+        return next(responses)
+
+    monkeypatch.setattr(cli, "chat", fake_chat)
+
+    cli.run_loop(
+        cli.build_agent_prompt([], str(tmp_path)),
+        [{"role": "user", "content": "edit file"}],
+        str(tmp_path),
+        max_turns=3,
+    )
+
+    assert "Contract Pressure" not in seen_instructions[0]
+    assert "Contract Pressure" in seen_instructions[1]
+    assert (tmp_path / ".dong" / "contracts" / "best-practices.md").exists()
+
+
 def test_skill_load_caps_model_loaded_skills_at_five(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
