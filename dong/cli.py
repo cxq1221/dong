@@ -23,6 +23,7 @@ from dong.context_compaction import (
     message_reasoning_content,
     trim_context,
 )
+from dong.contract import ContractController, ContractMode, load_scoreboard
 from dong.llm import chat, get_model_name
 from dong.log_viewer import LogFilter, stream_logs
 from dong.logging_config import (
@@ -1152,6 +1153,10 @@ def repl_completions(workdir: str, loaded_skills: list[str]) -> list[str]:
         "/skill",
         "/skills",
         "/sessions",
+        "/contract",
+        "/contract on",
+        "/contract off",
+        "/contract status",
         "/ocr",
         "/unskill",
     ]
@@ -1172,6 +1177,7 @@ def handle_repl_command(
     working: list,
     ui: TerminalUI,
     session: Session | None = None,
+    contract_controller: ContractController | None = None,
 ) -> ReplAction:
     """处理 REPL 内置命令，普通用户输入会返回 handled=False。"""
     if inp in ("exit", "quit", "/bye"):
@@ -1242,6 +1248,14 @@ def handle_repl_command(
         selected_session = _show_session_list(ui, workdir, session, working)
         log_event(LOGGER, logging.INFO, "repl_session_list_shown")
         return ReplAction(handled=True, session=selected_session)
+
+    if inp == "/contract" or inp.startswith("/contract "):
+        return _handle_contract_command(
+            inp,
+            workdir=workdir,
+            ui=ui,
+            contract_controller=contract_controller,
+        )
 
     if inp == "/ocr" or inp.startswith("/ocr "):
         return _handle_ocr_command(inp, ui=ui)
@@ -1329,6 +1343,73 @@ def handle_repl_command(
     return ReplAction(handled=False)
 
 
+def _show_contract_status(
+    *,
+    ui: TerminalUI,
+    controller: ContractController,
+) -> None:
+    """汇总当前契约压力状态；评分表只读，用于命令行状态展示。"""
+    scoreboard = load_scoreboard(controller.workdir)
+    trigger_reasons = sorted(reason.value for reason in controller.trigger_reasons)
+    presenter = getattr(ui, "show_contract_status", None)
+    if callable(presenter):
+        presenter(
+            mode=controller.mode.value,
+            active=controller.is_active(),
+            pressure_level=scoreboard.pressure_level,
+            average_score=scoreboard.average_score,
+            trigger_reasons=trigger_reasons,
+        )
+        return
+
+    # TUI 适配层不是 TerminalUI 子类时，退回到 err_console 的通用 print 接口。
+    score = (
+        "none"
+        if scoreboard.average_score is None
+        else f"{scoreboard.average_score:.1f}"
+    )
+    ui.err_console.print(f"contract mode: {controller.mode.value}")
+    ui.err_console.print(f"active: {controller.is_active()}")
+    ui.err_console.print(f"pressure level: {scoreboard.pressure_level}")
+    ui.err_console.print(f"average score: {score}")
+    if trigger_reasons:
+        ui.err_console.print(f"trigger reasons: {', '.join(trigger_reasons)}")
+
+
+def _handle_contract_command(
+    inp: str,
+    *,
+    workdir: str,
+    ui: TerminalUI,
+    contract_controller: ContractController | None,
+) -> ReplAction:
+    """处理 `/contract` 命令；这里只控制模式，不做压力注入。"""
+    controller = contract_controller or ContractController(workdir=workdir)
+    parts = inp.split(maxsplit=1)
+    subcommand = parts[1].strip().lower() if len(parts) > 1 else "status"
+
+    if subcommand == "on":
+        controller.set_mode(ContractMode.ON)
+        _show_contract_status(ui=ui, controller=controller)
+        log_event(LOGGER, logging.INFO, "contract_manual_on")
+        return ReplAction(handled=True)
+
+    if subcommand == "off":
+        controller.set_mode(ContractMode.OFF)
+        _show_contract_status(ui=ui, controller=controller)
+        log_event(LOGGER, logging.INFO, "contract_manual_off")
+        return ReplAction(handled=True)
+
+    if subcommand == "status":
+        _show_contract_status(ui=ui, controller=controller)
+        log_event(LOGGER, logging.INFO, "contract_status_shown")
+        return ReplAction(handled=True)
+
+    ui.show_error("Usage: /contract [on|off|status]")
+    log_event(LOGGER, logging.WARNING, "contract_command_invalid", command=subcommand)
+    return ReplAction(handled=True)
+
+
 def _handle_ocr_command(inp: str, *, ui: TerminalUI) -> ReplAction:
     """处理 `/ocr <image-path> [question]`，把图片转成文本 prompt。"""
     try:
@@ -1384,6 +1465,7 @@ def _process_repl_input(
     max_turns: int,
     enable_mcp: bool,
     session: Session | None = None,
+    contract_controller: ContractController | None = None,
 ) -> tuple[str, bool, Session | None]:
     """处理一条 REPL 输入；返回新的 workdir、退出状态和当前 session。"""
     inp = inp.strip()
@@ -1397,6 +1479,7 @@ def _process_repl_input(
         working=working,
         ui=ui,
         session=session,
+        contract_controller=contract_controller,
     )
     if action.exit_requested:
         return workdir, True, action.session or session
@@ -1457,6 +1540,7 @@ def _run_repl_sync(
     max_turns: int,
     enable_mcp: bool,
     session: Session | None = None,
+    contract_controller: ContractController | None = None,
 ) -> None:
     """非交互输入流使用的同步 REPL，保持管道和测试行为稳定。"""
     current_session = session
@@ -1480,6 +1564,7 @@ def _run_repl_sync(
             max_turns=max_turns,
             enable_mcp=enable_mcp,
             session=current_session,
+            contract_controller=contract_controller,
         )
         if exit_requested:
             break
@@ -1504,6 +1589,7 @@ def _run_repl_with_input_queue(
     max_turns: int,
     enable_mcp: bool,
     session: Session | None = None,
+    contract_controller: ContractController | None = None,
 ) -> None:
     """交互式 REPL：主线程继续读输入，后台 worker 顺序执行 AI 工作。"""
     input_queue: Queue[str | None] = Queue()
@@ -1531,6 +1617,7 @@ def _run_repl_with_input_queue(
                     max_turns=max_turns,
                     enable_mcp=enable_mcp,
                     session=current_session,
+                    contract_controller=contract_controller,
                 )
                 if exit_requested:
                     stop_requested.set()
@@ -1900,6 +1987,7 @@ def main():
         avail = describe_skills(workdir)
         log_event(LOGGER, logging.INFO, "repl_started", skill_count=len(avail))
         working = session.messages
+        contract_controller = ContractController(workdir=workdir)
         if interactive_tui:
             from dong.tui import TuiApp
 
@@ -1914,6 +2002,7 @@ def main():
                     max_turns=args.max_turns,
                     enable_mcp=args.mcp,
                     session=session,
+                    contract_controller=contract_controller,
                 )
                 return exit_requested
 
@@ -1959,6 +2048,7 @@ def main():
                 max_turns=args.max_turns,
                 enable_mcp=args.mcp,
                 session=session,
+                contract_controller=contract_controller,
             )
 
 

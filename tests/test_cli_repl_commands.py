@@ -12,6 +12,7 @@ from dong.cli import (
     handle_repl_command,
     repl_completions,
 )
+from dong.contract import ContractController
 from dong.ocr import OcrLine, OcrResult, image_marker
 from dong.tui import TuiApp
 from dong.ui import TerminalUI
@@ -260,6 +261,45 @@ def test_compact_command_noops_when_history_is_too_short(tmp_path) -> None:
     assert working == [{"role": "user", "content": "only current request"}]
     assert not (tmp_path / ".dong" / "context").exists()
     assert "not enough old context" in err.getvalue()
+
+
+def test_contract_commands_update_controller(tmp_path) -> None:
+    """`/contract on|off|status` 应控制当前契约压力层。"""
+    ui, err = _ui()
+    controller = ContractController(workdir=str(tmp_path))
+
+    on = handle_repl_command(
+        "/contract on",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=[],
+        ui=ui,
+        contract_controller=controller,
+    )
+    status = handle_repl_command(
+        "/contract status",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=[],
+        ui=ui,
+        contract_controller=controller,
+    )
+    off = handle_repl_command(
+        "/contract off",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=[],
+        ui=ui,
+        contract_controller=controller,
+    )
+
+    assert on.handled is True
+    assert status.handled is True
+    assert off.handled is True
+    rendered = err.getvalue()
+    assert "contract mode: on" in rendered
+    assert "pressure level" in rendered
+    assert "contract mode: off" in rendered
 
 
 def test_interactive_repl_queues_input_while_agent_is_working(
@@ -574,6 +614,16 @@ def test_repl_completions_include_commands_and_skills(tmp_path) -> None:
     assert "/skill review" in completions
     assert "/review" in completions
     assert "/unskill review" in completions
+
+
+def test_repl_completions_include_contract_commands(tmp_path) -> None:
+    """REPL 补全应暴露契约命令。"""
+    completions = repl_completions(str(tmp_path), [])
+
+    assert "/contract" in completions
+    assert "/contract on" in completions
+    assert "/contract off" in completions
+    assert "/contract status" in completions
 
 
 def test_repl_completions_include_local_skill_directories(tmp_path) -> None:

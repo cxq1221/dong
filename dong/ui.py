@@ -57,13 +57,14 @@ DONG_LIGHT_THEME = Theme({
 MARKDOWN_CODE_THEME = "ansi_light"
 # REPL 命令帮助的单一文案来源，普通终端和 TUI 共同复用。
 REPL_COMMANDS_TEXT = (
-    "Commands: exit, clear, /compact, dir=<path>, /, /skill, /sessions, /ocr, /unskill, /<skill> <prompt>"
+    "Commands: exit, clear, /compact, dir=<path>, /, /skill, /sessions, /contract, /ocr, /unskill, /<skill> <prompt>"
 )
 SLASH_COMMAND_LINES = [
     "Slash commands:",
     "  /compact           compact old context now",
     "  /skill              list/load skills",
     "  /sessions           list current workspace sessions",
+    "  /contract [cmd]     show or set contract pressure mode",
     "  /ocr <image> [ask]  recognize image text locally, then ask the model",
 ]
 SESSION_TRANSCRIPT_PREVIEW_LIMIT = 12
@@ -478,6 +479,27 @@ class TerminalUI:
             "  [green]context compacted[/] "
             f"removed={removed_messages} preserved={preserved_messages}{suffix}"
         )
+
+    def show_contract_status(
+        self,
+        *,
+        mode: str,
+        active: bool,
+        pressure_level: str,
+        average_score: float | None,
+        trigger_reasons: list[str],
+        lesson: str = "",
+    ) -> None:
+        """展示契约状态；只输出摘要，不展示完整评分表。"""
+        score = "none" if average_score is None else f"{average_score:.1f}"
+        self.err_console.print(f"contract mode: {mode}")
+        self.err_console.print(f"active: {active}")
+        self.err_console.print(f"pressure level: {pressure_level}")
+        self.err_console.print(f"average score: {score}")
+        if trigger_reasons:
+            self.err_console.print(f"trigger reasons: {', '.join(trigger_reasons)}")
+        if lesson:
+            self.err_console.print(f"lesson: {lesson}")
 
     def show_workdir(self, workdir: str) -> None:
         """提示工作目录已切换。"""
