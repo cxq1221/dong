@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import platform
+import shutil
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -97,6 +101,16 @@ class ScrollbarState:
     max_scroll_offset: int
 
 
+@dataclass(frozen=True)
+class TranscriptSelection:
+    """Transcript 可视区里的鼠标拖选范围，坐标按当前可视行保存。"""
+
+    anchor_row: int
+    anchor_col: int
+    active_row: int
+    active_col: int
+
+
 @dataclass
 class SessionPickerState:
     """`/sessions` 会话选择器状态，供键盘和鼠标事件共享。"""
@@ -131,11 +145,18 @@ class _TranscriptControl(FormattedTextControl):
 
     def mouse_handler(self, mouse_event: MouseEvent):  # type: ignore[no-untyped-def]
         if mouse_event.event_type == MouseEventType.MOUSE_UP:
+            self.app.finish_transcript_selection(mouse_event.position.y, mouse_event.position.x)
             self.app.stop_scrollbar_drag()
             return None
         if mouse_event.event_type == MouseEventType.MOUSE_DOWN and mouse_event.button == MouseButton.LEFT:
             if self.app.handle_session_picker_mouse(mouse_event.position.y):
                 return None
+            self.app.start_transcript_selection(mouse_event.position.y, mouse_event.position.x)
+            return None
+        if mouse_event.event_type == MouseEventType.MOUSE_MOVE:
+            if mouse_event.button == MouseButton.LEFT:
+                self.app.drag_transcript_selection(mouse_event.position.y, mouse_event.position.x)
+            return None
         if mouse_event.event_type == MouseEventType.SCROLL_UP:
             self.app.scroll_transcript(3)
             return None
@@ -246,9 +267,13 @@ class TuiApp:
         self._transcript_total_line_count = 1
         self._transcript_cursor_line = 0
         self._transcript_viewport_height = 1
+        self._transcript_visible_plain_lines: list[str] = []
+        self._transcript_selection: TranscriptSelection | None = None
+        self._transcript_selection_pending_origin = False
+        self._last_copied_transcript_text = ""
         self._scrollbar_drag_offset: int | None = None
-        # 默认不捕获鼠标：终端可以直接拖选 transcript 文本，F2 再开启滚轮和滚动条拖拽。
-        self._mouse_capture_enabled = False
+        # 默认捕获鼠标：TUI 自己处理内容区拖选复制、滚轮和滚动条拖拽。
+        self._mouse_capture_enabled = True
         self._last_ctrl_c = 0.0
         self._exit_resume_printed = False
         self._render_width_override: int | None = None
@@ -279,6 +304,8 @@ class TuiApp:
         )
         self.key_bindings = self._key_bindings()
         self.composer.control.key_bindings = self.key_bindings
+        self._default_composer_mouse_handler = self.composer.control.mouse_handler
+        self.composer.control.mouse_handler = self._composer_mouse_handler
         self.transcript_control = _TranscriptControl(self)
         self.scrollbar_control = _TranscriptScrollbarControl(self)
         self.status_control = FormattedTextControl(self._formatted_status)
@@ -406,6 +433,7 @@ class TuiApp:
             self._follow_bottom = True
             self._scroll_view_end_line = None
             self._scroll_offset = 0
+            self._clear_transcript_selection_locked()
             self.transcript_control.invalidate_content()
             self.scrollbar_control.invalidate_content()
         self.invalidate()
@@ -786,11 +814,112 @@ class TuiApp:
             self._scrollbar_drag_offset = None
         self.invalidate()
 
+    def start_transcript_selection(self, row: int, col: int) -> None:
+        """开始内容区拖选；复制由 TUI 处理，避免和终端鼠标模式冲突。"""
+        with self._lock:
+            self._transcript_selection_pending_origin = row == 0 and col == 0
+            self._transcript_selection = TranscriptSelection(row, col, row, col)
+            self.transcript_control.invalidate_content()
+        self.invalidate()
+
+    def drag_transcript_selection(self, row: int, col: int) -> None:
+        """更新内容区拖选终点。"""
+        with self._lock:
+            selection = self._transcript_selection
+            if selection is None:
+                return
+            if self._transcript_selection_pending_origin and row != 0:
+                self._clear_transcript_selection_locked()
+                self.transcript_control.invalidate_content()
+                return
+            if self._is_transcript_mouse_fallback_locked(row, col, selection):
+                return
+            self._transcript_selection_pending_origin = False
+            self._transcript_selection = TranscriptSelection(
+                selection.anchor_row,
+                selection.anchor_col,
+                row,
+                col,
+            )
+            self.transcript_control.invalidate_content()
+        self.invalidate()
+
+    def finish_transcript_selection(self, row: int, col: int) -> None:
+        """结束内容区拖选，只保留选区，等待 Ctrl-C 复制。"""
+        with self._lock:
+            selection = self._transcript_selection
+            if selection is None:
+                return
+            pending_origin = self._transcript_selection_pending_origin
+            self._transcript_selection_pending_origin = False
+            if pending_origin and row != 0:
+                self._transcript_selection = None
+                self.transcript_control.invalidate_content()
+                self.invalidate()
+                return
+            if self._is_transcript_mouse_fallback_locked(row, col, selection):
+                row = selection.active_row
+                col = selection.active_col
+            final_selection = TranscriptSelection(
+                selection.anchor_row,
+                selection.anchor_col,
+                row,
+                col,
+            )
+            text = self._selected_transcript_text_locked(final_selection)
+            if text.strip():
+                self._transcript_selection = final_selection
+                self._status.label = f"selected {len(text)} chars · Ctrl-C copy"
+            else:
+                self._transcript_selection = None
+            self.transcript_control.invalidate_content()
+        self.invalidate()
+
+    def copy_transcript_selection(self) -> bool:
+        """复制当前 transcript 选区；无选区时返回 False 让 Ctrl-C 走原逻辑。"""
+        with self._lock:
+            selection = self._transcript_selection
+            if selection is None:
+                return False
+            text = self._selected_transcript_text_locked(selection)
+            if not text.strip():
+                self._transcript_selection = None
+                self.transcript_control.invalidate_content()
+                return False
+
+        copied = self._copy_text_to_clipboard(text)
+        with self._lock:
+            self._last_copied_transcript_text = text
+            self._status.label = (
+                f"copied {len(text)} chars" if copied else "copy unavailable"
+            )
+        self.invalidate()
+        return True
+
+    def _copy_text_to_clipboard(self, text: str) -> bool:
+        """把文本复制到系统剪贴板；单独封装便于测试 Ctrl-C 路径。"""
+        return _copy_text_to_clipboard(text, output=self.application.output)
+
+    def _clear_transcript_selection_locked(self) -> None:
+        """清除 transcript 选区；用于点击、滚动、提交等改变上下文的操作。"""
+        self._transcript_selection = None
+        self._transcript_selection_pending_origin = False
+
     def _record_input_history_locked(self, text: str) -> None:
         """记录用户已提交输入，并结束当前历史浏览状态。"""
         self._input_history.append(text)
         self._input_history_index = None
         self._input_history_draft = ""
+
+    def _composer_mouse_handler(self, mouse_event: MouseEvent):  # type: ignore[no-untyped-def]
+        """输入框滚轮统一滚动 transcript，点击和拖动仍交给 TextArea 原逻辑。"""
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            self.scroll_transcript(3)
+            return None
+        if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            self.scroll_transcript(-3)
+            return None
+        return self._default_composer_mouse_handler(mouse_event)
 
     def toggle_mouse_capture(self) -> bool:
         """切换鼠标捕获；关闭时终端可以直接拖选 transcript 文本复制。"""
@@ -904,13 +1033,18 @@ class TuiApp:
     def _formatted_transcript(self) -> ANSI:
         with self._lock:
             lines = self._render_transcript_lines()
+            self._transcript_visible_plain_lines = [_plain_ansi_text(line) for line in lines]
             if lines:
-                text = "\n".join(lines)
                 self._transcript_cursor_line = max(0, len(lines) - 1)
+                return _format_transcript_fragments(
+                    lines,
+                    selection=self._transcript_selection,
+                )
             else:
                 text = f"\x1b[36m{self.title}\x1b[0m"
                 self._transcript_total_line_count = 1
                 self._transcript_cursor_line = 0
+                self._transcript_visible_plain_lines = [self.title]
         return ANSI(text)
 
     def _formatted_scrollbar(self) -> list[tuple[str, str]]:
@@ -959,6 +1093,45 @@ class TuiApp:
                 parts.append("confirm y/N")
             parts.append("mouse" if self._mouse_capture_enabled else "copy")
         return ANSI("  " + _fit_to_width(" · ".join(parts), self.render_width))
+
+    def _selected_transcript_text_locked(self, selection: TranscriptSelection) -> str:
+        """按拖选行列提取当前可视 transcript 文本。"""
+        lines = self._transcript_visible_plain_lines
+        if not lines:
+            return ""
+        start_row, start_col, end_row, end_col = _normalized_selection(selection)
+        start_row = max(0, min(len(lines) - 1, start_row))
+        end_row = max(0, min(len(lines) - 1, end_row))
+        selected: list[str] = []
+        for row in range(start_row, end_row + 1):
+            line = lines[row]
+            if row == start_row == end_row:
+                left = _text_index(line, start_col)
+                right = _selection_end_index(line, end_col)
+            elif row == start_row:
+                left = _text_index(line, start_col)
+                right = len(line)
+            elif row == end_row:
+                left = 0
+                right = _selection_end_index(line, end_col)
+            else:
+                left = 0
+                right = len(line)
+            selected.append(line[left:right])
+        return "\n".join(selected)
+
+    def _is_transcript_mouse_fallback_locked(
+        self,
+        row: int,
+        col: int,
+        selection: TranscriptSelection,
+    ) -> bool:
+        """识别 prompt_toolkit 在无文本区域给出的 (0, 0) 鼠标兜底坐标。"""
+        if row != 0 or col != 0:
+            return False
+        if selection.anchor_row == 0 and selection.anchor_col == 0:
+            return False
+        return selection.active_row != 0 or selection.active_col != 0
 
     def _formatted_context_usage_locked(self) -> str:
         """把上下文 token 预算压缩成 status bar 的短文本。"""
@@ -1181,6 +1354,8 @@ class TuiApp:
 
         @bindings.add("c-c", eager=True)
         def _(event) -> None:  # type: ignore[no-untyped-def]
+            if self.copy_transcript_selection():
+                return
             if self.cancel_session_picker():
                 return
             if self._confirmation is not None:
@@ -1707,6 +1882,149 @@ class _StreamingTranscriptContext(AbstractContextManager[Callable[[str], None]])
                 self.ui._active_reasoning_item = self.item
         else:
             self.app.update_item(self.item, ansi=ansi, raw=raw)
+
+
+def _format_transcript_fragments(
+    lines: list[str],
+    *,
+    selection: TranscriptSelection | None,
+) -> list[tuple[str, str]]:
+    """把 ANSI transcript 行转成 prompt_toolkit 片段，并叠加拖选高亮。"""
+    fragments: list[tuple[str, str]] = []
+    normalized = _normalized_selection(selection) if selection is not None else None
+    for row, line in enumerate(lines):
+        plain_index = 0
+        start_col = end_col = None
+        if normalized is not None:
+            start_row, raw_start_col, end_row, raw_end_col = normalized
+            if start_row <= row <= end_row:
+                if row == start_row == end_row:
+                    start_col = max(0, raw_start_col)
+                    end_col = _selection_end_index(_plain_ansi_text(line), raw_end_col)
+                elif row == start_row:
+                    start_col = max(0, raw_start_col)
+                    end_col = None
+                elif row == end_row:
+                    start_col = 0
+                    end_col = _selection_end_index(_plain_ansi_text(line), raw_end_col)
+                else:
+                    start_col = 0
+                    end_col = None
+
+        for style, text in ANSI(line).__pt_formatted_text__():
+            if style == "[ZeroWidthEscape]":
+                fragments.append((style, text))
+                continue
+            for char in text:
+                selected = (
+                    start_col is not None
+                    and start_col <= plain_index
+                    and (end_col is None or plain_index < end_col)
+                )
+                fragments.append((_selected_style(style) if selected else style, char))
+                plain_index += 1
+        if row < len(lines) - 1:
+            fragments.append(("", "\n"))
+    return fragments
+
+
+def _normalized_selection(
+    selection: TranscriptSelection | None,
+) -> tuple[int, int, int, int]:
+    """把拖选起止点归一化成从上到下、从左到右的范围。"""
+    if selection is None:
+        return (0, 0, 0, 0)
+    start = (selection.anchor_row, selection.anchor_col)
+    end = (selection.active_row, selection.active_col)
+    if end < start:
+        start, end = end, start
+    return (start[0], start[1], end[0], end[1])
+
+
+def _selected_style(style: str) -> str:
+    """保留原样式并追加反色，显示 transcript 鼠标选区。"""
+    return f"{style} reverse".strip()
+
+
+def _plain_ansi_text(text: str) -> str:
+    """去掉 ANSI 样式，保留可复制的纯文本。"""
+    return "".join(
+        part
+        for style, part in ANSI(text).__pt_formatted_text__()
+        if style != "[ZeroWidthEscape]"
+    )
+
+
+def _text_index(text: str, column: int) -> int:
+    """把 prompt_toolkit 内容列限制到文本下标范围。"""
+    if column <= 0:
+        return 0
+    return min(len(text), column)
+
+
+def _selection_end_index(text: str, column: int) -> int:
+    """把选区结束列转换为半开区间下标，行尾附近包含最后一个字符。"""
+    if column >= len(text) - 1:
+        return len(text)
+    return _text_index(text, column)
+
+
+def _copy_text_to_clipboard(text: str, *, output=None) -> bool:  # type: ignore[no-untyped-def]
+    """把 TUI 选中文本写入系统剪贴板；失败时返回 False 供状态栏提示。"""
+    return _copy_text_with_system_tool(text) or _copy_text_with_osc52(text, output=output)
+
+
+def _copy_text_with_system_tool(text: str) -> bool:
+    """优先使用本机剪贴板工具，避免终端不支持 OSC52 时复制失败。"""
+    system = platform.system()
+    if system == "Darwin" and shutil.which("pbcopy"):
+        return _run_clipboard_command(["pbcopy"], text)
+    if system == "Windows":
+        executable = shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
+        if executable:
+            return _run_clipboard_command(
+                [executable, "-NoProfile", "-Command", "Set-Clipboard"],
+                text,
+            )
+    if shutil.which("wl-copy"):
+        return _run_clipboard_command(["wl-copy"], text)
+    if shutil.which("xclip"):
+        return _run_clipboard_command(["xclip", "-selection", "clipboard"], text)
+    if shutil.which("xsel"):
+        return _run_clipboard_command(["xsel", "--clipboard", "--input"], text)
+    return False
+
+
+def _run_clipboard_command(command: list[str], text: str) -> bool:
+    """执行剪贴板命令并写入 UTF-8 文本。"""
+    try:
+        result = subprocess.run(
+            command,
+            input=text,
+            text=True,
+            timeout=2,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _copy_text_with_osc52(text: str, *, output=None) -> bool:  # type: ignore[no-untyped-def]
+    """用 OSC52 作为终端剪贴板兜底，兼容 SSH/远程终端场景。"""
+    try:
+        payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        sequence = f"\033]52;c;{payload}\a"
+        if output is not None:
+            output.write_raw(sequence)
+            output.flush()
+        else:
+            print(sequence, end="", flush=True)
+    except Exception:
+        return False
+    return True
 
 
 def render_markdown(text: str, *, width: int = 100) -> str:

@@ -60,6 +60,11 @@ def _read_available(fd: int, *, duration: float = 0.5) -> str:
     return "".join(chunks)
 
 
+def _contains_queued_one(output: str) -> bool:
+    """检查 queued 1 状态；prompt_toolkit 可能用光标移动复用旧字符。"""
+    return "queued 1" in output or ("queu" in output and "d 1" in output)
+
+
 def _wait_file_contains(path, needle: str, *, timeout: float = 5.0) -> str:
     """等待文件内容包含指定文本。"""
     deadline = time.monotonic() + timeout
@@ -188,7 +193,7 @@ cli.main()
 
         output = _read_until(master_fd, "done first", timeout=8.0)
         assert "done first" in output
-        assert "queued 1" in output
+        assert _contains_queued_one(output)
         calls = _wait_file_contains(
             calls_log,
             "start first\nend first\nstart second\nend second",
