@@ -146,7 +146,7 @@ def ensure_best_practices(workdir: str) -> Path:
 
 def pressure_summary(
     controller: ContractController,
-    average_score: float,
+    average_score: float | None,
     pressure_level: str,
     lesson_for_session: str = "",
 ) -> str:
@@ -159,10 +159,11 @@ def pressure_summary(
     reasons = ", ".join(sorted(reason.value for reason in controller.trigger_reasons))
     if not reasons:
         reasons = "manual"
+    score_text = "暂无历史分" if average_score is None else f"{average_score:.1f}"
 
     summary = (
         "[Contract Pressure | 契约压力] "
-        f"level={pressure_level}; average_score={average_score:.1f}; "
+        f"level={pressure_level}; average_score={score_text}; "
         f"trigger_reasons={reasons}; "
         "交付后会被第三方审计，低分会降低本轮声誉并要求补齐验证证据。"
     )

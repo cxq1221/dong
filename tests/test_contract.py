@@ -116,3 +116,18 @@ def test_pressure_summary_includes_reputation_and_lesson(tmp_path) -> None:
     assert "上次因为没有运行测试被扣分" in summary
     assert "第三方审计" in summary
     assert "声誉" in summary
+
+
+def test_pressure_summary_handles_absent_historical_score(tmp_path) -> None:
+    """没有历史分时，压力摘要应保留可读的无历史分提示。"""
+    controller = ContractController(workdir=str(tmp_path))
+    controller.set_mode(ContractMode.ON)
+
+    summary = pressure_summary(
+        controller,
+        average_score=None,
+        pressure_level="watch",
+    )
+
+    assert "契约压力" in summary
+    assert "暂无历史分" in summary
