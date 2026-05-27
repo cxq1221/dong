@@ -119,12 +119,18 @@ def test_hotfix_edit_then_grep_chain_updates_file_and_context(
                 ],
             ),
             assistant_message(content="修复并核验完成。"),
+            assistant_message(
+                content=(
+                    '{"score": 92, "deductions": [], "risk_flags": [], '
+                    '"lesson_for_session": "", "workspace_summary": "已核验"}'
+                )
+            ),
         ],
     )
 
     assert "return 'fixed'" in (workdir / "service.py").read_text(encoding="utf-8")
     assert any("service.py" in message and "fixed" in message for message in _tool_messages(workdir))
-    assert len(seen) == 3
+    assert len(seen) == 4
 
 
 def test_skill_search_then_skill_load_injects_only_after_model_choice(
