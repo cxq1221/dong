@@ -24,11 +24,16 @@ def _completion_texts(app: TuiApp, text: str) -> list[str]:
     return [item.text for item in completer.get_completions(Document(text), None)]
 
 
-def _mouse_event(row: int, event_type: MouseEventType) -> MouseEvent:
+def _mouse_event(
+    row: int,
+    event_type: MouseEventType,
+    *,
+    button: MouseButton = MouseButton.LEFT,
+) -> MouseEvent:
     return MouseEvent(
         position=Point(x=0, y=row),
         event_type=event_type,
-        button=MouseButton.LEFT,
+        button=button,
         modifiers=frozenset(),
     )
 
@@ -446,15 +451,16 @@ def test_tui_tool_result_uses_current_render_width() -> None:
 
 
 def test_transcript_cursor_tracks_bottom_page() -> None:
-    """transcript 超过一屏时，prompt_toolkit 光标应锚定当前视图底部。"""
+    """transcript 超过一屏时，控件只渲染底部可视页，避免内部滚动状态抢控制。"""
     app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
     app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
 
     content = app.transcript_control.create_content(width=80, height=20)
 
-    assert content.cursor_position.y == 59
-    assert _content_line_text(content, 0) == "line 0"
-    assert _content_line_text(content, 59) == "line 59"
+    assert content.cursor_position.y == 19
+    assert content.line_count == 20
+    assert _content_line_text(content, 0) == "line 40"
+    assert _content_line_text(content, content.line_count - 1) == "line 59"
 
 
 def test_transcript_manual_scroll_changes_visible_slice() -> None:
@@ -466,7 +472,9 @@ def test_transcript_manual_scroll_changes_visible_slice() -> None:
     app.scroll_transcript(20)
     content = app.transcript_control.create_content(width=80, height=20)
 
-    assert content.cursor_position.y == 39
+    assert content.cursor_position.y == 19
+    assert content.line_count == 20
+    assert _content_line_text(content, 0) == "line 20"
     assert _content_line_text(content, content.line_count - 1) == "line 39"
 
 
@@ -504,6 +512,24 @@ def test_transcript_returning_to_bottom_resumes_following_new_output() -> None:
     assert _content_line_text(after, after.line_count - 1) == "line 61"
     assert app.status.new_output is False
     assert app._follow_bottom
+
+
+def test_transcript_submit_after_long_output_stays_at_bottom() -> None:
+    """长 transcript 后继续输入，应直接恢复底部跟随且滚动条停在最下方。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
+    app.transcript_control.create_content(width=80, height=20)
+    app.scroll_transcript(20)
+
+    app.submit_text("next")
+    app.append_item("user", "user", "next")
+    content = app.transcript_control.create_content(width=80, height=20)
+    state = app._scrollbar_state_locked()
+
+    assert _content_line_text(content, content.line_count - 1) == "next"
+    assert state.thumb_top + state.thumb_height == state.track_height
+    assert app._follow_bottom
+    assert app._scroll_offset == 0
 
 
 def test_transcript_scrollbar_is_hidden_when_content_fits() -> None:
@@ -574,6 +600,25 @@ def test_transcript_scrollbar_drag_updates_offset_and_returns_to_bottom() -> Non
 
     assert app._scroll_offset == 0
     assert app._follow_bottom
+
+
+def test_transcript_scrollbar_stops_dragging_on_plain_mouse_move() -> None:
+    """释放事件丢失后，普通鼠标移动不应继续拖动滚动条。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
+    app.transcript_control.create_content(width=80, height=20)
+
+    app.scrollbar_control.mouse_handler(_mouse_event(14, MouseEventType.MOUSE_DOWN))
+    app.scrollbar_control.mouse_handler(_mouse_event(14, MouseEventType.MOUSE_MOVE))
+    assert app._scroll_offset == 0
+
+    app.scrollbar_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_MOVE, button=MouseButton.NONE)
+    )
+
+    assert app._scroll_offset == 0
+    assert app._follow_bottom
+    assert app._scrollbar_drag_offset is None
 
 
 def test_tui_working_status_records_tool_start() -> None:

@@ -130,6 +130,9 @@ class _TranscriptControl(FormattedTextControl):
         return super().create_content(width, height)
 
     def mouse_handler(self, mouse_event: MouseEvent):  # type: ignore[no-untyped-def]
+        if mouse_event.event_type == MouseEventType.MOUSE_UP:
+            self.app.stop_scrollbar_drag()
+            return None
         if mouse_event.event_type == MouseEventType.MOUSE_DOWN and mouse_event.button == MouseButton.LEFT:
             if self.app.handle_session_picker_mouse(mouse_event.position.y):
                 return None
@@ -170,7 +173,10 @@ class _TranscriptScrollbarControl(FormattedTextControl):
             self.app.start_scrollbar_drag(mouse_event.position.y)
             return None
         if mouse_event.event_type == MouseEventType.MOUSE_MOVE:
-            self.app.drag_scrollbar(mouse_event.position.y)
+            if mouse_event.button == MouseButton.LEFT:
+                self.app.drag_scrollbar(mouse_event.position.y)
+            else:
+                self.app.stop_scrollbar_drag()
             return None
         if mouse_event.event_type == MouseEventType.MOUSE_UP:
             self.app.stop_scrollbar_drag()
@@ -1089,9 +1095,11 @@ class TuiApp:
         return "\n".join(lines)
 
     def _render_transcript_lines(self) -> list[str]:
+        """按当前滚动状态生成 transcript 可视切片，避免 prompt_toolkit 再次滚动。"""
         text = "\n\n".join(item.ansi.rstrip() for item in self._transcript if item.ansi.strip())
         lines = text.splitlines()
         self._transcript_total_line_count = max(1, len(lines))
+        viewport_height = max(1, self._transcript_viewport_height)
         max_offset = self._max_scroll_offset_locked()
         if max_offset == 0:
             self._follow_bottom = True
@@ -1100,7 +1108,8 @@ class TuiApp:
         if self._follow_bottom:
             self._scroll_offset = 0
             self._scroll_view_end_line = None
-            return lines[-2000:]
+            end = len(lines)
+            return lines[max(0, end - viewport_height):end]
 
         end = self._current_view_end_locked()
         if end >= len(lines):
@@ -1108,11 +1117,12 @@ class TuiApp:
             self._scroll_offset = 0
             self._scroll_view_end_line = None
             self._status.new_output = False
-            return lines[-2000:]
+            end = len(lines)
+            return lines[max(0, end - viewport_height):end]
 
         self._scroll_view_end_line = end
         self._scroll_offset = max(0, self._transcript_total_line_count - end)
-        return lines[max(0, end - 2000):end]
+        return lines[max(0, end - viewport_height):end]
 
     def _key_bindings(self) -> KeyBindings:
         bindings = KeyBindings()
