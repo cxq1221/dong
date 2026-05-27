@@ -43,6 +43,23 @@ def test_contract_controller_auto_triggers_for_complex_signals(tmp_path) -> None
     assert TriggerReason.FILE_CHANGE in controller.trigger_reasons
 
 
+def test_contract_tool_threshold_ignores_result_records(tmp_path) -> None:
+    """工具阈值只按调用次数计算，不能被结果记录提前触发。"""
+    controller = ContractController(workdir=str(tmp_path))
+
+    for index in range(3):
+        controller.record_signal(ContractSignal.tool_call("read", f'{{"i": {index}}}'))
+        controller.record_signal(
+            ContractSignal.tool_result(
+                "read",
+                success=True,
+                tool_call_id=f"call-{index}",
+            )
+        )
+
+    assert TriggerReason.TOOL_THRESHOLD not in controller.trigger_reasons
+
+
 def test_contract_controller_manual_off_records_bypass(tmp_path) -> None:
     """用户关闭契约时，本轮不注入压力，但关闭原因会留给 scorer。"""
     controller = ContractController(workdir=str(tmp_path))
@@ -227,6 +244,28 @@ def test_rule_floor_caps_score_when_code_changed_without_verification() -> None:
     assert floor.base_score_ceiling <= 60
     assert "missing_verification" in floor.evidence_gaps
     assert "invalid_signature" in floor.required_deductions
+
+
+def test_rule_floor_caps_undisclosed_tool_failure() -> None:
+    """工具失败但最终答复未披露时，规则底座必须扣 undisclosed_failure。"""
+    evidence = ContractEvidence(
+        contract_version=1,
+        session_id="session-1",
+        trigger_reasons=["tool_threshold"],
+        user_objective="执行复杂任务",
+        tool_summary=[{"name": "bash", "success": False, "error": "boom"}],
+        file_changes=[],
+        verification_evidence=[],
+        final_answer="完成",
+        known_risks=[],
+        unverified_items=[],
+    )
+
+    floor = build_rule_floor(evidence, signature_valid=True)
+
+    assert floor.base_score_ceiling <= 70
+    assert "undisclosed_failure" in floor.required_deductions
+    assert "undisclosed_failure" in floor.evidence_gaps
 
 
 def test_validate_scorer_result_rejects_score_above_rule_ceiling() -> None:

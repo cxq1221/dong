@@ -129,12 +129,34 @@ class ContractSignal:
     kind: str
     name: str = ""
     detail: str = ""
+    success: bool | None = None
+    error: str = ""
+    tool_call_id: str = ""
 
     @classmethod
     def tool_call(cls, name: str, detail: str = "") -> ContractSignal:
         """记录一次工具调用；detail 可放 bash 命令等补充信息。"""
 
         return cls(kind="tool_call", name=name, detail=detail)
+
+    @classmethod
+    def tool_result(
+        cls,
+        name: str,
+        *,
+        success: bool,
+        error: str = "",
+        tool_call_id: str = "",
+    ) -> ContractSignal:
+        """记录一次工具结果；用于 scorer 判断失败是否被最终答复披露。"""
+
+        return cls(
+            kind="tool_result",
+            name=name,
+            success=success,
+            error=error,
+            tool_call_id=tool_call_id,
+        )
 
     @classmethod
     def file_change(cls, name: str, detail: str = "") -> ContractSignal:
@@ -174,12 +196,19 @@ class ContractController:
 
         if signal.kind == "tool_call":
             self.tool_calls.append(signal)
-            if len(self.tool_calls) >= TOOL_THRESHOLD:
+            tool_call_count = sum(
+                1 for item in self.tool_calls if item.kind == "tool_call"
+            )
+            if tool_call_count >= TOOL_THRESHOLD:
                 self.trigger_reasons.add(TriggerReason.TOOL_THRESHOLD)
             if signal.name in FILE_CHANGE_TOOLS:
                 self.trigger_reasons.add(TriggerReason.FILE_CHANGE)
             if signal.name == "bash" and _looks_like_verify_command(signal.detail):
                 self.trigger_reasons.add(TriggerReason.VERIFY_COMMAND)
+            return
+
+        if signal.kind == "tool_result":
+            self.tool_calls.append(signal)
             return
 
         if signal.kind == "file_change":
@@ -298,6 +327,20 @@ def write_contract_artifact(
         encoding="utf-8",
     )
     return path
+
+
+def update_contract_artifact_scorer_result(
+    artifact_path: Path,
+    scorer_result: ScorerResult,
+) -> None:
+    """把 scorer 结果回写到已签名证据包；该字段不参与证据 hash。"""
+
+    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    payload["scorer_result"] = asdict(scorer_result)
+    artifact_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def verify_signature(evidence: ContractEvidence, signature: ContractSignature) -> bool:
@@ -601,6 +644,7 @@ __all__ = [
     "scorer_instructions",
     "scorer_user_payload",
     "sign_evidence",
+    "update_contract_artifact_scorer_result",
     "validate_scorer_result",
     "verify_signature",
     "write_contract_artifact",

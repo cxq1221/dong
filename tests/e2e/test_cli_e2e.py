@@ -25,7 +25,7 @@ def test_system_prompt_is_clear_and_json_mode_aware() -> None:
     prompt_path = cli.resources.files("dong").joinpath(cli.DEFAULT_AGENT_DEFINE_FILENAME)
 
     assert cli.SYSTEM_PROMPT == prompt_path.read_text(encoding="utf-8").strip()
-    assert "你是在 dong CLI 中运行的编码代理" in cli.SYSTEM_PROMPT
+    assert "你是在 dong CLI 中运行的" in cli.SYSTEM_PROMPT
 
 
 def test_build_agent_prompt_moves_system_messages_to_instructions(tmp_path) -> None:
@@ -410,6 +410,10 @@ def test_contract_scorer_updates_scoreboard_and_session_lesson(tmp_path, monkeyp
     assert scoreboard["average_score"] == 58
     assert scoreboard["pressure_level"] == "watch"
     assert "后续修改必须先运行相关测试" in seen_instructions[-1]
+    artifacts = list((tmp_path / ".dong" / "contracts").glob("session-*.json"))
+    assert len(artifacts) == 1
+    artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
+    assert artifact["scorer_result"]["score"] == 58
 
 
 def test_contract_flow_logs_required_audit_events(tmp_path, monkeypatch) -> None:
@@ -454,6 +458,38 @@ def test_contract_flow_logs_required_audit_events(tmp_path, monkeypatch) -> None
     assert required_events.issubset(events)
 
 
+def test_contract_triggered_logs_verify_command_reason(tmp_path, monkeypatch) -> None:
+    """验证命令触发契约时，也必须记录 contract_triggered 审计事件。"""
+    responses = iter([
+        _assistant_message(tool_calls=[
+            _tool_call("call-1", "bash", '{"command": "printf pytest"}')
+        ]),
+        _assistant_message(content="已运行验证。"),
+        _assistant_message(content='{"score": 88, "deductions": [], "risk_flags": [], "lesson_for_session": "", "workspace_summary": "已验证"}'),
+    ])
+    events: list[tuple[str, dict]] = []
+
+    def fake_chat(_messages, _tools, instructions="", **_kwargs):  # type: ignore[no-untyped-def]
+        return next(responses)
+
+    def fake_log_event(_logger, _level, event, **fields):  # type: ignore[no-untyped-def]
+        events.append((event, fields))
+
+    monkeypatch.setattr(cli, "chat", fake_chat)
+    monkeypatch.setattr(cli, "log_event", fake_log_event)
+
+    cli.run_loop(
+        cli.build_agent_prompt([], str(tmp_path)),
+        [{"role": "user", "content": "run tests"}],
+        str(tmp_path),
+        max_turns=3,
+    )
+
+    triggered = [fields for event, fields in events if event == "contract_triggered"]
+    assert triggered
+    assert "verify_command" in triggered[0]["reasons"]
+
+
 def test_contract_signature_failure_is_logged_without_crashing(tmp_path, monkeypatch) -> None:
     """签名计算失败时只记录失败事件，不影响已展示的最终答复收尾。"""
     (tmp_path / "a.py").write_text("x", encoding="utf-8")
@@ -485,6 +521,39 @@ def test_contract_signature_failure_is_logged_without_crashing(tmp_path, monkeyp
 
     assert "contract_signature_failed" in events
     assert not list((tmp_path / ".dong" / "contracts").glob("session-*.json"))
+
+
+def test_contract_scorer_failure_is_logged_without_scoreboard(tmp_path, monkeypatch) -> None:
+    """scorer 失败时只记录失败事件，不应写入评分表。"""
+    (tmp_path / "a.py").write_text("x", encoding="utf-8")
+    responses = iter([
+        _assistant_message(tool_calls=[
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "x", "new": "y"}')
+        ]),
+        _assistant_message(content="已修改 a.py。"),
+        _assistant_message(content="not-json"),
+    ])
+    events: list[str] = []
+
+    def fake_log_event(_logger, _level, event, **_fields):  # type: ignore[no-untyped-def]
+        events.append(event)
+
+    monkeypatch.setattr(
+        cli,
+        "chat",
+        lambda _messages, _tools, instructions="", **_kwargs: next(responses),
+    )
+    monkeypatch.setattr(cli, "log_event", fake_log_event)
+
+    cli.run_loop(
+        cli.build_agent_prompt([], str(tmp_path)),
+        [{"role": "user", "content": "edit file"}],
+        str(tmp_path),
+        max_turns=3,
+    )
+
+    assert "contract_scorer_failed" in events
+    assert not (tmp_path / ".dong" / "scoreboard.json").exists()
 
 
 def test_skill_load_caps_model_loaded_skills_at_five(

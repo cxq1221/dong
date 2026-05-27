@@ -40,6 +40,7 @@ from dong.contract import (
     scorer_instructions,
     scorer_user_payload,
     sign_evidence,
+    update_contract_artifact_scorer_result,
     validate_scorer_result,
     verify_signature,
     write_contract_artifact,
@@ -542,9 +543,29 @@ def _record_contract_compaction(
     """压缩上下文后记录契约信号，下一轮可据此注入交付压力。"""
     if not compaction.compacted:
         return
-    contract_controller.record_signal(
-        ContractSignal.compaction(compaction.summary_ref or "")
+    _record_contract_signal(
+        contract_controller,
+        ContractSignal.compaction(compaction.summary_ref or ""),
     )
+
+
+def _record_contract_signal(
+    contract_controller: ContractController,
+    signal: ContractSignal,
+) -> None:
+    """记录契约信号，并在激活原因新增时留下统一审计日志。"""
+
+    was_active = contract_controller.is_active()
+    before_reasons = set(contract_controller.trigger_reasons)
+    contract_controller.record_signal(signal)
+    reasons_changed = before_reasons != contract_controller.trigger_reasons
+    if contract_controller.is_active() and (not was_active or reasons_changed):
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "contract_triggered",
+            reasons=_contract_trigger_reasons(contract_controller),
+        )
 
 
 def _contract_session_id(session: Session | None) -> str:
@@ -596,17 +617,22 @@ def _build_contract_evidence(
 
     for contract_signal in controller.tool_calls:
         args = _contract_tool_args(contract_signal.detail)
-        tool_summary.append({
+        item = {
             "kind": contract_signal.kind,
             "name": contract_signal.name,
             "detail_chars": len(contract_signal.detail),
-        })
-        if contract_signal.name in {"write", "edit"}:
+        }
+        if contract_signal.kind == "tool_result":
+            item["success"] = contract_signal.success
+            item["error"] = contract_signal.error
+            item["tool_call_id"] = contract_signal.tool_call_id
+        tool_summary.append(item)
+        if contract_signal.kind == "tool_call" and contract_signal.name in {"write", "edit"}:
             file_changes.append({
                 "tool": contract_signal.name,
                 "filepath": args.get("filepath", ""),
             })
-        if contract_signal.name == "bash":
+        if contract_signal.kind == "tool_call" and contract_signal.name == "bash":
             command = str(args.get("command") or args.get("cmd") or "")
             if _looks_like_contract_verification(command):
                 verification_evidence.append({
@@ -1236,7 +1262,8 @@ def run_loop(
                 name = tc.function.name
                 args_raw = tc.function.arguments
                 _log_ai_tool_call(tc, turn=turn + 1)
-                contract_controller.record_signal(
+                _record_contract_signal(
+                    contract_controller,
                     ContractSignal.tool_call(name, args_raw)
                 )
                 log_event(
@@ -1247,18 +1274,20 @@ def run_loop(
                     args_chars=len(args_raw),
                     turn=turn + 1,
                 )
-                if name in {"write", "edit"}:
-                    log_event(
-                        LOGGER,
-                        logging.INFO,
-                        "contract_triggered",
-                        reasons=_contract_trigger_reasons(contract_controller),
-                    )
 
                 if name == "bash":
                     # bash 工具风险最高，所以执行前先解析 command 并做危险命令确认。
                     cmd, invalid_result = _bash_command_from_args(args_raw)
                     if invalid_result is not None:
+                        _record_contract_signal(
+                            contract_controller,
+                            ContractSignal.tool_result(
+                                name,
+                                success=invalid_result.success,
+                                error=invalid_result.error,
+                                tool_call_id=tc.id,
+                            ),
+                        )
                         ui.show_tool_result(name, args_raw, invalid_result)
                         _append_tool_result(
                             working,
@@ -1279,6 +1308,15 @@ def run_loop(
                         cmd, default="n"
                     ):
                         # 用户拒绝危险命令时，也要把拒绝结果写回上下文，让模型知道发生了什么。
+                        _record_contract_signal(
+                            contract_controller,
+                            ContractSignal.tool_result(
+                                name,
+                                success=False,
+                                error="User cancelled dangerous command",
+                                tool_call_id=tc.id,
+                            ),
+                        )
                         _append_context_message(
                             working,
                             {
@@ -1333,6 +1371,15 @@ def run_loop(
                     )
                     if runtime_result is not None:
                         result = runtime_result
+                _record_contract_signal(
+                    contract_controller,
+                    ContractSignal.tool_result(
+                        name,
+                        success=result.success,
+                        error=result.error,
+                        tool_call_id=tc.id,
+                    ),
+                )
                 ui.show_tool_result(name, args_raw, result)
                 _log_ai_tool_result(name, tc.id, result, turn=turn + 1)
 
@@ -1423,6 +1470,10 @@ def run_loop(
                             workdir,
                             evidence,
                             signature,
+                        )
+                        update_contract_artifact_scorer_result(
+                            artifact_path,
+                            scorer_result,
                         )
                         log_event(
                             LOGGER,
