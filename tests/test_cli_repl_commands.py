@@ -302,6 +302,27 @@ def test_contract_commands_update_controller(tmp_path) -> None:
     assert "contract mode: off" in rendered
 
 
+def test_contract_controller_follows_repl_workdir_change(tmp_path) -> None:
+    """切换工作目录时，契约控制器也应跟随新的工作区。"""
+    next_workdir = tmp_path / "next"
+    next_workdir.mkdir()
+    ui, _err = _ui()
+    controller = ContractController(workdir=str(tmp_path))
+
+    action = handle_repl_command(
+        f"dir={next_workdir}",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=[],
+        ui=ui,
+        contract_controller=controller,
+    )
+
+    assert action.handled is True
+    assert action.workdir == str(next_workdir.resolve())
+    assert controller.workdir == str(next_workdir.resolve())
+
+
 def test_interactive_repl_queues_input_while_agent_is_working(
     tmp_path,
     monkeypatch,

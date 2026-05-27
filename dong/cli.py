@@ -1230,6 +1230,8 @@ def handle_repl_command(
                 workdir=new_workdir,
             )
             return ReplAction(handled=True)
+        if contract_controller is not None:
+            contract_controller.workdir = new_workdir
         ui.show_workdir(new_workdir)
         log_event(LOGGER, logging.INFO, "repl_workdir_changed", workdir=new_workdir)
         return ReplAction(handled=True, workdir=new_workdir)
