@@ -6,7 +6,13 @@ from io import StringIO
 from threading import Event
 
 from dong import cli
-from dong.cli import _run_repl_with_input_queue, handle_repl_command, repl_completions
+from dong.cli import (
+    _run_repl_sync,
+    _run_repl_with_input_queue,
+    handle_repl_command,
+    repl_completions,
+)
+from dong.ocr import OcrLine, OcrResult, image_marker
 from dong.tui import TuiApp
 from dong.ui import TerminalUI
 
@@ -41,7 +47,7 @@ class QueueTestUI(TerminalUI):
         self.queued: list[int] = []
         self.prompts: list[str] = []
 
-    def read_prompt(self, completions=(), *, prompt_text="\ndong ", bottom_toolbar=None):  # type: ignore[no-untyped-def]
+    def read_prompt(self, completions=(), *, prompt_text="\ndong ", bottom_toolbar=None, workdir=None):  # type: ignore[no-untyped-def]
         """第一条执行中输入第二条，第二条开始后再退出。"""
         self.prompts.append(prompt_text)
         self.read_count += 1
@@ -100,6 +106,160 @@ def test_clear_command_updates_session_snapshot(tmp_path) -> None:
     assert action.handled is True
     assert working == []
     assert loaded.messages == []
+
+
+def test_ocr_command_builds_prompt_from_image_text(tmp_path, monkeypatch) -> None:
+    """`/ocr` 应把本地识别结果转换成普通文本 prompt 继续进入模型。"""
+    image_path = tmp_path / "screen shot.png"
+    image_path.write_bytes(b"fake image")
+    ui, _err = _ui()
+
+    def fake_extract(path: str) -> OcrResult:
+        assert path == str(image_path)
+        return OcrResult(
+            image_path=str(image_path),
+            lines=(OcrLine("错误日志第一行", 0.99), OcrLine("错误日志第二行", 0.98)),
+        )
+
+    monkeypatch.setattr(cli, "extract_text_from_image", fake_extract)
+
+    action = handle_repl_command(
+        f'/ocr "{image_path}" 这是什么问题',
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=[],
+        ui=ui,
+    )
+
+    assert action.handled is True
+    assert action.prompt is not None
+    assert "不要假装直接看到了原图" in action.prompt
+    assert "错误日志第一行" in action.prompt
+    assert "用户输入" in action.prompt
+    assert "这是什么问题" in action.prompt
+
+
+def test_ocr_command_reports_usage_without_image_path(tmp_path) -> None:
+    """`/ocr` 缺少图片路径时不应进入模型请求。"""
+    ui, err = _ui()
+
+    action = handle_repl_command(
+        "/ocr",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=[],
+        ui=ui,
+    )
+
+    assert action.handled is True
+    assert action.prompt is None
+    assert "Usage: /ocr <image-path> [question]" in err.getvalue()
+
+
+def test_repl_image_marker_expands_to_ocr_prompt(tmp_path, monkeypatch) -> None:
+    """输入框图片占位符提交时应展开为 OCR 文本再进入模型。"""
+    ui, _err = _ui()
+    working: list[dict[str, str]] = []
+    image_path = tmp_path / "clipboard.png"
+    image_path.write_bytes(b"fake png")
+
+    def fake_extract(path: str) -> OcrResult:
+        assert path == str(image_path)
+        return OcrResult(
+            image_path=path,
+            lines=(OcrLine("图片中的报错"),),
+        )
+
+    def fake_run_loop(base_sys, working, _workdir, *, max_turns, ui, enable_mcp):  # type: ignore[no-untyped-def]
+        working.append({"role": "assistant", "content": "ok"})
+
+    monkeypatch.setattr("dong.ocr.extract_text_from_image", fake_extract)
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+
+    cli._process_repl_input(
+        f"{image_marker(image_path)} 怎么修",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=working,
+        ui=ui,
+        max_turns=3,
+        enable_mcp=False,
+    )
+
+    assert "图片中的报错" in working[0]["content"]
+    assert "怎么修" in working[0]["content"]
+
+
+def test_compact_command_forces_context_summary(tmp_path) -> None:
+    """`/compact` 应立即压缩旧上下文并保留最近消息。"""
+    ui, err = _ui()
+    working = [
+        {"role": "user", "content": f"message {index}"}
+        for index in range(7)
+    ]
+
+    action = handle_repl_command(
+        "/compact",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=working,
+        ui=ui,
+    )
+
+    assert action.handled is True
+    assert working[0]["role"] == "system"
+    assert "Compacted conversation context" in working[0]["content"]
+    assert "message 0" in working[0]["content"]
+    assert len(working) == 5
+    assert list((tmp_path / ".dong" / "context").glob("compact-*.md"))
+    rendered = err.getvalue()
+    assert "context compacted" in rendered
+    assert "removed=3" in rendered
+
+
+def test_compact_command_updates_session_snapshot(tmp_path) -> None:
+    """`/compact` 接入 session 时，应同步保存压缩后的上下文和 metadata。"""
+    from dong.session import SessionStore
+
+    ui, _err = _ui()
+    store = SessionStore(str(tmp_path))
+    session = store.create(model="deepseek-v4-pro")
+    for index in range(7):
+        session.append_message({"role": "user", "content": f"message {index}"})
+    working = session.messages
+
+    action = handle_repl_command(
+        "/compact",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=working,
+        ui=ui,
+        session=session,
+    )
+    loaded = store.load(session.session_id)
+
+    assert action.handled is True
+    assert loaded.messages[0]["role"] == "system"
+    assert loaded.compactions[-1]["removed_messages"] == 3
+
+
+def test_compact_command_noops_when_history_is_too_short(tmp_path) -> None:
+    """旧上下文不足时，`/compact` 不应生成空摘要。"""
+    ui, err = _ui()
+    working = [{"role": "user", "content": "only current request"}]
+
+    action = handle_repl_command(
+        "/compact",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=working,
+        ui=ui,
+    )
+
+    assert action.handled is True
+    assert working == [{"role": "user", "content": "only current request"}]
+    assert not (tmp_path / ".dong" / "context").exists()
+    assert "not enough old context" in err.getvalue()
 
 
 def test_interactive_repl_queues_input_while_agent_is_working(
@@ -210,6 +370,148 @@ def test_skill_load_and_unskill_preserve_loaded_skill_list(tmp_path) -> None:
     assert "Removed skill: review" in rendered
 
 
+def test_slash_root_lists_supported_commands(tmp_path) -> None:
+    """输入 `/` 应展示当前支持的用户级 slash 命令。"""
+    ui, err = _ui()
+
+    action = handle_repl_command(
+        "/",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=[],
+        ui=ui,
+    )
+
+    assert action.handled is True
+    rendered = err.getvalue()
+    assert "/skill" in rendered
+    assert "/sessions" in rendered
+    assert "/ocr" in rendered
+    assert "/compact" in rendered
+
+
+def test_sessions_command_lists_current_workspace_sessions(tmp_path) -> None:
+    """`/sessions` 应列出当前工作区可恢复的 session。"""
+    from dong.session import SessionStore
+
+    store = SessionStore(str(tmp_path))
+    first = store.create(model="deepseek-v4-pro")
+    first.append_message({"role": "user", "content": "older"})
+    second = store.create(model="deepseek-v4-pro")
+    second.append_message({"role": "user", "content": "newer"})
+    ui, err = _ui()
+
+    action = handle_repl_command(
+        "/sessions",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=second.messages,
+        ui=ui,
+        session=second,
+    )
+
+    assert action.handled is True
+    rendered = err.getvalue()
+    assert first.session_id in rendered
+    assert second.session_id in rendered
+    assert "messages" in rendered
+    assert "*" in rendered
+
+
+def test_sessions_command_can_switch_session_from_selector(tmp_path) -> None:
+    """TUI selector 选择 session 后，应切换当前 REPL working 上下文。"""
+    from dong.session import SessionStore
+
+    class SelectorUI(TerminalUI):
+        """模拟 TUI 的 session 选择能力。"""
+
+        def __init__(self, selected_id: str) -> None:
+            super().__init__(stderr=StringIO())
+            self.selected_id = selected_id
+            self.restored: tuple[str, str] | None = None
+
+        def select_session(self, summaries, *, current_session_id=None):  # type: ignore[no-untyped-def]
+            return self.selected_id
+
+        def show_session_restored(self, session_id: str, resume_command: str, messages=()) -> None:  # type: ignore[no-untyped-def]
+            self.restored = (session_id, resume_command)
+
+    store = SessionStore(str(tmp_path))
+    first = store.create(model="deepseek-v4-pro")
+    first.append_message({"role": "user", "content": "first context"})
+    second = store.create(model="deepseek-v4-pro")
+    second.append_message({"role": "user", "content": "second context"})
+    working = second.messages
+    ui = SelectorUI(first.session_id)
+
+    action = handle_repl_command(
+        "/sessions",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=working,
+        ui=ui,
+        session=second,
+    )
+
+    assert action.handled is True
+    assert action.session is not None
+    assert action.session.session_id == first.session_id
+    assert working == [{"role": "user", "content": "first context"}]
+    assert action.session.messages is working
+    assert ui.restored is not None
+    assert first.session_id in ui.restored[1]
+
+
+def test_exit_prints_copyable_resume_command(tmp_path) -> None:
+    """退出 REPL session 时应打印完整可复制恢复命令。"""
+    from dong.session import SessionStore
+
+    session = SessionStore(str(tmp_path)).create(model="deepseek-v4-pro")
+    ui, err = _ui()
+
+    action = handle_repl_command(
+        "exit",
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=session.messages,
+        ui=ui,
+        session=session,
+    )
+
+    assert action.handled is True
+    assert action.exit_requested is True
+    rendered = err.getvalue()
+    assert "Resume this session" in rendered
+    assert f"dong -d {tmp_path} --resume {session.session_id}" in rendered
+
+
+def test_ctrl_c_prompt_exit_prints_copyable_resume_command(tmp_path) -> None:
+    """提示符处 Ctrl-C 退出时应直接打印恢复命令。"""
+    from dong.session import SessionStore
+
+    session = SessionStore(str(tmp_path)).create(model="deepseek-v4-pro")
+    err = StringIO()
+
+    def raise_keyboard_interrupt(_prompt: str) -> str:
+        raise KeyboardInterrupt
+
+    ui = TerminalUI(stderr=err, input_func=raise_keyboard_interrupt)
+
+    _run_repl_sync(
+        workdir=str(tmp_path),
+        loaded_skills=[],
+        working=session.messages,
+        ui=ui,
+        max_turns=3,
+        enable_mcp=False,
+        session=session,
+    )
+
+    rendered = err.getvalue()
+    assert "Resume this session" in rendered
+    assert f"dong -d {tmp_path} --resume {session.session_id}" in rendered
+
+
 def test_slash_skill_invocation_returns_prompt(tmp_path) -> None:
     """`/review prompt` 应加载 skill 并把剩余文本作为 prompt 返回。"""
     _write(tmp_path / ".dong" / "skills" / "review.md", "# Review")
@@ -266,6 +568,9 @@ def test_repl_completions_include_commands_and_skills(tmp_path) -> None:
     completions = repl_completions(str(tmp_path), ["review"])
 
     assert "clear" in completions
+    assert "/compact" in completions
+    assert "/sessions" in completions
+    assert "/ocr" in completions
     assert "/skill review" in completions
     assert "/review" in completions
     assert "/unskill review" in completions

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import textwrap
 import json
@@ -12,6 +13,7 @@ from threading import Event, Thread
 from typing import TextIO
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import InMemoryHistory
@@ -24,6 +26,8 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
+from dong.clipboard_image import ClipboardImageError, save_clipboard_image
+from dong.ocr import image_marker
 from dong.tool import ToolResult
 
 
@@ -51,6 +55,54 @@ DONG_LIGHT_THEME = Theme({
 })
 
 MARKDOWN_CODE_THEME = "ansi_light"
+# REPL 命令帮助的单一文案来源，普通终端和 TUI 共同复用。
+REPL_COMMANDS_TEXT = (
+    "Commands: exit, clear, /compact, dir=<path>, /, /skill, /sessions, /ocr, /unskill, /<skill> <prompt>"
+)
+SLASH_COMMAND_LINES = [
+    "Slash commands:",
+    "  /compact           compact old context now",
+    "  /skill              list/load skills",
+    "  /sessions           list current workspace sessions",
+    "  /ocr <image> [ask]  recognize image text locally, then ask the model",
+]
+SESSION_TRANSCRIPT_PREVIEW_LIMIT = 12
+SESSION_TRANSCRIPT_PREVIEW_CHARS = 500
+
+
+def _session_message_text(content) -> str:
+    """把 session message content 展开成适合 transcript 预览的纯文本。"""
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(str(item))
+        text = " ".join(parts)
+    else:
+        text = str(content or "")
+    text = " ".join(text.split())
+    if len(text) > SESSION_TRANSCRIPT_PREVIEW_CHARS:
+        return text[: SESSION_TRANSCRIPT_PREVIEW_CHARS - 1] + "…"
+    return text
+
+
+def session_transcript_preview(messages: Iterable[object]) -> str:
+    """生成恢复 session 后展示在 UI 里的最近上下文内容。"""
+    rows: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "message")
+        text = _session_message_text(message.get("content"))
+        if not text:
+            continue
+        rows.append(f"{role}: {text}")
+    if not rows:
+        return ""
+    recent_rows = rows[-SESSION_TRANSCRIPT_PREVIEW_LIMIT:]
+    return "Recent session content:\n" + "\n".join(recent_rows)
 
 
 class _SlashAwareCompleter(Completer):
@@ -144,6 +196,8 @@ class _SlashAwareCompleter(Completer):
     def _slash_meta(candidate: str) -> str:
         if candidate in ("/skill", "/skills"):
             return "list/load skills"
+        if candidate == "/sessions":
+            return "list sessions"
         if candidate == "/unskill":
             return "unload skill"
         if candidate == "/bye":
@@ -187,6 +241,7 @@ class TerminalUI:
         *,
         prompt_text: str = "\ndong ",
         bottom_toolbar: str | None = None,
+        workdir: str | None = None,
     ) -> str:
         """读取一次 REPL 输入；非 TTY 环境下退回到普通 input()。"""
         if not self._interactive():
@@ -208,6 +263,17 @@ class TerminalUI:
         def _(event) -> None:  # type: ignore[no-untyped-def]
             # Ctrl-J 插入换行，让 REPL 仍然支持多行 prompt。
             event.current_buffer.insert_text("\n")
+
+        @key_bindings.add("c-v")
+        def _(event) -> None:  # type: ignore[no-untyped-def]
+            # Ctrl-V 尝试粘贴系统剪贴板图片；成功后插入可见图片占位符。
+            try:
+                path = save_clipboard_image(workdir or os.getcwd())
+            except ClipboardImageError as exc:
+                message = str(exc)
+                run_in_terminal(lambda: self.show_error(message))
+                return
+            event.current_buffer.insert_text(f"{image_marker(path)} ")
 
         @key_bindings.add("/")
         def _(event) -> None:  # type: ignore[no-untyped-def]
@@ -291,9 +357,70 @@ class TerminalUI:
             self.err_console.print(
                 f"   Skills: {skill_count} available  (/skill to list, /skill <name> to load)"
             )
-        self.err_console.print(
-            "   Commands: exit, clear, dir=<path>, /skill, /unskill, /<skill> <prompt>"
-        )
+        self.err_console.print(f"   {REPL_COMMANDS_TEXT}")
+
+    def show_slash_commands(self) -> None:
+        """展示用户可直接输入的 slash 命令。"""
+        for line in SLASH_COMMAND_LINES:
+            self.err_console.print(f"  {line}")
+
+    def show_session_summaries(
+        self,
+        summaries: Iterable[object],
+        *,
+        current_session_id: str | None = None,
+    ) -> None:
+        """展示当前工作区历史 session 列表。"""
+        rows = list(summaries)
+        if not rows:
+            self.err_console.print("  (no sessions for current workspace)")
+            return
+
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="bold cyan")
+        table.add_column()
+        table.add_column()
+        table.add_column()
+        table.add_column()
+        table.add_row("session", "messages", "updated", "current", "content")
+        for item in rows:
+            session_id = str(getattr(item, "session_id", ""))
+            updated_at_ms = int(getattr(item, "updated_at_ms", 0) or 0)
+            updated = time.strftime(
+                "%Y-%m-%d %H:%M:%S",
+                time.localtime(updated_at_ms / 1000),
+            )
+            current = "*" if session_id == current_session_id else ""
+            table.add_row(
+                session_id,
+                str(getattr(item, "message_count", 0)),
+                updated,
+                current,
+                str(getattr(item, "prompt_preview", "")),
+            )
+        self.err_console.print(table)
+
+    def show_session_resume_command(self, command: str) -> None:
+        """退出 REPL 时展示可复制的恢复命令。"""
+        text = f"  Resume this session:\n    {command}\n"
+        try:
+            os.write(self.stderr.fileno(), text.encode("utf-8"))
+        except Exception:
+            self.err_console.file.write(text)
+            self.err_console.file.flush()
+
+    def show_session_restored(
+        self,
+        session_id: str,
+        resume_command: str,
+        messages: Iterable[object] = (),
+    ) -> None:
+        """提示当前 REPL 已切换到指定 session。"""
+        self.err_console.print(f"  Restored session: {session_id}")
+        preview = session_transcript_preview(messages)
+        if preview:
+            self.err_console.print(preview)
+        self.err_console.print(f"  Resume command: {resume_command}")
 
     def show_loaded_skill(self, name: str, source: str, *, indent: str = "  ") -> None:
         """提示某个 skill 已加载，并展示来源。"""
@@ -317,7 +444,7 @@ class TerminalUI:
 
     def show_unknown_command_or_skill(self, command: str) -> None:
         """展示未知 slash 命令或 skill 的错误提示。"""
-        self.err_console.print(f"  Unknown command or skill: /{command}. Use /skill to list.")
+        self.err_console.print(f"  Unknown command or skill: /{command}. Use / to list commands.")
 
     def show_context_cleared(self) -> None:
         """提示当前会话上下文已清空。"""
@@ -333,6 +460,24 @@ class TerminalUI:
     ) -> None:
         """普通终端不持续展示 context 用量，TUI 会覆盖此方法。"""
         return
+
+    def show_context_compacted(
+        self,
+        *,
+        compacted: bool,
+        removed_messages: int,
+        preserved_messages: int,
+        summary_ref: str | None,
+    ) -> None:
+        """展示手动压缩结果。"""
+        if not compacted:
+            self.err_console.print("  (not enough old context to compact)")
+            return
+        suffix = f" -> {summary_ref}" if summary_ref else ""
+        self.err_console.print(
+            "  [green]context compacted[/] "
+            f"removed={removed_messages} preserved={preserved_messages}{suffix}"
+        )
 
     def show_workdir(self, workdir: str) -> None:
         """提示工作目录已切换。"""

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 
+from dong.ocr import image_marker
 from dong.tool import ToolResult
 from dong.tui import TuiApp, _fit_to_width, render_markdown, render_text
 
@@ -111,6 +113,28 @@ def test_tui_worker_processes_queued_inputs_in_order() -> None:
     assert seen == ["first", "second"]
 
 
+def test_tui_paste_clipboard_image_inserts_visible_marker(tmp_path, monkeypatch) -> None:
+    """TUI 粘贴图片应先在输入框插入可见附件占位符。"""
+    image_path = tmp_path / "clipboard.png"
+    image_path.write_bytes(b"fake png")
+    app = TuiApp(
+        process_input=lambda _text, _ui: False,
+        completion_provider=lambda: [],
+        workdir=str(tmp_path),
+    )
+
+    def fake_save(workdir: str):
+        assert workdir == str(tmp_path)
+        return image_path
+
+    monkeypatch.setattr("dong.tui.save_clipboard_image", fake_save)
+
+    app.paste_clipboard_image()
+
+    assert image_marker(image_path) in app.composer.text
+    assert "attached image" in app.transcript_text
+
+
 def test_tui_up_down_navigates_submitted_user_messages() -> None:
     """上下方向键历史应只在用户已提交消息和当前草稿之间切换。"""
     app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
@@ -197,8 +221,93 @@ def test_tui_ui_shows_auto_skill_selection() -> None:
     assert "matched: 浏览器" in app.transcript_text
 
 
-def test_tui_status_completion_hint_uses_short_lived_cache() -> None:
-    """状态栏反复重绘时不应每次都重新扫描 completion provider。"""
+def test_tui_session_picker_selects_with_keyboard() -> None:
+    """session picker 应支持上下键移动并用 Enter 选择。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    items = [
+        SimpleNamespace(
+            session_id="session-old",
+            updated_at_ms=1000,
+            message_count=1,
+            prompt_preview="old prompt",
+            assistant_preview="old answer",
+        ),
+        SimpleNamespace(
+            session_id="session-new",
+            updated_at_ms=2000,
+            message_count=2,
+            prompt_preview="new prompt",
+            assistant_preview="new answer",
+        ),
+    ]
+    result: list[str | None] = []
+    thread = threading.Thread(
+        target=lambda: result.append(app.select_session(items)),
+        daemon=True,
+    )
+
+    thread.start()
+    assert app._session_picker is not None
+    assert "old prompt" in app.transcript_text
+
+    assert app.move_session_picker_selection(1) is True
+    assert app.accept_session_picker() is True
+    thread.join(timeout=1)
+
+    assert result == ["session-new"]
+    assert app._session_picker is None
+    app.ui.show_session_restored(
+        "session-new",
+        "dong -d . --resume session-new",
+        [
+            {"role": "user", "content": "restored user question"},
+            {"role": "assistant", "content": "restored assistant answer"},
+        ],
+    )
+    assert "Restored session: session-new" in app.transcript_text
+    assert "Context loaded. Continue typing." in app.transcript_text
+    assert "restored user question" in app.transcript_text
+    assert "restored assistant answer" in app.transcript_text
+    assert "Selected session:" not in app.transcript_text
+    assert "old prompt" not in app.transcript_text
+
+
+def test_tui_session_picker_selects_with_mouse() -> None:
+    """session picker 应支持鼠标点击选择对应行。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.set_transcript_viewport_height(20)
+    items = [
+        SimpleNamespace(
+            session_id="session-old",
+            updated_at_ms=1000,
+            message_count=1,
+            prompt_preview="old prompt",
+            assistant_preview="old answer",
+        ),
+        SimpleNamespace(
+            session_id="session-new",
+            updated_at_ms=2000,
+            message_count=2,
+            prompt_preview="new prompt",
+            assistant_preview="new answer",
+        ),
+    ]
+    result: list[str | None] = []
+    thread = threading.Thread(
+        target=lambda: result.append(app.select_session(items)),
+        daemon=True,
+    )
+
+    thread.start()
+    assert app._session_picker is not None
+    assert app.handle_session_picker_mouse(18) is True
+    thread.join(timeout=1)
+
+    assert result == ["session-new"]
+
+
+def test_tui_slash_completion_menu_is_vertical_and_cached() -> None:
+    """slash 候选项应以竖向列表展示，并复用短缓存避免反复扫描。"""
     calls = 0
 
     def completions() -> list[str]:
@@ -208,10 +317,31 @@ def test_tui_status_completion_hint_uses_short_lived_cache() -> None:
 
     app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=completions)
     app.composer.buffer.text = "/"
+    rendered = "".join(text for _style, text in app._formatted_completion_menu())
 
-    assert "/review" in str(app._formatted_status())
-    assert "/review" in str(app._formatted_status())
+    assert app._has_completion_menu()
+    assert "› /skill\n    /review" in rendered
+    assert "/review" not in str(app._formatted_status())
+    assert "/review" in "".join(text for _style, text in app._formatted_completion_menu())
     assert calls == 1
+
+
+def test_tui_slash_completion_menu_moves_selection_and_accepts_candidate() -> None:
+    """slash 候选列表出现时，上下键语义应优先移动高亮项而不是切输入历史。"""
+    app = TuiApp(
+        process_input=lambda _text, _ui: False,
+        completion_provider=lambda: ["/skill", "/review", "/python-test"],
+    )
+    app.submit_text("previous user message")
+    app.composer.buffer.text = "/"
+
+    assert app.move_completion_selection(1)
+    rendered = "".join(text for _style, text in app._formatted_completion_menu())
+    assert "  /skill\n  › /python-test" in rendered
+    assert app.composer.text == "/"
+
+    assert app.accept_completion_selection()
+    assert app.composer.text == "/python-test"
 
 
 def test_tui_defaults_to_copy_friendly_mouse_mode() -> None:

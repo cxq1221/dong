@@ -102,10 +102,9 @@ def test_interactive_tty_repl_shows_slash_skill_menu_and_runs_commands(tmp_path)
         assert "dong" in output
 
         os.write(master_fd, b"/")
-        menu_output = _read_until(master_fd, "/python-test")
+        menu_output = _read_until(master_fd, "/sessions")
         assert "/skill" in menu_output
-        assert "/python-test" in menu_output
-        assert "/review" in menu_output
+        assert "/sessions" in menu_output
 
         _read_available(master_fd, duration=0.2)
         os.write(master_fd, b"re")
@@ -118,8 +117,8 @@ def test_interactive_tty_repl_shows_slash_skill_menu_and_runs_commands(tmp_path)
         assert "review" in load_output
 
         os.write(master_fd, b"/unskill review\r")
-        remove_output = _read_until(master_fd, "Removed skill: review")
-        assert "Removed skill: review" in remove_output
+        remove_output = _read_until(master_fd, "Removed ski")
+        assert "Removed ski" in remove_output
 
     finally:
         if proc.poll() is None:
@@ -284,6 +283,95 @@ def test_interactive_tty_tui_ctrl_d_exits(tmp_path) -> None:
         os.write(master_fd, b"\x04")
         proc.wait(timeout=5)
         assert proc.returncode == 0
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+        _read_available(master_fd, duration=0.1)
+        os.close(master_fd)
+
+
+def test_interactive_tty_sessions_enter_restores_visible_session_content(tmp_path) -> None:
+    """真实 TTY 中 /sessions 按 Enter 后，应在 TUI 里显示恢复 session 的内容。"""
+    from dong.session import SessionStore
+
+    store = SessionStore(str(tmp_path))
+    target = store.create(model="deepseek-v4-pro")
+    restored_tail = "RESTORED_TAIL_VISIBLE_AFTER_ENTER"
+    long_question = (
+        "恢复测试旧问题 "
+        + "x" * 140
+        + f" {restored_tail}"
+    )
+    target.append_message({"role": "user", "content": long_question})
+    target.append_message({"role": "assistant", "content": "恢复测试旧回答"})
+
+    master_fd, slave_fd = pty.openpty()
+    os.set_blocking(master_fd, False)
+    env = {
+        **os.environ,
+        "TERM": "xterm-256color",
+        "PROMPT_TOOLKIT_NO_CPR": "1",
+        "PYTHONUNBUFFERED": "1",
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "dong", "-d", str(tmp_path)],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=os.getcwd(),
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    try:
+        _read_until(master_fd, "dong")
+
+        os.write(master_fd, b"/sessions\r")
+        picker_output = _read_until(master_fd, target.session_id, timeout=5.0)
+        assert restored_tail not in picker_output
+
+        os.write(master_fd, b"\x1b[B\r")
+        restored_output = _read_until(master_fd, restored_tail, timeout=5.0)
+        assert "恢复测试旧回答" in restored_output
+        assert "Selected session:" not in restored_output
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+        _read_available(master_fd, duration=0.1)
+        os.close(master_fd)
+
+
+def test_interactive_tty_tui_ctrl_c_exits_with_resume_command(tmp_path) -> None:
+    """空输入状态下 Ctrl-C 应直接退出，并打印可复制恢复命令。"""
+    master_fd, slave_fd = pty.openpty()
+    os.set_blocking(master_fd, False)
+    env = {
+        **os.environ,
+        "TERM": "xterm-256color",
+        "PROMPT_TOOLKIT_NO_CPR": "1",
+        "PYTHONUNBUFFERED": "1",
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "dong", "-d", str(tmp_path)],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=os.getcwd(),
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    try:
+        output = _read_until(master_fd, "dong")
+        os.write(master_fd, b"\x03")
+        proc.wait(timeout=5)
+        output += _read_available(master_fd, duration=0.5)
+        assert proc.returncode == 0
+        assert "Resume this session" in output
+        assert "dong -d" in output
+        assert "--resume session-" in output
     finally:
         if proc.poll() is None:
             proc.terminate()

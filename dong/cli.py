@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import shlex
+import signal
 import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -11,9 +13,12 @@ from importlib import resources
 from queue import Empty, Queue
 from threading import Event, Thread
 
+from rich.text import Text
+
 from dong.context_compaction import (
     CONTEXT_SUMMARY_PREFIX,
     DEFAULT_CONTEXT_MAX_MESSAGES,
+    MIN_TAIL_MESSAGES,
     compact_context,
     message_reasoning_content,
     trim_context,
@@ -28,6 +33,12 @@ from dong.logging_config import (
     preview_payload,
 )
 from dong.mcp import McpConfigFile, McpManager, config_path, configured_server_names
+from dong.ocr import (
+    OcrError,
+    build_ocr_prompt,
+    expand_image_markers_to_ocr_prompt,
+    extract_text_from_image,
+)
 from dong.session import Session, SessionError, SessionStore
 from dong.skills import (
     SKILLS_RELPATH,
@@ -118,6 +129,7 @@ class ReplAction:
     exit_requested: bool = False
     workdir: str | None = None
     prompt: str | None = None
+    session: Session | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +138,21 @@ class AgentPrompt:
 
     instructions: str
     context_messages: list
+
+
+@dataclass(frozen=True)
+class SessionListItem:
+    """用于 `/sessions` 展示的 session 摘要和内容预览。"""
+
+    session_id: str
+    path: str
+    updated_at_ms: int
+    message_count: int
+    model: str | None
+    prompt_preview: str
+    assistant_preview: str
+    resume_command: str
+    current: bool = False
 
 
 # ═══════════════════════════════════════
@@ -177,6 +204,122 @@ def show_skill_status(ui: TerminalUI, workdir: str, loaded_skills: list[str]) ->
             ui.err_console.print(f"    {item}")
     else:
         ui.err_console.print("  (no skills loaded)")
+
+
+def _session_resume_command(workdir: str, session_id: str) -> str:
+    """生成可复制的恢复当前 session 命令。"""
+    return f"dong -d {shlex.quote(workdir)} --resume {shlex.quote(session_id)}"
+
+
+def _preview_text(value, *, limit: int = 96) -> str:
+    """把消息内容压成单行预览，避免 session 列表占满屏幕。"""
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(str(item))
+        text = " ".join(parts)
+    else:
+        text = str(value or "")
+    text = " ".join(text.split())
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
+
+
+def _session_list_items(
+    workdir: str,
+    session: Session | None,
+) -> list[SessionListItem]:
+    """读取当前工作区 session 摘要，并补充最近对话内容预览。"""
+    store = SessionStore(workdir)
+    current_session_id = session.session_id if session is not None else None
+    items: list[SessionListItem] = []
+    for summary in store.list_summaries():
+        prompt_preview = ""
+        assistant_preview = ""
+        try:
+            loaded = Session.load_from_path(summary.path)
+        except SessionError:
+            loaded = None
+        if loaded is not None:
+            for prompt in reversed(loaded.prompt_history):
+                prompt_preview = _preview_text(prompt.get("text"))
+                if prompt_preview:
+                    break
+            for message in reversed(loaded.messages):
+                if not isinstance(message, dict):
+                    continue
+                role = message.get("role")
+                if not prompt_preview and role == "user":
+                    prompt_preview = _preview_text(message.get("content"))
+                if not assistant_preview and role == "assistant":
+                    assistant_preview = _preview_text(message.get("content"))
+                if prompt_preview and assistant_preview:
+                    break
+
+        items.append(
+            SessionListItem(
+                session_id=summary.session_id,
+                path=str(summary.path),
+                updated_at_ms=summary.updated_at_ms,
+                message_count=summary.message_count,
+                model=summary.model,
+                prompt_preview=prompt_preview or "(no user prompt)",
+                assistant_preview=assistant_preview or "(no assistant reply)",
+                resume_command=_session_resume_command(workdir, summary.session_id),
+                current=summary.session_id == current_session_id,
+            )
+        )
+    return items
+
+
+def _attach_session_to_working(loaded: Session, working: list) -> Session:
+    """把已加载 session 接到当前 REPL working 列表，保持后续写盘同步。"""
+    working[:] = loaded.messages
+    loaded.messages = working
+    return loaded
+
+
+def _show_session_list(
+    ui: TerminalUI,
+    workdir: str,
+    session: Session | None,
+    working: list,
+) -> Session | None:
+    """展示 session 列表；TUI 下可选择并切换当前 session。"""
+    items = _session_list_items(workdir, session)
+    current_session_id = session.session_id if session is not None else None
+    selector = getattr(ui, "select_session", None)
+    if callable(selector):
+        selected_id = selector(items, current_session_id=current_session_id)
+        if not selected_id:
+            return None
+        loaded = SessionStore(workdir).load(selected_id)
+        loaded = _attach_session_to_working(loaded, working)
+        ui.show_session_restored(
+            loaded.session_id,
+            _session_resume_command(workdir, loaded.session_id),
+            loaded.messages,
+        )
+        return loaded
+    ui.show_session_summaries(items, current_session_id=current_session_id)
+    return None
+
+
+def _show_resume_command(
+    ui: TerminalUI,
+    workdir: str,
+    session: Session | None,
+) -> None:
+    """在退出交互会话前打印完整恢复命令。"""
+    if session is None:
+        return
+    ui.show_session_resume_command(
+        _session_resume_command(workdir, session.session_id)
+    )
 
 
 def build_messages(loaded_skills: list[str], workdir: str) -> list[dict[str, str]]:
@@ -1004,9 +1147,12 @@ def repl_completions(workdir: str, loaded_skills: list[str]) -> list[str]:
         "quit",
         "/bye",
         "clear",
+        "/compact",
         "dir=",
         "/skill",
         "/skills",
+        "/sessions",
+        "/ocr",
         "/unskill",
     ]
     skills = list_skills(workdir)
@@ -1029,6 +1175,7 @@ def handle_repl_command(
 ) -> ReplAction:
     """处理 REPL 内置命令，普通用户输入会返回 handled=False。"""
     if inp in ("exit", "quit", "/bye"):
+        _show_resume_command(ui, workdir, session)
         log_event(LOGGER, logging.INFO, "repl_exit_requested", command=inp)
         return ReplAction(handled=True, exit_requested=True)
 
@@ -1036,6 +1183,34 @@ def handle_repl_command(
         _replace_context_messages(working, [], session=session)
         ui.show_context_cleared()
         log_event(LOGGER, logging.INFO, "repl_context_cleared")
+        return ReplAction(handled=True)
+
+    if inp == "/compact":
+        compaction = compact_context(
+            working,
+            workdir=workdir,
+            model=get_model_name(),
+            force=True,
+            preserve_recent_messages=MIN_TAIL_MESSAGES,
+            reason="manual",
+        )
+        _apply_compaction_result(working, compaction, session=session)
+        _show_context_usage(ui, compaction)
+        ui.show_context_compacted(
+            compacted=compaction.compacted,
+            removed_messages=compaction.removed_messages,
+            preserved_messages=compaction.preserved_messages,
+            summary_ref=compaction.summary_ref,
+        )
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "repl_context_compact_requested",
+            compacted=compaction.compacted,
+            removed_messages=compaction.removed_messages,
+            preserved_messages=compaction.preserved_messages,
+            summary_ref=compaction.summary_ref,
+        )
         return ReplAction(handled=True)
 
     if inp.startswith("dir="):
@@ -1053,10 +1228,23 @@ def handle_repl_command(
         log_event(LOGGER, logging.INFO, "repl_workdir_changed", workdir=new_workdir)
         return ReplAction(handled=True, workdir=new_workdir)
 
+    if inp == "/":
+        ui.show_slash_commands()
+        log_event(LOGGER, logging.INFO, "repl_slash_commands_shown")
+        return ReplAction(handled=True)
+
     if inp in ("/skill", "/skills"):
         show_skill_status(ui, workdir, loaded_skills)
         log_event(LOGGER, logging.INFO, "repl_skill_status_shown")
         return ReplAction(handled=True)
+
+    if inp == "/sessions":
+        selected_session = _show_session_list(ui, workdir, session, working)
+        log_event(LOGGER, logging.INFO, "repl_session_list_shown")
+        return ReplAction(handled=True, session=selected_session)
+
+    if inp == "/ocr" or inp.startswith("/ocr "):
+        return _handle_ocr_command(inp, ui=ui)
 
     if inp.startswith("/skill "):
         name = inp[7:].strip()
@@ -1141,6 +1329,46 @@ def handle_repl_command(
     return ReplAction(handled=False)
 
 
+def _handle_ocr_command(inp: str, *, ui: TerminalUI) -> ReplAction:
+    """处理 `/ocr <image-path> [question]`，把图片转成文本 prompt。"""
+    try:
+        parts = shlex.split(inp)
+    except ValueError as exc:
+        ui.show_error(f"OCR 命令解析失败：{exc}")
+        log_event(LOGGER, logging.WARNING, "repl_ocr_parse_failed", error=str(exc))
+        return ReplAction(handled=True)
+
+    if len(parts) < 2:
+        ui.err_console.print(Text("  Usage: /ocr <image-path> [question]"))
+        return ReplAction(handled=True)
+
+    image_path = parts[1]
+    question = " ".join(parts[2:])
+    try:
+        result = extract_text_from_image(image_path)
+    except OcrError as exc:
+        ui.show_error(str(exc))
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "repl_ocr_failed",
+            image_path=image_path,
+            error=str(exc),
+        )
+        return ReplAction(handled=True)
+
+    prompt = build_ocr_prompt(result, question)
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "repl_ocr_completed",
+        image_path=result.image_path,
+        text_chars=len(result.text),
+        lines=len(result.lines),
+    )
+    return ReplAction(handled=True, prompt=prompt)
+
+
 def _is_repl_exit_input(inp: str) -> bool:
     """判断用户输入是否是退出 REPL 的命令。"""
     return inp.strip() in ("exit", "quit", "/bye")
@@ -1156,11 +1384,11 @@ def _process_repl_input(
     max_turns: int,
     enable_mcp: bool,
     session: Session | None = None,
-) -> tuple[str, bool]:
-    """处理一条 REPL 输入；返回新的 workdir 和是否请求退出。"""
+) -> tuple[str, bool, Session | None]:
+    """处理一条 REPL 输入；返回新的 workdir、退出状态和当前 session。"""
     inp = inp.strip()
     if not inp:
-        return workdir, False
+        return workdir, False, session
 
     action = handle_repl_command(
         inp,
@@ -1171,13 +1399,22 @@ def _process_repl_input(
         session=session,
     )
     if action.exit_requested:
-        return workdir, True
+        return workdir, True, action.session or session
     if action.workdir is not None:
-        return action.workdir, False
+        return action.workdir, False, action.session or session
     if action.handled and action.prompt is None:
-        return workdir, False
+        return workdir, False, action.session or session
 
     prompt = action.prompt if action.prompt is not None else inp
+    try:
+        ocr_prompt = expand_image_markers_to_ocr_prompt(prompt)
+    except OcrError as exc:
+        ui.show_error(str(exc))
+        log_event(LOGGER, logging.WARNING, "repl_image_marker_ocr_failed", error=str(exc))
+        return workdir, False, action.session or session
+    if ocr_prompt is not None:
+        prompt = ocr_prompt
+        log_event(LOGGER, logging.INFO, "repl_image_marker_ocr_completed")
     if action.prompt is None:
         log_event(LOGGER, logging.INFO, "repl_prompt_received", prompt_chars=len(inp))
 
@@ -1208,7 +1445,7 @@ def _process_repl_input(
     )
     _apply_compaction_result(working, compaction, session=session)
     _show_context_usage(ui, compaction)
-    return workdir, False
+    return workdir, False, session
 
 
 def _run_repl_sync(
@@ -1222,14 +1459,19 @@ def _run_repl_sync(
     session: Session | None = None,
 ) -> None:
     """非交互输入流使用的同步 REPL，保持管道和测试行为稳定。"""
+    current_session = session
     while True:
         try:
-            inp = ui.read_prompt(repl_completions(workdir, loaded_skills))
+            inp = ui.read_prompt(
+                repl_completions(workdir, loaded_skills),
+                workdir=workdir,
+            )
         except (EOFError, KeyboardInterrupt):
+            _show_resume_command(ui, workdir, current_session)
             ui.blank_line()
             break
 
-        workdir, exit_requested = _process_repl_input(
+        workdir, exit_requested, current_session = _process_repl_input(
             inp,
             workdir=workdir,
             loaded_skills=loaded_skills,
@@ -1237,7 +1479,7 @@ def _run_repl_sync(
             ui=ui,
             max_turns=max_turns,
             enable_mcp=enable_mcp,
-            session=session,
+            session=current_session,
         )
         if exit_requested:
             break
@@ -1270,16 +1512,17 @@ def _run_repl_with_input_queue(
     worker_busy = Event()
     worker_errors: list[BaseException] = []
     current_workdir = workdir
+    current_session = session
 
     def worker() -> None:
-        nonlocal current_workdir
+        nonlocal current_workdir, current_session
         while True:
             item = input_queue.get()
             try:
                 if item is None:
                     return
                 worker_busy.set()
-                current_workdir, exit_requested = _process_repl_input(
+                current_workdir, exit_requested, current_session = _process_repl_input(
                     item,
                     workdir=current_workdir,
                     loaded_skills=loaded_skills,
@@ -1287,7 +1530,7 @@ def _run_repl_with_input_queue(
                     ui=ui,
                     max_turns=max_turns,
                     enable_mcp=enable_mcp,
-                    session=session,
+                    session=current_session,
                 )
                 if exit_requested:
                     stop_requested.set()
@@ -1322,8 +1565,10 @@ def _run_repl_with_input_queue(
                     bottom_toolbar="AI 正在工作；当前输入会排队到下一轮"
                     if is_busy
                     else None,
+                    workdir=current_workdir,
                 )
             except (EOFError, KeyboardInterrupt):
+                _show_resume_command(ui, current_workdir, current_session)
                 ui.blank_line()
                 stop_requested.set()
                 _discard_pending_inputs(input_queue)
@@ -1496,7 +1741,7 @@ def main():
         # 把 "help" 子命令重定向到 argparse 的 --help
         sys.argv = [sys.argv[0], "--help"]
 
-    # 解析 CLI 参数：模型、工作目录、最大轮数、预加载 skill、一次性 prompt。
+    # 解析 CLI 参数：模型、工作目录、最大轮数、OCR 图片、预加载 skill、一次性 prompt。
     parser = argparse.ArgumentParser(description="dong — a minimal CLI coding agent")
     parser.add_argument("-m", "--model", default=get_model_name(), help="LLM model")
     parser.add_argument("-d", "--dir", default=None, help="Working directory")
@@ -1512,6 +1757,11 @@ def main():
     )
     parser.add_argument(
         "--mcp", action="store_true", help="Enable configured stdio MCP servers"
+    )
+    parser.add_argument(
+        "--image",
+        metavar="PATH",
+        help="Run local OCR on an image, then send recognized text with the prompt",
     )
     parser.add_argument(
         "--resume",
@@ -1537,7 +1787,7 @@ def main():
         "cli_started",
         model=args.model,
         workdir=workdir,
-        mode="single" if args.input else "repl",
+        mode="single" if args.input or args.image else "repl",
         log_path=str(log_path) if log_path else None,
         resume=args.resume,
     )
@@ -1551,7 +1801,7 @@ def main():
 
     # 加载项目规则；DONG.md 会进入系统消息，约束 agent 的行为。
     project_rules = load_dong_md(workdir)
-    interactive_tui = not args.input and ui._interactive()
+    interactive_tui = not args.input and not args.image and ui._interactive()
     tool_names = [
         *(tool["function"]["name"] for tool in TOOL_DEFS),
         *(["mcp"] if args.mcp else []),
@@ -1582,10 +1832,46 @@ def main():
             ui.show_skill_error(e)
             raise SystemExit(2) from e
 
-    if args.input:
+    if args.input or args.image:
         # 单次执行模式：命令行里带了 prompt，跑完一轮 run_loop 后直接退出。
         working = session.messages
         user_prompt = " ".join(args.input)
+        if args.image:
+            try:
+                ocr_result = extract_text_from_image(args.image)
+                user_prompt = build_ocr_prompt(ocr_result, user_prompt)
+                log_event(
+                    LOGGER,
+                    logging.INFO,
+                    "single_ocr_completed",
+                    image_path=ocr_result.image_path,
+                    text_chars=len(ocr_result.text),
+                    lines=len(ocr_result.lines),
+                )
+            except OcrError as exc:
+                ui.show_error(str(exc))
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    "single_ocr_failed",
+                    image_path=args.image,
+                    error=str(exc),
+                )
+                raise SystemExit(2) from exc
+        else:
+            try:
+                ocr_prompt = expand_image_markers_to_ocr_prompt(user_prompt)
+            except OcrError as exc:
+                ui.show_error(str(exc))
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    "single_image_marker_ocr_failed",
+                    error=str(exc),
+                )
+                raise SystemExit(2) from exc
+            if ocr_prompt is not None:
+                user_prompt = ocr_prompt
         log_event(
             LOGGER,
             logging.INFO,
@@ -1618,8 +1904,8 @@ def main():
             from dong.tui import TuiApp
 
             def process_tui_input(inp: str, tui_ui) -> bool:  # type: ignore[no-untyped-def]
-                nonlocal workdir
-                workdir, exit_requested = _process_repl_input(
+                nonlocal workdir, session
+                workdir, exit_requested, session = _process_repl_input(
                     inp,
                     workdir=workdir,
                     loaded_skills=loaded_skills,
@@ -1634,6 +1920,10 @@ def main():
             tui_app = TuiApp(
                 process_input=process_tui_input,
                 completion_provider=lambda: repl_completions(workdir, loaded_skills),
+                resume_command_provider=lambda: _session_resume_command(
+                    workdir, session.session_id
+                ),
+                workdir=workdir,
             )
             tui_app.ui.show_startup(
                 model=args.model,
@@ -1646,7 +1936,19 @@ def main():
                     info.name, info.selected_source, indent="   "
                 )
             tui_app.ui.show_repl_help(skill_count=len(avail))
-            tui_app.run()
+            tui_app.ui.show_session_resume_command(
+                _session_resume_command(workdir, session.session_id)
+            )
+            previous_sigint = signal.getsignal(signal.SIGINT)
+
+            def handle_tui_sigint(_signum, _frame) -> None:  # type: ignore[no-untyped-def]
+                raise SystemExit(0)
+
+            signal.signal(signal.SIGINT, handle_tui_sigint)
+            try:
+                tui_app.run()
+            finally:
+                signal.signal(signal.SIGINT, previous_sigint)
         else:
             ui.show_repl_help(skill_count=len(avail))
             _run_repl_sync(

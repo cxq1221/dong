@@ -222,12 +222,19 @@ dong
 |------|------|
 | `exit` / `quit` | 退出程序 |
 | `clear` | 清空对话上下文 |
+| `/compact` | 立即压缩旧上下文，保留最近消息 |
 | `dir=/path/to/project` | 切换到另一个项目目录 |
+| `/` | 查看当前支持的 slash 命令 |
 | `/skill <name>` | 加载指定 skill |
+| `/sessions` | 查看当前工作区历史 session；全屏 TUI 中可用 ↑/↓、鼠标点击选择并直接恢复 |
 | `/unskill <name>` | 卸载指定 skill |
 | `/<skill-name>` | 快捷方式：加载 skill 并以后续内容为 prompt |
 
-输入 `/` 时自动弹出命令和 skill 补全菜单。
+输入 `/` 回车会展示可用 slash 命令；只输入 `/` 但不回车时，会自动弹出命令和 skill 补全菜单。通过 `exit`、`quit`、`/bye`、Ctrl-C 或 Ctrl-D 退出交互 session 时，dong 会打印完整恢复命令，例如：
+
+```bash
+dong -d /path/to/project --resume session-1779874198099-1
+```
 
 ---
 
