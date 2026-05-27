@@ -222,6 +222,9 @@ class TuiApp:
         self._render_width_override: int | None = None
         self._completion_cache: list[str] = []
         self._completion_cache_at = 0.0
+        self._input_history: list[str] = []
+        self._input_history_index: int | None = None
+        self._input_history_draft = ""
         self._confirmation: ConfirmationRequest | None = None
         self._transcript: list[TranscriptItem] = []
         self._status = StatusState()
@@ -334,6 +337,7 @@ class TuiApp:
         if not text:
             return
         with self._lock:
+            self._record_input_history_locked(text)
             self._input_queue.put(text)
             self._status.queued = self._input_queue.qsize()
             self._status.new_output = False
@@ -446,6 +450,39 @@ class TuiApp:
                     return item.raw
         return None
 
+    def navigate_input_history(self, direction: int) -> None:
+        """按方向键切换已提交的用户输入；direction < 0 更旧，> 0 更新。"""
+        if direction == 0:
+            return
+
+        with self._lock:
+            if self._confirmation is not None or not self._input_history:
+                return
+
+            if self._input_history_index is None:
+                if direction > 0:
+                    return
+                self._input_history_draft = self.composer.text
+                next_index = len(self._input_history) - 1
+            else:
+                next_index = self._input_history_index + direction
+
+            if next_index < 0:
+                next_index = 0
+
+            if next_index >= len(self._input_history):
+                text = self._input_history_draft
+                self._input_history_index = None
+            else:
+                text = self._input_history[next_index]
+                self._input_history_index = next_index
+
+        self.composer.buffer.set_document(
+            Document(text, cursor_position=len(text)),
+            bypass_readonly=True,
+        )
+        self.invalidate()
+
     def scroll_transcript(self, lines: int) -> None:
         """Scroll transcript history; positive lines move to older output."""
         if lines == 0:
@@ -501,6 +538,12 @@ class TuiApp:
         with self._lock:
             self._scrollbar_drag_offset = None
         self.invalidate()
+
+    def _record_input_history_locked(self, text: str) -> None:
+        """记录用户已提交输入，并结束当前历史浏览状态。"""
+        self._input_history.append(text)
+        self._input_history_index = None
+        self._input_history_draft = ""
 
     def toggle_mouse_capture(self) -> bool:
         """切换鼠标捕获；关闭时终端可以直接拖选 transcript 文本复制。"""
@@ -758,6 +801,21 @@ class TuiApp:
         @bindings.add("c-j")
         def _(event) -> None:  # type: ignore[no-untyped-def]
             event.app.current_buffer.insert_text("\n")
+
+        @bindings.add("up")
+        def _(event) -> None:  # type: ignore[no-untyped-def]
+            if event.current_buffer.document.cursor_position_row > 0:
+                event.current_buffer.cursor_up()
+                return
+            self.navigate_input_history(-1)
+
+        @bindings.add("down")
+        def _(event) -> None:  # type: ignore[no-untyped-def]
+            document = event.current_buffer.document
+            if document.cursor_position_row < document.line_count - 1:
+                event.current_buffer.cursor_down()
+                return
+            self.navigate_input_history(1)
 
         @bindings.add("/")
         def _(event) -> None:  # type: ignore[no-untyped-def]

@@ -111,6 +111,29 @@ def test_tui_worker_processes_queued_inputs_in_order() -> None:
     assert seen == ["first", "second"]
 
 
+def test_tui_up_down_navigates_submitted_user_messages() -> None:
+    """上下方向键历史应只在用户已提交消息和当前草稿之间切换。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.submit_text("first")
+    app.submit_text("second")
+    app.composer.buffer.text = "draft"
+
+    app.navigate_input_history(-1)
+    assert app.composer.text == "second"
+
+    app.navigate_input_history(-1)
+    assert app.composer.text == "first"
+
+    app.navigate_input_history(-1)
+    assert app.composer.text == "first"
+
+    app.navigate_input_history(1)
+    assert app.composer.text == "second"
+
+    app.navigate_input_history(1)
+    assert app.composer.text == "draft"
+
+
 def test_tui_exit_unblocks_pending_confirmation() -> None:
     """TUI 退出时应拒绝并唤醒危险命令确认，避免 worker 线程挂住。"""
     confirmation_seen = threading.Event()

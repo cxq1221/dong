@@ -39,6 +39,11 @@ tests/
 └── mcp_helpers.py        # MCP 测试辅助工具
 ```
 
+安装到系统，并且开发调试模式
+```
+uv tool install --reinstall --editable .
+```
+
 ### 核心模块职责
 
 **`cli.py`** —— 程序入口与 agent 调度中心
