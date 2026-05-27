@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import signal
 import subprocess
 import sys
@@ -349,6 +350,37 @@ def test_contract_pressure_injected_after_complex_signal(tmp_path, monkeypatch) 
     assert "Contract Pressure" not in seen_instructions[0]
     assert "Contract Pressure" in seen_instructions[1]
     assert (tmp_path / ".dong" / "contracts" / "best-practices.md").exists()
+
+
+def test_contract_artifact_created_after_complex_final_answer(tmp_path, monkeypatch) -> None:
+    """复杂任务最终答复后，应生成带签名的契约证据包。"""
+    (tmp_path / "a.py").write_text("x", encoding="utf-8")
+    responses = iter([
+        _assistant_message(tool_calls=[
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "x", "new": "y"}')
+        ]),
+        _assistant_message(content="已修改 a.py；未运行测试。"),
+    ])
+
+    monkeypatch.setattr(
+        cli,
+        "chat",
+        lambda _messages, _tools, instructions="", **_kwargs: next(responses),
+    )
+
+    cli.run_loop(
+        cli.build_agent_prompt([], str(tmp_path)),
+        [{"role": "user", "content": "edit file"}],
+        str(tmp_path),
+        max_turns=3,
+    )
+
+    artifacts = list((tmp_path / ".dong" / "contracts").glob("session-*.json"))
+    assert len(artifacts) == 1
+    payload = json.loads(artifacts[0].read_text(encoding="utf-8"))
+    assert payload["signature"]["signature_hash"].startswith("0")
+    assert payload["file_changes"]
+    assert payload["unverified_items"]
 
 
 def test_skill_load_caps_model_loaded_skills_at_five(

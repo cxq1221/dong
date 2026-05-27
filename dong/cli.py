@@ -6,6 +6,7 @@ import os
 import shlex
 import signal
 import sys
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
@@ -24,11 +25,16 @@ from dong.context_compaction import (
     trim_context,
 )
 from dong.contract import (
+    CONTRACT_VERSION,
+    ContractEvidence,
     ContractController,
     ContractMode,
+    ContractSignature,
     ContractSignal,
     load_scoreboard,
     pressure_summary,
+    sign_evidence,
+    write_contract_artifact,
 )
 from dong.llm import chat, get_model_name
 from dong.log_viewer import LogFilter, stream_logs
@@ -521,6 +527,91 @@ def _record_contract_compaction(
         return
     contract_controller.record_signal(
         ContractSignal.compaction(compaction.summary_ref or "")
+    )
+
+
+def _contract_session_id(session: Session | None) -> str:
+    """生成契约证据使用的 session id；无持久 session 时用临时时间戳。"""
+    if session is not None and session.session_id:
+        return session.session_id
+    return f"session-{int(time.time() * 1000)}"
+
+
+def _last_user_prompt(messages: list) -> str:
+    """从当前上下文中取最近一条用户输入，作为本轮契约目标。"""
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+    return ""
+
+
+def _contract_tool_args(detail: str) -> dict:
+    """解析工具参数 JSON；解析失败时返回空 dict，避免影响最终答复。"""
+    try:
+        payload = json.loads(detail)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _looks_like_contract_verification(command: str) -> bool:
+    """用保守关键词识别契约证据里的验证命令。"""
+    command_lower = command.lower()
+    return any(
+        keyword in command_lower
+        for keyword in ("pytest", "ruff", "test", "lint", "build")
+    )
+
+
+def _build_contract_evidence(
+    session: Session | None,
+    controller: ContractController,
+    user_objective: str,
+    final_answer: str,
+) -> ContractEvidence:
+    """从控制器轨迹构造最终答复后的契约证据包。"""
+    tool_summary: list[dict] = []
+    file_changes: list[dict] = []
+    verification_evidence: list[dict] = []
+
+    for contract_signal in controller.tool_calls:
+        args = _contract_tool_args(contract_signal.detail)
+        tool_summary.append({
+            "kind": contract_signal.kind,
+            "name": contract_signal.name,
+            "detail_chars": len(contract_signal.detail),
+        })
+        if contract_signal.name in {"write", "edit"}:
+            file_changes.append({
+                "tool": contract_signal.name,
+                "filepath": args.get("filepath", ""),
+            })
+        if contract_signal.name == "bash":
+            command = str(args.get("command") or args.get("cmd") or "")
+            if _looks_like_contract_verification(command):
+                verification_evidence.append({
+                    "tool": contract_signal.name,
+                    "command": command,
+                })
+
+    unverified_items: list[str] = []
+    if file_changes and not verification_evidence:
+        unverified_items.append("代码修改后未观察到验证命令")
+
+    return ContractEvidence(
+        contract_version=CONTRACT_VERSION,
+        session_id=_contract_session_id(session),
+        trigger_reasons=_contract_trigger_reasons(controller),
+        user_objective=user_objective,
+        tool_summary=tool_summary,
+        file_changes=file_changes,
+        verification_evidence=verification_evidence,
+        final_answer=final_answer,
+        known_risks=[],
+        unverified_items=unverified_items,
     )
 
 
@@ -1203,6 +1294,44 @@ def run_loop(
                     final_content_chars=len(msg.content),
                     reasoning_chars=len(reasoning),
                 )
+                if contract_controller.is_active():
+                    # 契约签名只在最终答复后执行，避免把未完成的工具循环写成证据包。
+                    evidence = _build_contract_evidence(
+                        session,
+                        contract_controller,
+                        _last_user_prompt(working),
+                        msg.content,
+                    )
+                    signature_started_at = time.perf_counter()
+                    log_event(
+                        LOGGER,
+                        logging.INFO,
+                        "contract_signature_started",
+                        session_id=evidence.session_id,
+                        difficulty=1,
+                    )
+                    signature: ContractSignature = sign_evidence(evidence, difficulty=1)
+                    artifact_path = write_contract_artifact(
+                        workdir,
+                        evidence,
+                        signature,
+                    )
+                    if session is not None:
+                        session.record_event(
+                            "contract_signed",
+                            {
+                                "artifact_path": str(artifact_path),
+                                "signature_hash": signature.signature_hash,
+                                "difficulty": signature.difficulty,
+                            },
+                        )
+                    log_event(
+                        LOGGER,
+                        logging.INFO,
+                        "contract_signature_finished",
+                        artifact_path=str(artifact_path),
+                        elapsed_ms=int((time.perf_counter() - signature_started_at) * 1000),
+                    )
                 return
 
             # 控制上下文长度，避免长时间 REPL 或多轮工具调用导致 messages 过大。

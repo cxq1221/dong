@@ -281,6 +281,25 @@ def sign_evidence(
     raise TimeoutError("contract signature proof-of-work exhausted max_attempts")
 
 
+def write_contract_artifact(
+    workdir: str,
+    evidence: ContractEvidence,
+    signature: ContractSignature,
+) -> Path:
+    """把证据包和签名写入 .dong/contracts，供 scorer 和人工审计。"""
+
+    contracts_dir = Path(workdir) / ".dong" / "contracts"
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+    payload = evidence.to_dict()
+    payload["signature"] = asdict(signature)
+    path = contracts_dir / f"{evidence.session_id}-{int(time.time() * 1000)}.json"
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return path
+
+
 def verify_signature(evidence: ContractEvidence, signature: ContractSignature) -> bool:
     """校验证据 hash、签名 hash 和难度前缀是否全部匹配。"""
 
@@ -552,4 +571,5 @@ __all__ = [
     "sign_evidence",
     "validate_scorer_result",
     "verify_signature",
+    "write_contract_artifact",
 ]
