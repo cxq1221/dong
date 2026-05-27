@@ -90,8 +90,7 @@ class ContractController:
             return
 
         if signal.kind == "file_change":
-            if signal.name in FILE_CHANGE_TOOLS:
-                self.trigger_reasons.add(TriggerReason.FILE_CHANGE)
+            self.trigger_reasons.add(TriggerReason.FILE_CHANGE)
             return
 
         if signal.kind == "compaction":

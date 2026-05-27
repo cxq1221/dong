@@ -50,3 +50,33 @@ def test_contract_controller_manual_on_forces_active(tmp_path) -> None:
 
     assert controller.is_active() is True
     assert TriggerReason.MANUAL_ON in controller.trigger_reasons
+
+
+def test_contract_controller_file_change_path_triggers_file_change(tmp_path) -> None:
+    """文件变更信号里的 name 可以是路径，也应触发文件变更压力。"""
+    controller = ContractController(workdir=str(tmp_path))
+
+    controller.record_signal(ContractSignal.file_change("a.py"))
+
+    assert controller.is_active() is True
+    assert TriggerReason.FILE_CHANGE in controller.trigger_reasons
+
+
+def test_contract_controller_verify_bash_command_triggers_pressure(tmp_path) -> None:
+    """bash 执行验证命令时，应触发验证命令压力。"""
+    controller = ContractController(workdir=str(tmp_path))
+
+    controller.record_signal(ContractSignal.tool_call("bash", "uv run pytest -q"))
+
+    assert controller.is_active() is True
+    assert TriggerReason.VERIFY_COMMAND in controller.trigger_reasons
+
+
+def test_contract_controller_compaction_triggers_pressure(tmp_path) -> None:
+    """发生上下文压缩时，应触发压缩压力。"""
+    controller = ContractController(workdir=str(tmp_path))
+
+    controller.record_signal(ContractSignal.compaction("compact-1.md"))
+
+    assert controller.is_active() is True
+    assert TriggerReason.COMPACTION in controller.trigger_reasons
