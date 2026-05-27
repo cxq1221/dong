@@ -612,6 +612,7 @@ def _build_contract_evidence(
     tool_summary: list[dict] = []
     file_changes: list[dict] = []
     verification_evidence: list[dict] = []
+    saw_file_change = False
 
     for contract_signal in controller.tool_calls:
         args = _contract_tool_args(contract_signal.detail)
@@ -626,9 +627,20 @@ def _build_contract_evidence(
             item["tool_call_id"] = contract_signal.tool_call_id
         tool_summary.append(item)
         if contract_signal.kind == "tool_call" and contract_signal.name in {"write", "edit"}:
+            saw_file_change = True
             file_changes.append({
                 "tool": contract_signal.name,
                 "filepath": args.get("filepath", ""),
+            })
+        if (
+            contract_signal.kind == "tool_call"
+            and saw_file_change
+            and contract_signal.name in {"read", "grep"}
+        ):
+            verification_evidence.append({
+                "tool": contract_signal.name,
+                "filepath": args.get("filepath") or args.get("path") or "",
+                "pattern": args.get("pattern", ""),
             })
         if contract_signal.kind == "tool_call" and contract_signal.name == "bash":
             command = str(args.get("command") or args.get("cmd") or "")

@@ -424,6 +424,42 @@ def test_contract_artifact_records_assert_bash_verification(tmp_path, monkeypatc
     assert payload["unverified_items"] == []
 
 
+def test_contract_artifact_records_read_after_edit_verification(tmp_path, monkeypatch) -> None:
+    """文件修改后的 read/grep 复查应进入契约验证证据。"""
+    (tmp_path / "a.py").write_text("value = 1\n", encoding="utf-8")
+    responses = iter([
+        _assistant_message(tool_calls=[
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old": "value = 1", "new": "value = 2"}')
+        ]),
+        _assistant_message(tool_calls=[
+            _tool_call("call-2", "read", '{"filepath": "a.py"}')
+        ]),
+        _assistant_message(content="已修改并读取验证。"),
+        _assistant_message(content='{"score": 92, "deductions": [], "risk_flags": [], "lesson_for_session": "", "workspace_summary": "已验证"}'),
+    ])
+
+    monkeypatch.setattr(
+        cli,
+        "chat",
+        lambda _messages, _tools, instructions="", **_kwargs: next(responses),
+    )
+
+    cli.run_loop(
+        cli.build_agent_prompt([], str(tmp_path)),
+        [{"role": "user", "content": "edit and verify"}],
+        str(tmp_path),
+        max_turns=4,
+    )
+
+    artifacts = list((tmp_path / ".dong" / "contracts").glob("session-*.json"))
+    assert len(artifacts) == 1
+    payload = json.loads(artifacts[0].read_text(encoding="utf-8"))
+    assert payload["verification_evidence"] == [
+        {"filepath": "a.py", "pattern": "", "tool": "read"}
+    ]
+    assert payload["unverified_items"] == []
+
+
 def test_contract_scorer_updates_scoreboard_and_session_lesson(tmp_path, monkeypatch) -> None:
     """第三方 scorer 结果应更新评分表，并让同 session 后续轮次看到教训。"""
     (tmp_path / "a.py").write_text("x", encoding="utf-8")
