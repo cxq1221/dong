@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+import json
+import time
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 
+CONTRACT_VERSION = 1
 TOOL_THRESHOLD = 5
 VERIFY_COMMAND_KEYWORDS = ("pytest", "ruff", "mypy", "test", "lint", "build", "uv run")
 FILE_CHANGE_TOOLS = {"write", "edit"}
@@ -25,6 +29,40 @@ DEFAULT_BEST_PRACTICES = """# dong 契约最佳实践
 - 不要用漂亮总结替代验收材料。
 - 签名前确认交付可审阅、可复现、可回滚。
 """
+
+
+@dataclass(frozen=True)
+class ContractSignature:
+    """契约签名结果；记录证据 hash、nonce、难度和本地工作量证明 hash。"""
+
+    evidence_hash: str
+    nonce: int
+    difficulty: int
+    elapsed_ms: int
+    signature_hash: str
+
+
+@dataclass(frozen=True)
+class ContractEvidence:
+    """契约证据包；汇总交付目标、工具轨迹、文件变更、验证证据和风险。"""
+
+    contract_version: int
+    session_id: str
+    trigger_reasons: list[str]
+    user_objective: str
+    tool_summary: list[dict]
+    file_changes: list[dict]
+    verification_evidence: list[dict]
+    final_answer: str
+    known_risks: list[str]
+    unverified_items: list[str]
+    signature: dict | None = None
+    scorer_result: dict | None = None
+
+    def to_dict(self) -> dict:
+        """把证据包转换为普通 dict，方便规范化 JSON 和后续持久化。"""
+
+        return asdict(self)
 
 
 class ContractMode(str, Enum):
@@ -134,6 +172,94 @@ def _looks_like_verify_command(command: str) -> bool:
     return any(keyword in command_lower for keyword in VERIFY_COMMAND_KEYWORDS)
 
 
+def build_evidence_hash(evidence: ContractEvidence) -> str:
+    """使用规范化 JSON 生成证据包 hash，签名和 scorer 结果不参与证据自身 hash。"""
+
+    evidence_dict = evidence.to_dict()
+    evidence_dict["signature"] = None
+    evidence_dict["scorer_result"] = None
+    canonical_payload = json.dumps(
+        evidence_dict,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+
+
+def _signature_hash(
+    *,
+    session_id: str,
+    evidence_hash: str,
+    contract_version: int,
+    nonce: int,
+    difficulty: int,
+) -> str:
+    """基于会话、证据和 nonce 生成单次签名尝试的 hash。"""
+
+    payload = {
+        "contract_version": contract_version,
+        "difficulty": difficulty,
+        "evidence_hash": evidence_hash,
+        "nonce": nonce,
+        "session_id": session_id,
+    }
+    canonical_payload = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+
+
+def sign_evidence(
+    evidence: ContractEvidence,
+    difficulty: int,
+    max_attempts: int = 5_000_000,
+) -> ContractSignature:
+    """为证据包执行本地工作量证明签名，找到满足前导 0 难度的 nonce。"""
+
+    if difficulty < 0:
+        raise ValueError("difficulty must be non-negative")
+
+    started_at = time.perf_counter()
+    evidence_hash = build_evidence_hash(evidence)
+    prefix = "0" * difficulty
+    for nonce in range(max_attempts):
+        candidate_hash = _signature_hash(
+            session_id=evidence.session_id,
+            evidence_hash=evidence_hash,
+            contract_version=evidence.contract_version,
+            nonce=nonce,
+            difficulty=difficulty,
+        )
+        if candidate_hash.startswith(prefix):
+            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            return ContractSignature(
+                evidence_hash=evidence_hash,
+                nonce=nonce,
+                difficulty=difficulty,
+                elapsed_ms=elapsed_ms,
+                signature_hash=candidate_hash,
+            )
+
+    raise TimeoutError("contract signature proof-of-work exhausted max_attempts")
+
+
+def verify_signature(evidence: ContractEvidence, signature: ContractSignature) -> bool:
+    """校验证据 hash、签名 hash 和难度前缀是否全部匹配。"""
+
+    evidence_hash = build_evidence_hash(evidence)
+    if evidence_hash != signature.evidence_hash:
+        return False
+
+    expected_hash = _signature_hash(
+        session_id=evidence.session_id,
+        evidence_hash=evidence_hash,
+        contract_version=evidence.contract_version,
+        nonce=signature.nonce,
+        difficulty=signature.difficulty,
+    )
+    prefix = "0" * signature.difficulty
+    return expected_hash == signature.signature_hash and expected_hash.startswith(prefix)
+
+
 def ensure_best_practices(workdir: str) -> Path:
     """确保契约最佳实践材料存在；已有自定义文件必须原样保留。"""
 
@@ -174,14 +300,20 @@ def pressure_summary(
 
 __all__ = [
     "BEST_PRACTICES_RELPATH",
+    "CONTRACT_VERSION",
     "ContractController",
+    "ContractEvidence",
     "ContractMode",
+    "ContractSignature",
     "ContractSignal",
     "DEFAULT_BEST_PRACTICES",
     "FILE_CHANGE_TOOLS",
     "TOOL_THRESHOLD",
     "TriggerReason",
     "VERIFY_COMMAND_KEYWORDS",
+    "build_evidence_hash",
     "ensure_best_practices",
     "pressure_summary",
+    "sign_evidence",
+    "verify_signature",
 ]

@@ -4,11 +4,16 @@ from __future__ import annotations
 
 from dong.contract import (
     ContractController,
+    ContractEvidence,
     ContractMode,
+    ContractSignature,
     ContractSignal,
     TriggerReason,
+    build_evidence_hash,
     ensure_best_practices,
     pressure_summary,
+    sign_evidence,
+    verify_signature,
 )
 
 
@@ -131,3 +136,47 @@ def test_pressure_summary_handles_absent_historical_score(tmp_path) -> None:
 
     assert "契约压力" in summary
     assert "暂无历史分" in summary
+
+
+def test_evidence_hash_is_stable_for_same_payload() -> None:
+    """证据包 hash 应使用规范化 JSON，字段顺序不能影响结果。"""
+    evidence = ContractEvidence(
+        contract_version=1,
+        session_id="session-1",
+        trigger_reasons=["file_change"],
+        user_objective="修改 README",
+        tool_summary=[{"name": "edit", "success": True}],
+        file_changes=[{"path": "README.md", "operation": "edit"}],
+        verification_evidence=[
+            {"command": "uv run pytest tests/test_contract.py -q", "success": True}
+        ],
+        final_answer="已完成",
+        known_risks=[],
+        unverified_items=[],
+    )
+
+    assert build_evidence_hash(evidence) == build_evidence_hash(evidence)
+
+
+def test_sign_evidence_produces_verifiable_hash() -> None:
+    """签名应有真实 nonce、耗时字段，并能用相同证据校验。"""
+    evidence = ContractEvidence(
+        contract_version=1,
+        session_id="session-1",
+        trigger_reasons=["manual_on"],
+        user_objective="小任务",
+        tool_summary=[],
+        file_changes=[],
+        verification_evidence=[],
+        final_answer="完成",
+        known_risks=[],
+        unverified_items=["未运行测试"],
+    )
+
+    signature = sign_evidence(evidence, difficulty=1, max_attempts=100_000)
+
+    assert isinstance(signature, ContractSignature)
+    assert signature.difficulty == 1
+    assert signature.elapsed_ms >= 0
+    assert signature.signature_hash.startswith("0")
+    assert verify_signature(evidence, signature) is True
