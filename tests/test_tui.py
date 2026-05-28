@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 
 from dong.ocr import image_marker
@@ -24,13 +25,28 @@ def _completion_texts(app: TuiApp, text: str) -> list[str]:
     return [item.text for item in completer.get_completions(Document(text), None)]
 
 
-def _mouse_event(row: int, event_type: MouseEventType) -> MouseEvent:
+def _mouse_event(
+    row: int,
+    event_type: MouseEventType,
+    *,
+    button: MouseButton = MouseButton.LEFT,
+    x: int = 0,
+) -> MouseEvent:
     return MouseEvent(
-        position=Point(x=0, y=row),
+        position=Point(x=x, y=row),
         event_type=event_type,
-        button=MouseButton.LEFT,
+        button=button,
         modifiers=frozenset(),
     )
+
+
+def _press_key(app: TuiApp, key: Keys | str) -> None:
+    """执行指定 TUI key binding，便于测试 Ctrl-C 这类全局按键。"""
+    for binding in app.key_bindings.bindings:
+        if binding.keys == (key,):
+            binding.handler(SimpleNamespace(app=app.application))
+            return
+    raise AssertionError(f"missing key binding: {key}")
 
 
 def test_rich_markdown_renders_offscreen_with_ansi_color() -> None:
@@ -344,17 +360,256 @@ def test_tui_slash_completion_menu_moves_selection_and_accepts_candidate() -> No
     assert app.composer.text == "/python-test"
 
 
-def test_tui_defaults_to_copy_friendly_mouse_mode() -> None:
-    """TUI 默认不捕获鼠标，终端应能直接拖选 transcript 文本复制。"""
+def test_tui_defaults_to_mouse_mode_for_scrolling_and_selection() -> None:
+    """TUI 默认捕获鼠标，统一处理滚轮、滚动条和内容区拖选复制。"""
     app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+
+    assert app.application.mouse_support() is True
+    assert "mouse" in str(app._formatted_status())
+
+    assert app.toggle_mouse_capture() is False
 
     assert app.application.mouse_support() is False
     assert "copy" in str(app._formatted_status())
 
-    assert app.toggle_mouse_capture() is True
 
-    assert app.application.mouse_support() is True
-    assert "mouse" in str(app._formatted_status())
+def test_tui_transcript_ctrl_c_copies_visible_selection(monkeypatch) -> None:
+    """内容区拖选只保留选区，Ctrl-C 才复制当前可视 transcript 文本。"""
+    copied: list[str] = []
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "alpha\nbeta")
+    app.transcript_control.create_content(width=80, height=20)
+
+    def fake_copy(text: str, *, output=None) -> bool:  # type: ignore[no-untyped-def]
+        copied.append(text)
+        return True
+
+    monkeypatch.setattr("dong.tui._copy_text_to_clipboard", fake_copy)
+
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_DOWN, x=1)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(1, MouseEventType.MOUSE_MOVE, x=2)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(1, MouseEventType.MOUSE_UP, x=2)
+    )
+
+    assert copied == []
+    assert app._transcript_selection is not None
+    assert "selected" in app.status.label
+
+    _press_key(app, Keys.ControlC)
+
+    assert copied == ["lpha\nbe"]
+    assert app._last_copied_transcript_text == "lpha\nbe"
+    assert app._transcript_selection is not None
+    assert "copied" in app.status.label
+
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_DOWN, x=0)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_UP, x=0)
+    )
+
+    assert app._transcript_selection is None
+    assert "selected" not in app.status.label
+
+
+def test_tui_transcript_click_without_drag_does_not_select_text() -> None:
+    """内容区单击只清除选区，不应自动选中最后一个字符。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "alpha")
+    app.transcript_control.create_content(width=80, height=20)
+
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_DOWN, x=4)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_UP, x=4)
+    )
+
+    assert app._transcript_selection is None
+    assert app.copy_transcript_selection() is False
+
+
+def test_tui_composer_click_clears_transcript_selection() -> None:
+    """点击输入区应取消 transcript 选区，让 Ctrl-C 恢复退出/取消语义。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "alpha\nbeta")
+    app.transcript_control.create_content(width=80, height=20)
+
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_DOWN, x=1)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(1, MouseEventType.MOUSE_MOVE, x=2)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(1, MouseEventType.MOUSE_UP, x=2)
+    )
+    assert app._transcript_selection is not None
+
+    app.composer.control.mouse_handler(_mouse_event(0, MouseEventType.MOUSE_DOWN))
+
+    assert app._transcript_selection is None
+    assert app.copy_transcript_selection() is False
+
+
+def test_tui_transcript_selection_survives_scroll_and_clears_on_submit(monkeypatch) -> None:
+    """滚动时保留选区；提交新消息会改变 transcript 语境，应清除旧选区。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
+    app.transcript_control.create_content(width=80, height=20)
+
+    app.transcript_control.mouse_handler(
+        _mouse_event(19, MouseEventType.MOUSE_DOWN, x=0)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(19, MouseEventType.MOUSE_MOVE, x=4)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(19, MouseEventType.MOUSE_UP, x=4)
+    )
+    assert app._transcript_selection is not None
+
+    app.scroll_transcript(3)
+    assert app._transcript_selection is not None
+
+    app.scroll_transcript(-3)
+    assert app._transcript_selection is not None
+
+    app.submit_text("next")
+    assert app._transcript_selection is None
+
+
+def test_tui_transcript_selection_uses_prompt_toolkit_text_columns(monkeypatch) -> None:
+    """prompt_toolkit 已把鼠标坐标换算成字符列，中文选区不能再按双宽折算。"""
+    copied: list[str] = []
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "中文ABC")
+    app.transcript_control.create_content(width=80, height=20)
+
+    def fake_copy(text: str, *, output=None) -> bool:  # type: ignore[no-untyped-def]
+        copied.append(text)
+        return True
+
+    monkeypatch.setattr("dong.tui._copy_text_to_clipboard", fake_copy)
+
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_DOWN, x=1)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_MOVE, x=3)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_UP, x=3)
+    )
+
+    assert copied == []
+    assert app.copy_transcript_selection()
+    assert copied == ["文A"]
+
+
+def test_tui_transcript_selection_includes_last_character_at_line_end(monkeypatch) -> None:
+    """拖到行尾最后一个字符附近时，应包含最后一个字。"""
+    copied: list[str] = []
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "alpha")
+    app.transcript_control.create_content(width=80, height=20)
+
+    def fake_copy(text: str, *, output=None) -> bool:  # type: ignore[no-untyped-def]
+        copied.append(text)
+        return True
+
+    monkeypatch.setattr("dong.tui._copy_text_to_clipboard", fake_copy)
+
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_DOWN, x=0)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_MOVE, x=4)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_UP, x=4)
+    )
+
+    assert app.copy_transcript_selection()
+    assert copied == ["alpha"]
+
+
+def test_tui_transcript_selection_ignores_blank_area_fallback(monkeypatch) -> None:
+    """拖到无文本区域产生的 (0,0) 兜底坐标，不应反向选中上方内容。"""
+    copied: list[str] = []
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "alpha\nbeta\ngamma")
+    app.transcript_control.create_content(width=80, height=20)
+
+    def fake_copy(text: str, *, output=None) -> bool:  # type: ignore[no-untyped-def]
+        copied.append(text)
+        return True
+
+    monkeypatch.setattr("dong.tui._copy_text_to_clipboard", fake_copy)
+
+    app.transcript_control.mouse_handler(
+        _mouse_event(2, MouseEventType.MOUSE_DOWN, x=1)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(2, MouseEventType.MOUSE_MOVE, x=4)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_MOVE, x=0)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_UP, x=0)
+    )
+
+    assert copied == []
+    assert app.copy_transcript_selection()
+    assert copied == ["amma"]
+
+
+def test_tui_transcript_selection_does_not_start_from_blank_gap(monkeypatch) -> None:
+    """两行之间空白处按下会得到 (0,0) 兜底，拖走时不应从顶部开始选区。"""
+    copied: list[str] = []
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "alpha\nbeta")
+    app.transcript_control.create_content(width=80, height=20)
+
+    def fake_copy(text: str, *, output=None) -> bool:  # type: ignore[no-untyped-def]
+        copied.append(text)
+        return True
+
+    monkeypatch.setattr("dong.tui._copy_text_to_clipboard", fake_copy)
+
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_DOWN, x=0)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(1, MouseEventType.MOUSE_MOVE, x=4)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(1, MouseEventType.MOUSE_UP, x=4)
+    )
+
+    assert app._transcript_selection is None
+    assert not app.copy_transcript_selection()
+    assert copied == []
+
+
+def test_tui_composer_mouse_wheel_scrolls_transcript() -> None:
+    """输入框区域滚轮也应滚动 transcript，而不是滚动多行输入框。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
+    app.transcript_control.create_content(width=80, height=20)
+
+    app.composer.control.mouse_handler(_mouse_event(0, MouseEventType.SCROLL_UP))
+    content = app.transcript_control.create_content(width=80, height=20)
+
+    assert _content_line_text(content, content.line_count - 1) == "line 56"
+    assert app._scroll_offset == 3
 
 
 def test_tui_status_shows_context_usage() -> None:
@@ -446,15 +701,16 @@ def test_tui_tool_result_uses_current_render_width() -> None:
 
 
 def test_transcript_cursor_tracks_bottom_page() -> None:
-    """transcript 超过一屏时，prompt_toolkit 光标应锚定当前视图底部。"""
+    """transcript 超过一屏时，控件只渲染底部可视页，避免内部滚动状态抢控制。"""
     app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
     app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
 
     content = app.transcript_control.create_content(width=80, height=20)
 
-    assert content.cursor_position.y == 59
-    assert _content_line_text(content, 0) == "line 0"
-    assert _content_line_text(content, 59) == "line 59"
+    assert content.cursor_position.y == 19
+    assert content.line_count == 20
+    assert _content_line_text(content, 0) == "line 40"
+    assert _content_line_text(content, content.line_count - 1) == "line 59"
 
 
 def test_transcript_manual_scroll_changes_visible_slice() -> None:
@@ -466,7 +722,9 @@ def test_transcript_manual_scroll_changes_visible_slice() -> None:
     app.scroll_transcript(20)
     content = app.transcript_control.create_content(width=80, height=20)
 
-    assert content.cursor_position.y == 39
+    assert content.cursor_position.y == 19
+    assert content.line_count == 20
+    assert _content_line_text(content, 0) == "line 20"
     assert _content_line_text(content, content.line_count - 1) == "line 39"
 
 
@@ -504,6 +762,24 @@ def test_transcript_returning_to_bottom_resumes_following_new_output() -> None:
     assert _content_line_text(after, after.line_count - 1) == "line 61"
     assert app.status.new_output is False
     assert app._follow_bottom
+
+
+def test_transcript_submit_after_long_output_stays_at_bottom() -> None:
+    """长 transcript 后继续输入，应直接恢复底部跟随且滚动条停在最下方。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
+    app.transcript_control.create_content(width=80, height=20)
+    app.scroll_transcript(20)
+
+    app.submit_text("next")
+    app.append_item("user", "user", "next")
+    content = app.transcript_control.create_content(width=80, height=20)
+    state = app._scrollbar_state_locked()
+
+    assert _content_line_text(content, content.line_count - 1) == "next"
+    assert state.thumb_top + state.thumb_height == state.track_height
+    assert app._follow_bottom
+    assert app._scroll_offset == 0
 
 
 def test_transcript_scrollbar_is_hidden_when_content_fits() -> None:
@@ -574,6 +850,25 @@ def test_transcript_scrollbar_drag_updates_offset_and_returns_to_bottom() -> Non
 
     assert app._scroll_offset == 0
     assert app._follow_bottom
+
+
+def test_transcript_scrollbar_stops_dragging_on_plain_mouse_move() -> None:
+    """释放事件丢失后，普通鼠标移动不应继续拖动滚动条。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "\n".join(f"line {index}" for index in range(60)))
+    app.transcript_control.create_content(width=80, height=20)
+
+    app.scrollbar_control.mouse_handler(_mouse_event(14, MouseEventType.MOUSE_DOWN))
+    app.scrollbar_control.mouse_handler(_mouse_event(14, MouseEventType.MOUSE_MOVE))
+    assert app._scroll_offset == 0
+
+    app.scrollbar_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_MOVE, button=MouseButton.NONE)
+    )
+
+    assert app._scroll_offset == 0
+    assert app._follow_bottom
+    assert app._scrollbar_drag_offset is None
 
 
 def test_tui_working_status_records_tool_start() -> None:

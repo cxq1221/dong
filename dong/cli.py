@@ -2242,6 +2242,71 @@ def _open_session(
         raise SystemExit(2) from exc
 
 
+def _replay_session_to_tui(ui, messages: list) -> None:
+    """把已加载 session 的消息回放到 TUI transcript，恢复完整视觉上下文。
+
+    遍历 session 中每条消息，按其 role 调用 TuiUI 的对应展示方法，
+    让 transcript 中可以看到完整的历史对话，而不仅仅是内存中的上下文。
+    """
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role", "")
+        content = message.get("content", "")
+
+        if role == "user":
+            text = _message_text_for_display(content)
+            if text.strip():
+                ui.show_user_message(text)
+        elif role == "assistant":
+            reasoning = message.get("reasoning_content", "")
+            if reasoning:
+                reasoning_text = _message_text_for_display(reasoning)
+                if reasoning_text.strip():
+                    ui.show_reasoning_message(reasoning_text)
+
+            tool_calls = message.get("tool_calls") or []
+            if tool_calls:
+                for tc in tool_calls:
+                    func = tc.get("function") if isinstance(tc, dict) else getattr(tc, "function", None)
+                    if func is not None:
+                        name = func.get("name") if isinstance(func, dict) else getattr(func, "name", "")
+                        args = func.get("arguments") if isinstance(func, dict) else getattr(func, "arguments", "{}")
+                        ui.show_tool_result(
+                            name,
+                            args if isinstance(args, str) else json.dumps(args),
+                            ToolResult(success=True, summary="(from previous session)"),
+                        )
+
+            if content:
+                text = _message_text_for_display(content)
+                if text.strip():
+                    ui.show_assistant_message(text)
+        elif role == "tool":
+            text = _message_text_for_display(content)
+            if text.strip():
+                success = text.startswith("[✓]")
+                summary = text[:120] + ("..." if len(text) > 120 else "")
+                ui.show_tool_result(
+                    "tool",
+                    "",
+                    ToolResult(success=success, summary=summary),
+                )
+
+
+def _message_text_for_display(content) -> str:
+    """把 session message content 还原为适合展示的文本。"""
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(str(item))
+        return " ".join(parts)
+    return str(content or "")
+
+
 def main():
     """CLI 主入口：解析参数，并根据是否传入 prompt 选择单次或 REPL 模式。"""
     import argparse
@@ -2328,6 +2393,12 @@ def main():
             agents_loaded=project_rules is not None,
             tools=tool_names,
         )
+        if args.resume is not None and session.messages:
+            ui.show_session_restored(
+                session.session_id,
+                _session_resume_command(workdir, session.session_id),
+                session.messages,
+            )
 
     # 保存当前已启用的 skill 名称；build_messages 会根据它们拼装系统提示词。
     loaded_skills = []
@@ -2452,6 +2523,13 @@ def main():
                 tui_app.ui.show_loaded_skill(
                     info.name, info.selected_source, indent="   "
                 )
+            if args.resume is not None:
+                tui_app.ui.show_session_restored(
+                    session.session_id,
+                    _session_resume_command(workdir, session.session_id),
+                    session.messages,
+                )
+                _replay_session_to_tui(tui_app.ui, session.messages)
             tui_app.ui.show_repl_help(skill_count=len(avail))
             tui_app.ui.show_session_resume_command(
                 _session_resume_command(workdir, session.session_id)

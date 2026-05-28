@@ -34,6 +34,9 @@ class SessionTranscriptLine:
     role: str
     text: str
 
+    def __str__(self) -> str:
+        return f"{self.role}: {self.text}"
+
 
 @dataclass(frozen=True)
 class SessionTranscriptPreview:
@@ -45,6 +48,14 @@ class SessionTranscriptPreview:
     def empty(self) -> bool:
         """判断恢复摘要是否没有可展示内容。"""
         return not self.lines
+
+    def __str__(self) -> str:
+        """还原为人类可读的摘要文本。"""
+        if not self.lines:
+            return ""
+        return "Recent session content:\n" + "\n".join(
+            f"{line.role}: {line.text}" for line in self.lines
+        )
 
 
 @dataclass(frozen=True)
