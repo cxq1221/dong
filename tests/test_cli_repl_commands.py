@@ -489,13 +489,13 @@ def test_sessions_command_can_switch_session_from_selector(tmp_path) -> None:
         def __init__(self, selected_id: str) -> None:
             super().__init__(stderr=StringIO())
             self.selected_id = selected_id
-            self.restored: tuple[str, str] | None = None
+            self.restored: object | None = None
 
         def select_session(self, summaries, *, current_session_id=None):  # type: ignore[no-untyped-def]
             return self.selected_id
 
-        def show_session_restored(self, session_id: str, resume_command: str, messages=()) -> None:  # type: ignore[no-untyped-def]
-            self.restored = (session_id, resume_command)
+        def show_session_restored(self, result) -> None:  # type: ignore[no-untyped-def]
+            self.restored = result
 
     store = SessionStore(str(tmp_path))
     first = store.create(model="deepseek-v4-pro")
@@ -520,7 +520,8 @@ def test_sessions_command_can_switch_session_from_selector(tmp_path) -> None:
     assert working == [{"role": "user", "content": "first context"}]
     assert action.session.messages is working
     assert ui.restored is not None
-    assert first.session_id in ui.restored[1]
+    assert getattr(ui.restored, "session").session_id == first.session_id
+    assert first.session_id in getattr(ui.restored, "resume_command")
 
 
 def test_exit_prints_copyable_resume_command(tmp_path) -> None:

@@ -12,7 +12,9 @@
 dong/
 ├── __init__.py          # 空 Module，暴露公共 API
 ├── __main__.py          # python -m dong 入口，薄转发到 cli.main()
-├── cli.py               # CLI 主入口 + Agent 循环 + Skill 管理 (~450L)
+├── cli.py               # CLI 主入口 + Agent 循环 + Skill 管理
+├── session_recovery.py  # Session Recovery Module：列表摘要、恢复命令、上下文接入、恢复结果 view model
+├── tui.py               # 全屏 Terminal UI Module：Persistent Composer、Transcript、session picker
 ├── llm.py               # OpenAI Responses / ChatCompletions / Anthropic Messages 请求适配 (~250L)
 ├── tools.py             # 内置工具实现（read/write/edit/bash/grep/fetch/update_plan）(~450L)
 ├── tool.py              # 工具框架：注册/校验/执行/结构化结果 (~150L)
@@ -23,12 +25,13 @@ dong/
 
 **理由**：
 - `tools.py` 已膨胀到 450 行，抽出 `tool.py` 作为框架层，实现工具注册与执行解耦，方便单独测试
-- `ui.py` 隔离所有 Rich/prompt_toolkit 依赖，允许未来切换 Textual 或其他渲染引擎
+- `ui.py` 隔离普通终端 Rich 输出和共享终端渲染材料；`tui.py` 承担 Codex-like 全屏 Terminal UI Module
+- `session_recovery.py` 把 session 列表、恢复命令、恢复结果 view model 从 CLI 命令处理里抽出，避免 UI Adapter 理解 session 存储规则
 - `logging_config.py` 和 `log_viewer.py` 独立于主循环，通过子命令 `dong logs` 串联
 - `cli.py` 承担 Agent 循环和 Skill 加载，暂未进一步拆分以保持迭代速度
 
 ### 后果
-- 各 Module 通过明确的 import 边界交互：`cli → llm + tools + ui + tool`，`tools → tool`，`cli → logging_config`
+- 各 Module 通过明确的 import 边界交互：`cli → llm + tools + ui + tui + session_recovery + tool`，`tools → tool`，`cli → logging_config`
 - 每个 Module 可独立测试；ui、logging_config、log_viewer 不依赖其他业务 Module
 
 ---
@@ -150,13 +153,13 @@ def chat(messages, tools, *, model=None, instructions="") -> ChatCompletionMessa
 
 ---
 
-## 6. UI 层（ui.py）
+## 6. UI 层（ui.py + tui.py）
 
 ### 决策：Rich + prompt_toolkit，非全屏
 
 参见 [ADR-0001](./0001-rich-prompt-toolkit-inline-repl.md)。
 
-`TerminalUI` 类封装：
+`TerminalUI` 类封装普通终端 Adapter：
 - `show_startup()` — 启动面板（模型、工作目录、工具列表）
 - `show_assistant_message()` — Markdown 渲染到 stdout
 - `show_reasoning_message()` — thinking 面板渲染到 stderr
@@ -166,6 +169,11 @@ def chat(messages, tools, *, model=None, instructions="") -> ChatCompletionMessa
 - `confirm_dangerous_command()` — 危险命令确认
 - Skill 相关方法：`show_loaded_skill()`、`show_skill_error()` 等
 
+`tui.py` 中的 `TuiApp` 和 `TuiUI` 封装 Codex-like fullscreen Terminal UI Module：
+- `TuiApp` 拥有 prompt_toolkit.Application、Persistent Composer、Transcript、滚动条、slash completion、session picker。
+- `TuiUI` 是 TUI UI Adapter，保留 agent-loop UI 方法 surface，把输出转换为 Transcript item。
+- `/sessions` 选择器只返回用户选择；恢复结果通过 Session Restore Result 渲染，TUI 可以把原 picker Transcript item 原地替换成恢复后的内容。
+
 ### 补全设计（_SlashAwareCompleter）
 - `/` 开头弹出 slash 命令（/skill, /unskill）和已加载 skill 快捷项
 - `/skill <name>` 子补全：列出所有可用 skill 名
@@ -173,8 +181,8 @@ def chat(messages, tools, *, model=None, instructions="") -> ChatCompletionMessa
 - 非 `/` 开头补全普通命令（exit、clear）
 
 ### 后果
-- 所有终端渲染集中在 ui.py，CLI 循环只调用 TerminalUI 方法
-- 未来可添加 `--tui` 模式切换到 Textual 全屏 UI
+- 普通终端渲染集中在 `ui.py`，全屏 Transcript 渲染集中在 `tui.py`，CLI 循环只调用 UI Adapter 方法
+- `ui.py` 可以保存普通终端和 TUI 都需要的共享渲染材料，但不拥有全屏 layout 状态
 
 ---
 
@@ -255,7 +263,7 @@ log_event(logger, logging.INFO, "event_name", key=value, ...)
 
 ## 10. 对话历史与上下文管理
 
-### 决策：在 cli.py 中以 messages 列表管理
+### 决策：运行时仍以 messages 列表管理，session 文件负责恢复
 
 - REPL 模式：跨轮对话保持 messages 列表（单次模式不保持）
 - `clear` 命令重置 messages 为初始 system prompt
@@ -267,8 +275,32 @@ log_event(logger, logging.INFO, "event_name", key=value, ...)
 - 用户 prompt 中需包含 "json" 字样以满足 OpenAI API 要求
 
 ### 后果
-- messages 列表无持久化，进程退出后历史丢失
-- 无 token 计数和上下文窗口管理
+- messages 列表是运行时工作副本；持久化和恢复由 session 文件及 Session Recovery Module 管理
+- 上下文窗口管理由 Context Compaction Module 管理
+
+---
+
+## 10a. Session Recovery Module
+
+### 决策：session 恢复规则集中在 `session_recovery.py`
+
+`dong/session_recovery.py` 是 Session Recovery Module，拥有以下职责：
+
+- 从当前工作区读取 session 摘要，并生成 `/sessions` 列表需要的 `SessionListItem`
+- 生成可复制的 `dong -d <workdir> --resume <session-id>` 恢复命令
+- 加载用户选择的 session，并把恢复后的 messages 接入当前 REPL working 列表
+- 生成 Session Restore Result，包含恢复后的 session、恢复命令、最近 Transcript 预览 view model
+
+### 理由
+
+- CLI 命令处理只应决定“用户输入了 `/sessions`”，不应理解 session 文件格式、预览截断规则和恢复命令拼接。
+- 普通终端 Adapter 和 TUI UI Adapter 都需要展示恢复结果，但不应各自重新遍历 session messages。
+- 恢复后的 Transcript 预览是 UI view model，不是 session 存储格式；放在 Session Recovery Module 可以让测试穿过稳定 Interface。
+
+### 后果
+
+- `/sessions` 的业务回归测试可以直接覆盖 Session Recovery Module，再用 TTY E2E 证明 TUI 用户路径。
+- UI Adapter 只消费 Session Restore Result；后续改恢复摘要格式时不需要修改 CLI command handler。
 
 ---
 
@@ -310,7 +342,7 @@ dong logs [选项]          # 日志查看
 
 - 不用 LangChain/AutoGen 等重型 Agent 框架
 - 不用 Typer/Click 等 CLI 框架（argparse 足够）
-- 不用 Textual 等全屏 TUI（Phase 1 保持 inline REPL）
+- 不用 Textual；当前 Codex-like fullscreen TUI 直接基于 prompt_toolkit.Application
 
 ### 后果
 - 总依赖数 ~5 个运行时库，安装体积小

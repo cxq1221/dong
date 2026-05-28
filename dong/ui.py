@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+import platform
 import sys
-import textwrap
 import json
+import textwrap
 import time
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
@@ -28,6 +29,7 @@ from rich.theme import Theme
 
 from dong.clipboard_image import ClipboardImageError, save_clipboard_image
 from dong.ocr import image_marker
+from dong.session_recovery import SessionRestoreResult, SessionTranscriptPreview
 from dong.tool import ToolResult
 
 
@@ -67,43 +69,46 @@ SLASH_COMMAND_LINES = [
     "  /contract [cmd]     show or set contract pressure mode",
     "  /ocr <image> [ask]  recognize image text locally, then ask the model",
 ]
-SESSION_TRANSCRIPT_PREVIEW_LIMIT = 12
-SESSION_TRANSCRIPT_PREVIEW_CHARS = 500
 
 
-def _session_message_text(content) -> str:
-    """把 session message content 展开成适合 transcript 预览的纯文本。"""
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict):
-                parts.append(str(item.get("text") or item.get("content") or ""))
-            else:
-                parts.append(str(item))
-        text = " ".join(parts)
-    else:
-        text = str(content or "")
-    text = " ".join(text.split())
-    if len(text) > SESSION_TRANSCRIPT_PREVIEW_CHARS:
-        return text[: SESSION_TRANSCRIPT_PREVIEW_CHARS - 1] + "…"
-    return text
+def _is_macos() -> bool:
+    """判断当前运行平台是否是 macOS，用于展示平台习惯快捷键。"""
+    return platform.system() == "Darwin"
 
 
-def session_transcript_preview(messages: Iterable[object]) -> str:
-    """生成恢复 session 后展示在 UI 里的最近上下文内容。"""
-    rows: list[str] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        role = str(message.get("role") or "message")
-        text = _session_message_text(message.get("content"))
-        if not text:
-            continue
-        rows.append(f"{role}: {text}")
-    if not rows:
+def _shortcut_label(key: str) -> str:
+    """把内部 Ctrl 风格按键转换成面向用户的平台快捷键文案。"""
+    prefix = "Cmd" if _is_macos() else "Ctrl"
+    return f"{prefix}-{key.upper()}"
+
+
+def _cancel_shortcut_hint() -> str:
+    """生成真实可触发的取消提示；macOS 终端通常不会把物理 Cmd-C 传给应用。"""
+    if _is_macos():
+        return "Ctrl-C / Esc-C 取消当前任务"
+    return "Ctrl-C 取消当前任务"
+
+
+def _bind_control_shortcut(
+    key_bindings: KeyBindings,
+    key: str,
+    handler: Callable[..., None],
+    *,
+    eager: bool = False,
+) -> None:
+    """绑定 Ctrl 快捷键；macOS 额外接受终端可传入的 Esc+key 序列。"""
+    normalized = key.lower()
+    key_bindings.add(f"c-{normalized}", eager=eager)(handler)
+    if _is_macos():
+        key_bindings.add("escape", normalized, eager=eager)(handler)
+
+
+def format_session_transcript_preview(preview: SessionTranscriptPreview) -> str:
+    """把恢复摘要 view model 渲染成终端文本。"""
+    if preview.empty:
         return ""
-    recent_rows = rows[-SESSION_TRANSCRIPT_PREVIEW_LIMIT:]
-    return "Recent session content:\n" + "\n".join(recent_rows)
+    rows = [f"{line.role}: {line.text}" for line in preview.lines]
+    return "Recent session content:\n" + "\n".join(rows)
 
 
 class _SlashAwareCompleter(Completer):
@@ -260,14 +265,14 @@ class TerminalUI:
             # Enter 提交当前缓冲区，保持单行输入的直觉行为。
             event.app.current_buffer.validate_and_handle()
 
-        @key_bindings.add("c-j")
-        def _(event) -> None:  # type: ignore[no-untyped-def]
-            # Ctrl-J 插入换行，让 REPL 仍然支持多行 prompt。
+        def insert_newline(event) -> None:  # type: ignore[no-untyped-def]
+            # 平台换行快捷键插入换行，让 REPL 仍然支持多行 prompt。
             event.current_buffer.insert_text("\n")
 
-        @key_bindings.add("c-v")
-        def _(event) -> None:  # type: ignore[no-untyped-def]
-            # Ctrl-V 尝试粘贴系统剪贴板图片；成功后插入可见图片占位符。
+        _bind_control_shortcut(key_bindings, "j", insert_newline)
+
+        def paste_clipboard_image(event) -> None:  # type: ignore[no-untyped-def]
+            # 平台快捷键尝试粘贴系统剪贴板图片；成功后插入可见图片占位符。
             try:
                 path = save_clipboard_image(workdir or os.getcwd())
             except ClipboardImageError as exc:
@@ -275,6 +280,8 @@ class TerminalUI:
                 run_in_terminal(lambda: self.show_error(message))
                 return
             event.current_buffer.insert_text(f"{image_marker(path)} ")
+
+        _bind_control_shortcut(key_bindings, "v", paste_clipboard_image)
 
         @key_bindings.add("/")
         def _(event) -> None:  # type: ignore[no-untyped-def]
@@ -410,18 +417,13 @@ class TerminalUI:
             self.err_console.file.write(text)
             self.err_console.file.flush()
 
-    def show_session_restored(
-        self,
-        session_id: str,
-        resume_command: str,
-        messages: Iterable[object] = (),
-    ) -> None:
+    def show_session_restored(self, result: SessionRestoreResult) -> None:
         """提示当前 REPL 已切换到指定 session。"""
-        self.err_console.print(f"  Restored session: {session_id}")
-        preview = session_transcript_preview(messages)
+        self.err_console.print(f"  Restored session: {result.session.session_id}")
+        preview = format_session_transcript_preview(result.transcript_preview)
         if preview:
             self.err_console.print(preview)
-        self.err_console.print(f"  Resume command: {resume_command}")
+        self.err_console.print(f"  Resume command: {result.resume_command}")
 
     def show_loaded_skill(self, name: str, source: str, *, indent: str = "  ") -> None:
         """提示某个 skill 已加载，并展示来源。"""
@@ -542,21 +544,22 @@ class TerminalUI:
         message: str,
         *,
         timeout_seconds: float | None = None,
-        cancel_hint: str = "Ctrl-C 取消当前任务",
+        cancel_hint: str | None = None,
     ) -> AbstractContextManager[None]:
         """显示当前正在执行的阶段；退出上下文时自动清理状态行。"""
+        resolved_cancel_hint = cancel_hint or _cancel_shortcut_hint()
         if self._background_input_mode:
             return _StaticWorkingStatus(
                 self.err_console,
                 message,
                 timeout_seconds=timeout_seconds,
-                cancel_hint=cancel_hint,
+                cancel_hint=resolved_cancel_hint,
             )
         return _WorkingStatus(
             self.err_console,
             message,
             timeout_seconds=timeout_seconds,
-            cancel_hint=cancel_hint,
+            cancel_hint=resolved_cancel_hint,
         )
 
     def stream_assistant_message(self) -> AbstractContextManager[Callable[[str], None]]:

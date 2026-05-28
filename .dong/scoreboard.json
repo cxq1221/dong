@@ -1,0 +1,31 @@
+{
+  "average_score": 10.0,
+  "common_deductions": {
+    "undisclosed_failure": 1,
+    "{'reason': 'incomplete_delivery', 'amount': 45}": 1,
+    "{'reason': 'undisclosed_failure', 'amount': 15}": 1
+  },
+  "pressure_level": "probation",
+  "recent_scores": [
+    10
+  ],
+  "sessions": {
+    "session-1779934512721-1": {
+      "deductions": [
+        "{'reason': 'undisclosed_failure', 'amount': 15}",
+        "{'reason': 'incomplete_delivery', 'amount': 45}",
+        "undisclosed_failure"
+      ],
+      "lesson_for_session": "当用户提出具体需求（如搭建多 agent 功能）时，应先尝试给出实现方案或 prototype，而不是仅提问。在无法立即交付时需要明确说明当前无法完成的原因和下一步建议，并记录任何失败操作以便审计。",
+      "risk_flags": [
+        "undisclosed_failure",
+        "incomplete_delivery",
+        "no_verification",
+        "task_not_attempted"
+      ],
+      "score": 10,
+      "workspace_summary": "代码库浏览：查找了所有 Python 源文件，读取了 session.py, cli.py, llm.py 三个核心文件，试图读取 DONG.md 失败（未在总结中提及）。无文件修改。最终答复是反问用户多 agent 协作模型问题，未提供任何代码、配置或验证。"
+    }
+  },
+  "version": 1
+}

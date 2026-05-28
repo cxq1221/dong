@@ -103,7 +103,7 @@ def test_interactive_tty_repl_shows_slash_skill_menu_and_runs_commands(tmp_path)
     )
     os.close(slave_fd)
     try:
-        output = _read_until(master_fd, "dong")
+        output = _read_until(master_fd, "dong >")
         assert "dong" in output
 
         os.write(master_fd, b"/")
@@ -296,6 +296,68 @@ def test_interactive_tty_tui_ctrl_d_exits(tmp_path) -> None:
         os.close(master_fd)
 
 
+def test_interactive_tty_macos_mouse_selection_copies_to_pbcopy(tmp_path) -> None:
+    """真实 TTY 鼠标拖选应写入 macOS pbcopy 兼容剪贴板命令。"""
+    runner = tmp_path / "run_tui_selection.py"
+    clipboard_file = tmp_path / "clipboard.txt"
+    fake_bin = tmp_path / "bin"
+    pbcopy = fake_bin / "pbcopy"
+    _write(
+        pbcopy,
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(clipboard_file)!r}).write_text(sys.stdin.read(), encoding='utf-8')\n",
+    )
+    pbcopy.chmod(0o755)
+    _write(
+        runner,
+        """
+from dong import tui
+
+tui.platform.system = lambda: "Darwin"
+app = tui.TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+app.append_item("assistant", "assistant", "alpha\\nbeta", raw="alpha\\nbeta")
+app.run()
+""",
+    )
+
+    master_fd, slave_fd = pty.openpty()
+    os.set_blocking(master_fd, False)
+    env = {
+        **os.environ,
+        "TERM": "xterm-256color",
+        "PROMPT_TOOLKIT_NO_CPR": "1",
+        "PYTHONUNBUFFERED": "1",
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+    }
+    proc = subprocess.Popen(
+        [sys.executable, str(runner)],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=os.getcwd(),
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    try:
+        _read_until(master_fd, "dong", timeout=5.0)
+        # SGR mouse events: press at alpha[1], drag/release at beta[2].
+        os.write(master_fd, b"\x1b[<0;2;1M")
+        time.sleep(0.05)
+        os.write(master_fd, b"\x1b[<32;3;2M")
+        time.sleep(0.05)
+        os.write(master_fd, b"\x1b[<0;3;2m")
+
+        assert _wait_file_contains(clipboard_file, "lpha\nbe", timeout=5.0) == "lpha\nbe"
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+        _read_available(master_fd, duration=0.1)
+        os.close(master_fd)
+
+
 def test_interactive_tty_sessions_enter_restores_visible_session_content(tmp_path) -> None:
     """真实 TTY 中 /sessions 按 Enter 后，应在 TUI 里显示恢复 session 的内容。"""
     from dong.session import SessionStore
@@ -339,6 +401,7 @@ def test_interactive_tty_sessions_enter_restores_visible_session_content(tmp_pat
         os.write(master_fd, b"\x1b[B\r")
         restored_output = _read_until(master_fd, restored_tail, timeout=5.0)
         assert "恢复测试旧回答" in restored_output
+        assert "Recent session content" not in restored_output
         assert "Selected session:" not in restored_output
     finally:
         if proc.poll() is None:
@@ -369,9 +432,13 @@ def test_interactive_tty_tui_ctrl_c_exits_with_resume_command(tmp_path) -> None:
     )
     os.close(slave_fd)
     try:
-        output = _read_until(master_fd, "dong")
+        output = _read_until(master_fd, "dong >")
         os.write(master_fd, b"\x03")
-        proc.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while proc.poll() is None and time.monotonic() < deadline:
+            output += _read_available(master_fd, duration=0.1)
+        if proc.poll() is None:
+            raise subprocess.TimeoutExpired(proc.args, 5)
         output += _read_available(master_fd, duration=0.5)
         assert proc.returncode == 0
         assert "Resume this session" in output

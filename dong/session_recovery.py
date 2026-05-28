@@ -144,7 +144,7 @@ def session_transcript_preview(
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "message")
-        text = _message_text(message.get("content"))
+        text = session_message_text(message.get("content"))
         if not text:
             continue
         rows.append(SessionTranscriptLine(role=role, text=text))
@@ -155,13 +155,13 @@ def session_transcript_preview(
 
 def _preview_text(value, *, limit: int = 96) -> str:
     """把消息内容压成单行预览，避免 session 列表占满屏幕。"""
-    text = _message_text(value)
+    text = session_message_text(value)
     if len(text) > limit:
         return text[: limit - 1] + "…"
     return text
 
 
-def _message_text(content) -> str:
+def session_message_text(content) -> str:
     """把 session message content 展开成适合展示的纯文本。"""
     if isinstance(content, list):
         parts = []

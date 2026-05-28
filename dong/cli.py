@@ -7,6 +7,7 @@ import shlex
 import signal
 import sys
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
@@ -46,7 +47,7 @@ from dong.contract import (
     verify_signature,
     write_contract_artifact,
 )
-from dong.llm import chat, get_model_name
+from dong.llm import TaskCancelled, chat, get_model_name
 from dong.log_viewer import LogFilter, stream_logs
 from dong.logging_config import (
     configure_logging,
@@ -63,6 +64,13 @@ from dong.ocr import (
     extract_text_from_image,
 )
 from dong.session import Session, SessionError, SessionStore
+from dong.session_recovery import (
+    SessionRestoreResult,
+    restore_session,
+    session_list_items,
+    session_resume_command,
+    session_transcript_preview,
+)
 from dong.skills import (
     SKILLS_RELPATH,
     _codex_skills_dir,
@@ -163,21 +171,6 @@ class AgentPrompt:
     context_messages: list
 
 
-@dataclass(frozen=True)
-class SessionListItem:
-    """用于 `/sessions` 展示的 session 摘要和内容预览。"""
-
-    session_id: str
-    path: str
-    updated_at_ms: int
-    message_count: int
-    model: str | None
-    prompt_preview: str
-    assistant_preview: str
-    resume_command: str
-    current: bool = False
-
-
 # ═══════════════════════════════════════
 #  项目级自动提示词
 # ═══════════════════════════════════════
@@ -229,83 +222,6 @@ def show_skill_status(ui: TerminalUI, workdir: str, loaded_skills: list[str]) ->
         ui.err_console.print("  (no skills loaded)")
 
 
-def _session_resume_command(workdir: str, session_id: str) -> str:
-    """生成可复制的恢复当前 session 命令。"""
-    return f"dong -d {shlex.quote(workdir)} --resume {shlex.quote(session_id)}"
-
-
-def _preview_text(value, *, limit: int = 96) -> str:
-    """把消息内容压成单行预览，避免 session 列表占满屏幕。"""
-    if isinstance(value, list):
-        parts = []
-        for item in value:
-            if isinstance(item, dict):
-                parts.append(str(item.get("text") or item.get("content") or ""))
-            else:
-                parts.append(str(item))
-        text = " ".join(parts)
-    else:
-        text = str(value or "")
-    text = " ".join(text.split())
-    if len(text) > limit:
-        return text[: limit - 1] + "…"
-    return text
-
-
-def _session_list_items(
-    workdir: str,
-    session: Session | None,
-) -> list[SessionListItem]:
-    """读取当前工作区 session 摘要，并补充最近对话内容预览。"""
-    store = SessionStore(workdir)
-    current_session_id = session.session_id if session is not None else None
-    items: list[SessionListItem] = []
-    for summary in store.list_summaries():
-        prompt_preview = ""
-        assistant_preview = ""
-        try:
-            loaded = Session.load_from_path(summary.path)
-        except SessionError:
-            loaded = None
-        if loaded is not None:
-            for prompt in reversed(loaded.prompt_history):
-                prompt_preview = _preview_text(prompt.get("text"))
-                if prompt_preview:
-                    break
-            for message in reversed(loaded.messages):
-                if not isinstance(message, dict):
-                    continue
-                role = message.get("role")
-                if not prompt_preview and role == "user":
-                    prompt_preview = _preview_text(message.get("content"))
-                if not assistant_preview and role == "assistant":
-                    assistant_preview = _preview_text(message.get("content"))
-                if prompt_preview and assistant_preview:
-                    break
-
-        items.append(
-            SessionListItem(
-                session_id=summary.session_id,
-                path=str(summary.path),
-                updated_at_ms=summary.updated_at_ms,
-                message_count=summary.message_count,
-                model=summary.model,
-                prompt_preview=prompt_preview or "(no user prompt)",
-                assistant_preview=assistant_preview or "(no assistant reply)",
-                resume_command=_session_resume_command(workdir, summary.session_id),
-                current=summary.session_id == current_session_id,
-            )
-        )
-    return items
-
-
-def _attach_session_to_working(loaded: Session, working: list) -> Session:
-    """把已加载 session 接到当前 REPL working 列表，保持后续写盘同步。"""
-    working[:] = loaded.messages
-    loaded.messages = working
-    return loaded
-
-
 def _show_session_list(
     ui: TerminalUI,
     workdir: str,
@@ -313,21 +229,16 @@ def _show_session_list(
     working: list,
 ) -> Session | None:
     """展示 session 列表；TUI 下可选择并切换当前 session。"""
-    items = _session_list_items(workdir, session)
+    items = session_list_items(workdir, session)
     current_session_id = session.session_id if session is not None else None
     selector = getattr(ui, "select_session", None)
     if callable(selector):
         selected_id = selector(items, current_session_id=current_session_id)
         if not selected_id:
             return None
-        loaded = SessionStore(workdir).load(selected_id)
-        loaded = _attach_session_to_working(loaded, working)
-        ui.show_session_restored(
-            loaded.session_id,
-            _session_resume_command(workdir, loaded.session_id),
-            loaded.messages,
-        )
-        return loaded
+        result = restore_session(workdir, selected_id, working)
+        ui.show_session_restored(result)
+        return result.session
     ui.show_session_summaries(items, current_session_id=current_session_id)
     return None
 
@@ -341,7 +252,16 @@ def _show_resume_command(
     if session is None:
         return
     ui.show_session_resume_command(
-        _session_resume_command(workdir, session.session_id)
+        session_resume_command(workdir, session.session_id)
+    )
+
+
+def _session_restore_result(workdir: str, session: Session) -> SessionRestoreResult:
+    """把已加载 session 包装成 UI 可展示的恢复结果。"""
+    return SessionRestoreResult(
+        session=session,
+        resume_command=session_resume_command(workdir, session.session_id),
+        transcript_preview=session_transcript_preview(session.messages),
     )
 
 
@@ -958,6 +878,14 @@ def _show_task_failed(ui: TerminalUI, *, phase: str, error: Exception) -> None:
     ui.show_error(f"{phase}失败：{type(error).__name__}: {message}")
 
 
+def _ui_cancel_requested(ui: TerminalUI) -> Callable[[], bool] | None:
+    """从 UI 适配器提取协作取消检查函数；普通终端没有则返回 None。"""
+    checker = getattr(ui, "cancel_requested", None)
+    if callable(checker):
+        return checker
+    return None
+
+
 def _chat_with_streaming_ui(messages, tool_defs, instructions: str, ui: TerminalUI):
     """调用 LLM 时把文本 delta 直接交给 UI，同时保留完整 message 给工具循环。"""
     working_status = ui.show_working("AI 正在思考...")
@@ -998,6 +926,7 @@ def _chat_with_streaming_ui(messages, tool_defs, instructions: str, ui: Terminal
                 instructions=instructions,
                 on_text_delta=on_text_delta,
                 on_reasoning_delta=on_reasoning_delta,
+                cancel_requested=_ui_cancel_requested(ui),
             )
     except BaseException as exc:
         if working_active and working_entered:
@@ -1050,7 +979,7 @@ def run_turn(messages, workdir, ui: TerminalUI | None = None, enable_mcp: bool =
                 turn_instructions,
                 ui,
             )
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, TaskCancelled):
             _show_task_interrupted(ui, phase="AI 思考")
             log_event(LOGGER, logging.WARNING, "run_turn_interrupted", phase="llm")
             return False
@@ -1247,7 +1176,7 @@ def run_loop(
                     turn_instructions,
                     ui,
                 )
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, TaskCancelled):
                 _show_task_interrupted(ui, phase="AI 思考")
                 log_event(LOGGER, logging.WARNING, "run_loop_interrupted", phase="llm")
                 return
@@ -2394,11 +2323,7 @@ def main():
             tools=tool_names,
         )
         if args.resume is not None and session.messages:
-            ui.show_session_restored(
-                session.session_id,
-                _session_resume_command(workdir, session.session_id),
-                session.messages,
-            )
+            ui.show_session_restored(_session_restore_result(workdir, session))
 
     # 保存当前已启用的 skill 名称；build_messages 会根据它们拼装系统提示词。
     loaded_skills = []
@@ -2508,7 +2433,7 @@ def main():
             tui_app = TuiApp(
                 process_input=process_tui_input,
                 completion_provider=lambda: repl_completions(workdir, loaded_skills),
-                resume_command_provider=lambda: _session_resume_command(
+                resume_command_provider=lambda: session_resume_command(
                     workdir, session.session_id
                 ),
                 workdir=workdir,
@@ -2524,15 +2449,10 @@ def main():
                     info.name, info.selected_source, indent="   "
                 )
             if args.resume is not None:
-                tui_app.ui.show_session_restored(
-                    session.session_id,
-                    _session_resume_command(workdir, session.session_id),
-                    session.messages,
-                )
-                _replay_session_to_tui(tui_app.ui, session.messages)
+                tui_app.ui.show_session_restored(_session_restore_result(workdir, session))
             tui_app.ui.show_repl_help(skill_count=len(avail))
             tui_app.ui.show_session_resume_command(
-                _session_resume_command(workdir, session.session_id)
+                session_resume_command(workdir, session.session_id)
             )
             previous_sigint = signal.getsignal(signal.SIGINT)
 

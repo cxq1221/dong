@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import os
 from types import SimpleNamespace
 
 from prompt_toolkit.data_structures import Point
@@ -11,8 +12,11 @@ from prompt_toolkit.keys import Keys
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 
 from dong.ocr import image_marker
+from dong.session import Session
+from dong.session_recovery import SessionRestoreResult, session_transcript_preview
 from dong.tool import ToolResult
 from dong.tui import TuiApp, _fit_to_width, render_markdown, render_text
+from dong.ui import _cancel_shortcut_hint, _shortcut_label
 
 
 def _content_line_text(content, line_no: int) -> str:  # type: ignore[no-untyped-def]
@@ -41,12 +45,49 @@ def _mouse_event(
 
 
 def _press_key(app: TuiApp, key: Keys | str) -> None:
-    """执行指定 TUI key binding，便于测试 Ctrl-C 这类全局按键。"""
+    """执行指定 TUI key binding，便于测试复制/取消这类全局按键。"""
     for binding in app.key_bindings.bindings:
         if binding.keys == (key,):
             binding.handler(SimpleNamespace(app=app.application))
             return
     raise AssertionError(f"missing key binding: {key}")
+
+
+def test_shortcut_labels_follow_platform(monkeypatch) -> None:
+    """取消提示应展示终端真实能传入应用的按键。"""
+    monkeypatch.setattr("dong.ui.platform.system", lambda: "Darwin")
+    assert _shortcut_label("c") == "Cmd-C"
+    assert _cancel_shortcut_hint() == "Ctrl-C / Esc-C 取消当前任务"
+
+    monkeypatch.setattr("dong.ui.platform.system", lambda: "Linux")
+    assert _shortcut_label("c") == "Ctrl-C"
+    assert _cancel_shortcut_hint() == "Ctrl-C 取消当前任务"
+
+
+def test_tui_macos_shortcuts_accept_escape_aliases(monkeypatch) -> None:
+    """macOS 下除 Ctrl 触发外，也接受终端能传入的 Esc+key 兼容序列。"""
+    monkeypatch.setattr("dong.ui.platform.system", lambda: "Darwin")
+
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    keys = {binding.keys for binding in app.key_bindings.bindings}
+
+    assert (Keys.ControlC,) in keys
+    assert (Keys.Escape, "c") in keys
+    assert (Keys.Escape, "d") in keys
+
+
+def test_tui_ctrl_c_sets_cooperative_cancel_when_busy() -> None:
+    """TUI 忙碌时 Ctrl-C 应设置可被 worker/LLM 读取的取消事件。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+
+    with app._lock:
+        app._busy = True
+
+    _press_key(app, Keys.ControlC)
+
+    assert app.status.cancellation_requested
+    assert app.cancel_requested()
+    assert app.ui.cancel_requested()
 
 
 def test_rich_markdown_renders_offscreen_with_ansi_color() -> None:
@@ -258,7 +299,7 @@ def test_tui_session_picker_selects_with_keyboard() -> None:
     ]
     result: list[str | None] = []
     thread = threading.Thread(
-        target=lambda: result.append(app.select_session(items)),
+        target=lambda: result.append(app.ui.select_session(items)),
         daemon=True,
     )
 
@@ -273,17 +314,29 @@ def test_tui_session_picker_selects_with_keyboard() -> None:
     assert result == ["session-new"]
     assert app._session_picker is None
     app.ui.show_session_restored(
-        "session-new",
-        "dong -d . --resume session-new",
-        [
-            {"role": "user", "content": "restored user question"},
-            {"role": "assistant", "content": "restored assistant answer"},
-        ],
+        SessionRestoreResult(
+            session=Session(
+                session_id="session-new",
+                created_at_ms=1,
+                updated_at_ms=1,
+                workspace_root=".",
+                messages=[
+                    {"role": "user", "content": "restored user question"},
+                    {"role": "assistant", "content": "restored assistant answer"},
+                ],
+            ),
+            resume_command="dong -d . --resume session-new",
+            transcript_preview=session_transcript_preview([
+                {"role": "user", "content": "restored user question"},
+                {"role": "assistant", "content": "restored assistant answer"},
+            ]),
+        )
     )
     assert "Restored session: session-new" in app.transcript_text
     assert "Context loaded. Continue typing." in app.transcript_text
     assert "restored user question" in app.transcript_text
     assert "restored assistant answer" in app.transcript_text
+    assert "Recent session content" not in app.transcript_text
     assert "Selected session:" not in app.transcript_text
     assert "old prompt" not in app.transcript_text
 
@@ -310,7 +363,7 @@ def test_tui_session_picker_selects_with_mouse() -> None:
     ]
     result: list[str | None] = []
     thread = threading.Thread(
-        target=lambda: result.append(app.select_session(items)),
+        target=lambda: result.append(app.ui.select_session(items)),
         daemon=True,
     )
 
@@ -320,6 +373,42 @@ def test_tui_session_picker_selects_with_mouse() -> None:
     thread.join(timeout=1)
 
     assert result == ["session-new"]
+
+
+def test_tui_session_picker_loads_more_sessions_when_scrolling_down() -> None:
+    """历史 session 很多时，选择器默认只展示 10 个，向下移动才加载更多。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    items = [
+        SimpleNamespace(
+            session_id=f"session-{index:02d}",
+            updated_at_ms=1000 + index,
+            message_count=index,
+            prompt_preview=f"prompt {index:02d}",
+            assistant_preview=f"answer {index:02d}",
+        )
+        for index in range(25)
+    ]
+    thread = threading.Thread(
+        target=lambda: app.ui.select_session(items),
+        daemon=True,
+    )
+
+    thread.start()
+    assert app._session_picker is not None
+    assert "prompt 09" in app.transcript_text
+    assert "prompt 10" not in app.transcript_text
+    assert "15 remaining" in app.transcript_text
+
+    for _ in range(10):
+        assert app.move_session_picker_selection(1)
+
+    assert "prompt 10" in app.transcript_text
+    assert "prompt 19" in app.transcript_text
+    assert "prompt 20" not in app.transcript_text
+    assert "5 remaining" in app.transcript_text
+
+    assert app.cancel_session_picker()
+    thread.join(timeout=1)
 
 
 def test_tui_slash_completion_menu_is_vertical_and_cached() -> None:
@@ -336,7 +425,7 @@ def test_tui_slash_completion_menu_is_vertical_and_cached() -> None:
     rendered = "".join(text for _style, text in app._formatted_completion_menu())
 
     assert app._has_completion_menu()
-    assert "› /skill\n    /review" in rendered
+    assert "› /skill\n    ----------\n    /review" in rendered
     assert "/review" not in str(app._formatted_status())
     assert "/review" in "".join(text for _style, text in app._formatted_completion_menu())
     assert calls == 1
@@ -353,11 +442,25 @@ def test_tui_slash_completion_menu_moves_selection_and_accepts_candidate() -> No
 
     assert app.move_completion_selection(1)
     rendered = "".join(text for _style, text in app._formatted_completion_menu())
-    assert "  /skill\n  › /python-test" in rendered
+    assert "  /skill\n    ----------\n  › /python-test" in rendered
     assert app.composer.text == "/"
 
     assert app.accept_completion_selection()
     assert app.composer.text == "/python-test"
+
+
+def test_tui_slash_sessions_completion_submits_command_directly() -> None:
+    """菜单里选中 /sessions 时应直接进入功能，不先填回输入框。"""
+    app = TuiApp(
+        process_input=lambda _text, _ui: False,
+        completion_provider=lambda: ["/sessions"],
+    )
+    app.composer.buffer.text = "/"
+
+    assert app.accept_completion_selection()
+
+    assert app.composer.text == ""
+    assert app._input_queue.get_nowait() == "/sessions"
 
 
 def test_tui_defaults_to_mouse_mode_for_scrolling_and_selection() -> None:
@@ -373,9 +476,10 @@ def test_tui_defaults_to_mouse_mode_for_scrolling_and_selection() -> None:
     assert "copy" in str(app._formatted_status())
 
 
-def test_tui_transcript_ctrl_c_copies_visible_selection(monkeypatch) -> None:
-    """内容区拖选只保留选区，Ctrl-C 才复制当前可视 transcript 文本。"""
+def test_tui_transcript_copy_shortcut_copies_visible_selection(monkeypatch) -> None:
+    """内容区拖选只保留选区，平台复制快捷键才复制当前可视 transcript 文本。"""
     copied: list[str] = []
+    monkeypatch.setattr("dong.tui.platform.system", lambda: "Linux")
     app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
     app.append_item("assistant", "assistant", "alpha\nbeta")
     app.transcript_control.create_content(width=80, height=20)
@@ -418,6 +522,71 @@ def test_tui_transcript_ctrl_c_copies_visible_selection(monkeypatch) -> None:
     assert "selected" not in app.status.label
 
 
+def test_tui_macos_selection_auto_copies_visible_text(monkeypatch) -> None:
+    """macOS 下 Cmd-C 不会进入 TUI，鼠标松开时应直接复制内部选区。"""
+    copied: list[str] = []
+    monkeypatch.setattr("dong.tui.platform.system", lambda: "Darwin")
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "alpha\nbeta")
+    app.transcript_control.create_content(width=80, height=20)
+
+    def fake_copy(text: str, *, output=None) -> bool:  # type: ignore[no-untyped-def]
+        copied.append(text)
+        return True
+
+    monkeypatch.setattr("dong.tui._copy_text_to_clipboard", fake_copy)
+
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_DOWN, x=1)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(1, MouseEventType.MOUSE_MOVE, x=2)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(1, MouseEventType.MOUSE_UP, x=2)
+    )
+
+    assert copied == ["lpha\nbe"]
+    assert app._last_copied_transcript_text == "lpha\nbe"
+    assert app._transcript_selection is not None
+    assert "copied" in app.status.label
+
+
+def test_tui_macos_selection_writes_system_clipboard_tool(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """macOS 内部选区应端到端写入 pbcopy，而不是只更新 TUI 状态。"""
+    clipboard_file = tmp_path / "clipboard.txt"
+    pbcopy = tmp_path / "pbcopy"
+    pbcopy.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(clipboard_file)!r}).write_text(sys.stdin.read(), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    pbcopy.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr("dong.tui.platform.system", lambda: "Darwin")
+
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    app.append_item("assistant", "assistant", "alpha\nbeta")
+    app.transcript_control.create_content(width=80, height=20)
+
+    app.transcript_control.mouse_handler(
+        _mouse_event(0, MouseEventType.MOUSE_DOWN, x=1)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(1, MouseEventType.MOUSE_MOVE, x=2)
+    )
+    app.transcript_control.mouse_handler(
+        _mouse_event(1, MouseEventType.MOUSE_UP, x=2)
+    )
+
+    assert clipboard_file.read_text(encoding="utf-8") == "lpha\nbe"
+    assert app._last_copied_transcript_text == "lpha\nbe"
+
+
 def test_tui_transcript_click_without_drag_does_not_select_text() -> None:
     """内容区单击只清除选区，不应自动选中最后一个字符。"""
     app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
@@ -436,7 +605,7 @@ def test_tui_transcript_click_without_drag_does_not_select_text() -> None:
 
 
 def test_tui_composer_click_clears_transcript_selection() -> None:
-    """点击输入区应取消 transcript 选区，让 Ctrl-C 恢复退出/取消语义。"""
+    """点击输入区应取消 transcript 选区，让复制快捷键恢复退出/取消语义。"""
     app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
     app.append_item("assistant", "assistant", "alpha\nbeta")
     app.transcript_control.create_content(width=80, height=20)
@@ -488,6 +657,7 @@ def test_tui_transcript_selection_survives_scroll_and_clears_on_submit(monkeypat
 def test_tui_transcript_selection_uses_prompt_toolkit_text_columns(monkeypatch) -> None:
     """prompt_toolkit 已把鼠标坐标换算成字符列，中文选区不能再按双宽折算。"""
     copied: list[str] = []
+    monkeypatch.setattr("dong.tui.platform.system", lambda: "Linux")
     app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
     app.append_item("assistant", "assistant", "中文ABC")
     app.transcript_control.create_content(width=80, height=20)
@@ -516,6 +686,7 @@ def test_tui_transcript_selection_uses_prompt_toolkit_text_columns(monkeypatch) 
 def test_tui_transcript_selection_includes_last_character_at_line_end(monkeypatch) -> None:
     """拖到行尾最后一个字符附近时，应包含最后一个字。"""
     copied: list[str] = []
+    monkeypatch.setattr("dong.tui.platform.system", lambda: "Linux")
     app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
     app.append_item("assistant", "assistant", "alpha")
     app.transcript_control.create_content(width=80, height=20)
@@ -543,6 +714,7 @@ def test_tui_transcript_selection_includes_last_character_at_line_end(monkeypatc
 def test_tui_transcript_selection_ignores_blank_area_fallback(monkeypatch) -> None:
     """拖到无文本区域产生的 (0,0) 兜底坐标，不应反向选中上方内容。"""
     copied: list[str] = []
+    monkeypatch.setattr("dong.tui.platform.system", lambda: "Linux")
     app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
     app.append_item("assistant", "assistant", "alpha\nbeta\ngamma")
     app.transcript_control.create_content(width=80, height=20)
@@ -574,6 +746,7 @@ def test_tui_transcript_selection_ignores_blank_area_fallback(monkeypatch) -> No
 def test_tui_transcript_selection_does_not_start_from_blank_gap(monkeypatch) -> None:
     """两行之间空白处按下会得到 (0,0) 兜底，拖走时不应从顶部开始选区。"""
     copied: list[str] = []
+    monkeypatch.setattr("dong.tui.platform.system", lambda: "Linux")
     app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
     app.append_item("assistant", "assistant", "alpha\nbeta")
     app.transcript_control.create_content(width=80, height=20)

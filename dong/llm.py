@@ -42,6 +42,27 @@ _openai_client = None
 _anthropic_client = None
 _resolved_api_mode: str | None = None
 
+CancelRequested = Callable[[], bool]
+
+
+class TaskCancelled(Exception):
+    """用户取消当前模型任务时抛出的协作式中断信号。"""
+
+
+def _llm_timeout_seconds() -> float:
+    """读取 LLM SDK 超时，避免流式 socket 无增量时无限阻塞取消。"""
+    raw = (os.getenv("DONG_LLM_TIMEOUT") or "30").strip()
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return 30.0
+
+
+def _raise_if_cancelled(cancel_requested: CancelRequested | None) -> None:
+    """在 provider 调用边界轮询取消请求，并转换成统一异常。"""
+    if cancel_requested is not None and cancel_requested():
+        raise TaskCancelled("current task cancelled")
+
 
 @dataclass(frozen=True)
 class LlmRequest:
@@ -139,6 +160,7 @@ def _get_openai_client():
         _openai_client = OpenAI(
             api_key=os.getenv("DONG_API_KEY") or os.getenv("OPENAI_API_KEY"),
             base_url=base_url,
+            timeout=_llm_timeout_seconds(),
         )
         log_event(LOGGER, logging.INFO, "llm_client_initialized", base_url=base_url)
     return _openai_client
@@ -155,6 +177,7 @@ def _get_anthropic_client():
         _anthropic_client = Anthropic(
             api_key=os.getenv("DONG_ANTHROPIC_API_KEY") or os.getenv("DONG_API_KEY"),
             base_url=base_url,
+            timeout=_llm_timeout_seconds(),
         )
         log_event(
             LOGGER,
@@ -660,8 +683,10 @@ def _create_chat_completion_stream(
     request: LlmRequest,
     *,
     stream_callbacks: LlmStreamCallbacks,
+    cancel_requested: CancelRequested | None = None,
 ):
     """使用 ChatCompletions stream=True，并累积成 CLI 仍可消费的完整消息。"""
+    _raise_if_cancelled(cancel_requested)
     stream = _get_openai_client().chat.completions.create(
         model=request.model,
         messages=_chat_messages(request.input, request.instructions),
@@ -675,6 +700,7 @@ def _create_chat_completion_stream(
     tool_parts: dict[int, dict[str, str]] = {}
 
     for chunk in stream:
+        _raise_if_cancelled(cancel_requested)
         choices = _stream_attr(chunk, "choices") or []
         if not choices:
             continue
@@ -693,6 +719,7 @@ def _create_chat_completion_stream(
             stream_callbacks.reasoning(reasoning_delta)
 
         for tool_call in _stream_tool_call_deltas(delta):
+            _raise_if_cancelled(cancel_requested)
             index = _stream_attr(tool_call, "index", 0) or 0
             current = tool_parts.setdefault(
                 index,
@@ -773,11 +800,14 @@ def _create_anthropic_message_stream(
     request: LlmRequest,
     *,
     stream_callbacks: LlmStreamCallbacks,
+    cancel_requested: CancelRequested | None = None,
 ):
     """使用 Anthropic Messages stream，并把最终 Message 转回统一 assistant message。"""
     kwargs = _anthropic_request_kwargs(request)
+    _raise_if_cancelled(cancel_requested)
     with _get_anthropic_client().messages.stream(**kwargs) as stream:
         for event in stream:
+            _raise_if_cancelled(cancel_requested)
             if _stream_attr(event, "type") != "content_block_delta":
                 continue
             delta = _stream_attr(event, "delta")
@@ -786,6 +816,7 @@ def _create_anthropic_message_stream(
                 stream_callbacks.text(_stream_attr(delta, "text") or "")
             elif delta_type == "thinking_delta":
                 stream_callbacks.reasoning(_stream_attr(delta, "thinking") or "")
+        _raise_if_cancelled(cancel_requested)
         return _anthropic_message(stream.get_final_message())
 
 
@@ -797,6 +828,7 @@ def chat(
     *,
     on_text_delta: Callable[[str], None] | None = None,
     on_reasoning_delta: Callable[[str], None] | None = None,
+    cancel_requested: CancelRequested | None = None,
 ):
     """发起一次带 instructions 和工具定义的 LLM 调用，并返回模型消息。"""
     global _resolved_api_mode
@@ -825,17 +857,23 @@ def chat(
     )
     try:
         mode = _effective_api_mode()
+        _raise_if_cancelled(cancel_requested)
         if mode == "anthropic":
             if stream_callbacks.enabled:
                 message = _create_anthropic_message_stream(
                     request,
                     stream_callbacks=stream_callbacks,
+                    cancel_requested=cancel_requested,
                 )
             else:
+                _raise_if_cancelled(cancel_requested)
                 message = _create_anthropic_message(request)
+                _raise_if_cancelled(cancel_requested)
         elif mode in {"auto", "responses"}:
             try:
+                _raise_if_cancelled(cancel_requested)
                 message = _create_responses(request)
+                _raise_if_cancelled(cancel_requested)
                 if _api_mode() == "auto":
                     _resolved_api_mode = "responses"
             except Exception as responses_error:
@@ -853,17 +891,33 @@ def chat(
                     message = _create_chat_completion_stream(
                         request,
                         stream_callbacks=stream_callbacks,
+                        cancel_requested=cancel_requested,
                     )
                 else:
+                    _raise_if_cancelled(cancel_requested)
                     message = _create_chat_completion(request)
+                    _raise_if_cancelled(cancel_requested)
         else:
             if stream_callbacks.enabled:
                 message = _create_chat_completion_stream(
                     request,
                     stream_callbacks=stream_callbacks,
+                    cancel_requested=cancel_requested,
                 )
             else:
+                _raise_if_cancelled(cancel_requested)
                 message = _create_chat_completion(request)
+                _raise_if_cancelled(cancel_requested)
+    except TaskCancelled:
+        duration_ms = int((time.monotonic() - started) * 1000)
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "llm_request_cancelled",
+            model=selected_model,
+            duration_ms=duration_ms,
+        )
+        raise
     except Exception as e:
         duration_ms = int((time.monotonic() - started) * 1000)
         log_event(

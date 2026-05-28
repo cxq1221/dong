@@ -52,6 +52,14 @@ _Avoid_: ad hoc print debugging, prompt dumps
 The module that owns conversation-history budget estimation, model-aware compaction thresholds, summary generation, summary file persistence, and tool-call/tool-result pair preservation.
 _Avoid_: ad hoc trim helper, token cleanup branch, caller-owned history pruning
 
+**Session Recovery Module**:
+The module that owns current-workspace session listing, recoverable session summaries, resume-command generation, loading a selected session, attaching it to the active working context, and producing a restore result for UI adapters.
+_Avoid_: CLI-owned session picker logic, UI-owned session storage rules, resume string helper
+
+**Session Restore Result**:
+The view model returned after a session is restored: restored session, copyable resume command, and recent Transcript preview data.
+_Avoid_: tuple of session id and command, UI-specific restore string
+
 **First-Phase UI Dependencies**:
 The first fullscreen TUI phase uses Rich and prompt_toolkit.Application while keeping argparse and avoiding Textual.
 _Avoid_: Typer migration, Textual dependency
@@ -66,6 +74,8 @@ _Avoid_: Typer migration, Textual dependency
 - **Offscreen Rich Rendering** lets **First-Phase Rich Rendering** coexist with a **Persistent Composer**.
 - **Operational File Logging** records the agent loop, LLM adapter, skill loading, and tool execution paths without changing user-visible terminal output, then exposes filtered local inspection through `dong logs`.
 - The **Context Compaction Module** protects the agent loop from context-window growth while preserving resumable intent and provider-valid tool history.
+- The **Session Recovery Module** protects the agent loop from session storage details while preserving resumable working context.
+- A **Session Restore Result** is consumed by the ordinary terminal adapter and the **TUI UI Adapter**.
 - **First-Phase Prompt Input** belongs inside the **Terminal UI Module**.
 - **First-Phase Rich Rendering** belongs inside the **Terminal UI Module**.
 - **Behavior Compatibility Tests** verify a **Behavior-Compatible UI Phase**.
@@ -90,6 +100,9 @@ _Avoid_: Typer migration, Textual dependency
 
 > **Dev:** "Should phase one migrate argparse to Typer?"
 > **Domain expert:** "No — **First-Phase UI Dependencies** are limited to Rich and prompt_toolkit."
+
+> **Dev:** "Should `/sessions` restoration be assembled inside the CLI command handler?"
+> **Domain expert:** "No — use the **Session Recovery Module** to produce a **Session Restore Result**, then let each UI adapter render it."
 
 ## Flagged ambiguities
 

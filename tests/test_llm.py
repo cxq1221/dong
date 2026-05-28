@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from types import SimpleNamespace
 
+import pytest
+
 from dong import llm
 
 
@@ -145,6 +147,18 @@ def test_load_env_files_keeps_existing_environment(monkeypatch, tmp_path) -> Non
     assert os.environ["DONG_API_KEY"] == "shell-key"
 
 
+def test_llm_timeout_seconds_uses_single_env_with_safe_default(monkeypatch) -> None:
+    """LLM SDK 超时只由 DONG_LLM_TIMEOUT 控制，非法值回退到安全默认。"""
+    monkeypatch.delenv("DONG_LLM_TIMEOUT", raising=False)
+    assert llm._llm_timeout_seconds() == 30.0
+
+    monkeypatch.setenv("DONG_LLM_TIMEOUT", "7.5")
+    assert llm._llm_timeout_seconds() == 7.5
+
+    monkeypatch.setenv("DONG_LLM_TIMEOUT", "bad")
+    assert llm._llm_timeout_seconds() == 30.0
+
+
 def test_chat_passes_deepseek_thinking_and_reasoning_options(monkeypatch) -> None:
     """DeepSeek V4 thinking 配置应传入 ChatCompletions 请求。"""
     completions, _responses = _install_fake_client(monkeypatch)
@@ -217,6 +231,26 @@ def test_chat_streams_text_deltas_and_returns_final_message(monkeypatch) -> None
     assert message.content == "Hello"
     assert message.tool_calls == []
     assert message.reasoning_content == "r"
+
+
+def test_chat_completion_stream_raises_task_cancelled(monkeypatch) -> None:
+    """ChatCompletions 流式读取时应轮询取消信号并中断当前任务。"""
+    completions, _responses = _install_fake_client(monkeypatch)
+    completions.stream_chunks = [
+        _stream_chunk(SimpleNamespace(content="Hel")),
+        _stream_chunk(SimpleNamespace(content="lo")),
+    ]
+    monkeypatch.setenv("DONG_LLM_API", "chat")
+    checks = iter([False, False, True])
+
+    with pytest.raises(llm.TaskCancelled):
+        llm.chat(
+            [{"role": "user", "content": "hi"}],
+            [],
+            model="deepseek-v4-flash",
+            on_text_delta=lambda _delta: None,
+            cancel_requested=lambda: next(checks),
+        )
 
 
 def test_chat_streams_tool_call_deltas_into_tool_calls(monkeypatch) -> None:
@@ -536,6 +570,26 @@ def test_anthropic_streams_text_deltas_and_returns_final_message(monkeypatch) ->
     assert deltas == ["Hel", "lo"]
     assert message.content == "Hello"
     assert message.tool_calls == []
+
+
+def test_anthropic_stream_raises_task_cancelled(monkeypatch) -> None:
+    """Anthropic 流式读取时也应响应同一取消信号。"""
+    anthropic_messages = _install_fake_anthropic_client(monkeypatch)
+    anthropic_messages.stream_events = [
+        _anthropic_stream_event(SimpleNamespace(type="text_delta", text="Hel")),
+        _anthropic_stream_event(SimpleNamespace(type="text_delta", text="lo")),
+    ]
+    monkeypatch.setenv("DONG_LLM_API", "anthropic")
+    checks = iter([False, False, True])
+
+    with pytest.raises(llm.TaskCancelled):
+        llm.chat(
+            [{"role": "user", "content": "hi"}],
+            [],
+            model="claude-sonnet-4-5",
+            on_text_delta=lambda _delta: None,
+            cancel_requested=lambda: next(checks),
+        )
 
 
 def test_anthropic_stream_final_message_can_return_tool_calls(monkeypatch) -> None:

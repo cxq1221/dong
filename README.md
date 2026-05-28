@@ -11,15 +11,17 @@
 ```
 dong/
 ├── __init__.py          # 包入口（1 行）
-├── __main__.py          # python -m dong 入口（5 行）
-├── cli.py               # 主入口层：CLI 解析、REPL 对话循环、agent 调度、skill 管理、上下文压缩（1382 行）
-├── llm.py               # LLM 抽象层：多 provider 适配、流式调用、Messages/Responses/Chat 格式转换（830 行）
-├── tools.py             # 内置工具集：read / write / edit / bash / grep / fetch / update_plan（349 行）
-├── tool.py              # 工具注册框架：装饰器注册、Pydantic 参数校验、安全路径验证（149 行）
-├── ui.py                # 终端 UI 适配层：Rich 渲染、prompt_toolkit 输入、补全、确认面板（491 行）
-├── mcp.py               # MCP stdio 客户端：发现外部工具、转发调用、管理 server 生命周期（438 行）
-├── logging_config.py    # 结构化日志：JSON 事件日志、payload 掩码、模块级 logger 工厂（202 行）
-└── log_viewer.py        # 日志查看器：dong logs 子命令，按级别/事件/关键词过滤（184 行）
+├── __main__.py          # python -m dong 入口
+├── cli.py               # 主入口层：CLI 解析、REPL 对话循环、agent 调度、skill 管理、上下文压缩
+├── session_recovery.py  # session 恢复：列表摘要、恢复命令、上下文接入、恢复结果 view model
+├── tui.py               # 全屏 TUI：Persistent Composer、Transcript、session picker、滚动条
+├── llm.py               # LLM 抽象层：多 provider 适配、流式调用、Messages/Responses/Chat 格式转换
+├── tools.py             # 内置工具集：read / write / edit / bash / grep / fetch / update_plan
+├── tool.py              # 工具注册框架：装饰器注册、Pydantic 参数校验、安全路径验证
+├── ui.py                # 普通终端 UI Adapter：Rich 渲染、prompt_toolkit 输入、补全、确认面板
+├── mcp.py               # MCP stdio 客户端：发现外部工具、转发调用、管理 server 生命周期
+├── logging_config.py    # 结构化日志：JSON 事件日志、payload 掩码、模块级 logger 工厂
+└── log_viewer.py        # 日志查看器：dong logs 子命令，按级别/事件/关键词过滤
 
 tests/
 ├── e2e/
@@ -82,6 +84,16 @@ uv tool install --reinstall --editable .
 - Rich 渲染：Markdown 消息、工具结果行、启动通知、确认面板
 - prompt_toolkit 输入：多行编辑、历史记录、命令/路径自动补全、粘贴保护
 - Interrupt 兼容：`Ctrl+C` 中断模型调用但不退出程序
+
+**`tui.py`** —— 全屏 Terminal UI Module
+- 使用 prompt_toolkit.Application 管理 Persistent Composer 和 Transcript
+- 通过 TUI UI Adapter 消费 agent-loop UI 方法，不执行工具和模型请求
+- `/sessions` picker 支持键盘和鼠标选择，恢复成功后原地展示 Session Restore Result
+
+**`session_recovery.py`** —— Session Recovery Module
+- 生成当前工作区历史 session 列表摘要和恢复命令
+- 加载用户选择的 session，并把恢复后的 messages 接入当前 working 上下文
+- 生成 Session Restore Result，供普通终端和 TUI 两个 UI Adapter 渲染
 
 **`mcp.py`** —— MCP stdio 客户端
 - 读取 `.dong/mcp.json` 项目配置，管理 stdio transport 的 MCP server
@@ -233,7 +245,7 @@ dong
 | `/contract status` | 查看契约模式、触发原因和历史平均分 |
 | `/<skill-name>` | 快捷方式：加载 skill 并以后续内容为 prompt |
 
-输入 `/` 回车会展示可用 slash 命令；只输入 `/` 但不回车时，会自动弹出命令和 skill 补全菜单。通过 `exit`、`quit`、`/bye`、Ctrl-C 或 Ctrl-D 退出交互 session 时，dong 会打印完整恢复命令，例如：
+输入 `/` 回车会展示可用 slash 命令；只输入 `/` 但不回车时，会自动弹出命令和 skill 补全菜单。通过 `exit`、`quit`、`/bye`、Cmd-C/Cmd-D（macOS）或 Ctrl-C/Ctrl-D（其他平台）退出交互 session 时，dong 会打印完整恢复命令，例如：
 
 ```bash
 dong -d /path/to/project --resume session-1779874198099-1

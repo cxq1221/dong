@@ -155,6 +155,19 @@ class FinalAssistantPanelUI(RecordingUI):
         super().show_assistant_message(text)
 
 
+class CancelAwareUI(RecordingUI):
+    """测试用 UI：模拟 TUI 暴露给 LLM 层的取消检查函数。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_checks = 0
+
+    def cancel_requested(self) -> bool:
+        """记录 LLM 是否真的轮询了取消状态。"""
+        self.cancel_checks += 1
+        return True
+
+
 def test_single_prompt_mode_runs_through_tool_call_and_final_answer(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1118,6 +1131,34 @@ def test_run_loop_llm_error_shows_error_panel(
     rendered = ui.stderr.getvalue()
     assert "AI 请求失败" in rendered
     assert "provider rejected request" in rendered
+
+
+def test_run_loop_task_cancelled_returns_to_caller(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLM 协作取消应按用户中断处理，不展示普通错误面板。"""
+    ui = CancelAwareUI()
+
+    def raise_task_cancelled(_messages, _tools, instructions="", **kwargs):
+        assert instructions
+        assert kwargs["cancel_requested"]()
+        raise cli.TaskCancelled("cancelled")
+
+    monkeypatch.setattr(cli, "chat", raise_task_cancelled)
+
+    cli.run_loop(
+        [{"role": "system", "content": "system"}],
+        [{"role": "user", "content": "answer"}],
+        str(tmp_path),
+        max_turns=1,
+        ui=ui,
+    )
+
+    rendered = ui.stderr.getvalue()
+    assert ui.cancel_checks == 1
+    assert "已中断当前任务" in rendered
+    assert "AI 请求失败" not in rendered
 
 
 def test_run_loop_preserves_reasoning_content_after_tool_call(

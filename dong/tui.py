@@ -43,9 +43,18 @@ from dong.ui import (
     SLASH_COMMAND_LINES,
     _SlashAwareCompleter,
     _assistant_display_text,
+    _bind_control_shortcut,
+    _cancel_shortcut_hint,
     _normalize_model_text,
-    session_transcript_preview,
+    _shortcut_label,
 )
+from dong.session_recovery import SessionRestoreResult, session_message_text
+
+
+SYSTEM_SLASH_COMMAND_ORDER = ["/compact", "/sessions", "/ocr", "/skill", "/skills", "/unskill", "/bye"]
+SYSTEM_SLASH_COMMANDS = set(SYSTEM_SLASH_COMMAND_ORDER)
+COMPLETION_GROUP_SEPARATOR = "----------"
+SESSION_PICKER_BATCH_SIZE = 10
 
 
 @dataclass
@@ -127,6 +136,7 @@ class SessionPickerState:
     items: list[object]
     current_session_id: str | None
     selected_index: int = 0
+    visible_count: int = SESSION_PICKER_BATCH_SIZE
     done: threading.Event = field(default_factory=threading.Event)
     result: str | None = None
     transcript_item: TranscriptItem | None = None
@@ -167,9 +177,13 @@ class _TranscriptControl(FormattedTextControl):
                 self.app.drag_transcript_selection(mouse_event.position.y, mouse_event.position.x)
             return None
         if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            if self.app.move_session_picker_selection(-1):
+                return None
             self.app.scroll_transcript(3)
             return None
         if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            if self.app.move_session_picker_selection(1):
+                return None
             self.app.scroll_transcript(-3)
             return None
         return super().mouse_handler(mouse_event)
@@ -261,6 +275,8 @@ class TuiApp:
 
         self._lock = threading.RLock()
         self._input_queue: Queue[str | None] = Queue()
+        # TUI 取消事件由主线程设置，worker/LLM 流式读取层轮询它来协作退出。
+        self._cancel_event = threading.Event()
         self._worker_errors: list[BaseException] = []
         self._worker_thread = threading.Thread(
             target=self._worker,
@@ -295,7 +311,6 @@ class TuiApp:
         self._input_history_draft = ""
         self._confirmation: ConfirmationRequest | None = None
         self._session_picker: SessionPickerState | None = None
-        self._session_picker_result_item: TranscriptItem | None = None
         self._transcript: list[TranscriptItem] = []
         self._status = StatusState()
         self._context_usage: ContextUsageState | None = None
@@ -423,6 +438,7 @@ class TuiApp:
         with self._lock:
             self._shutdown_requested = True
             self._status.cancellation_requested = True
+            self._cancel_event.set()
             request = self._confirmation
             if request is not None and not request.done.is_set():
                 request.result = False
@@ -485,6 +501,24 @@ class TuiApp:
                 item.raw = raw
             if not self._follow_bottom:
                 self._status.new_output = True
+            self.transcript_control.invalidate_content()
+            self.scrollbar_control.invalidate_content()
+        self.invalidate()
+
+    def replace_transcript(
+        self,
+        entries: list[tuple[str, str, str, str]],
+    ) -> None:
+        """用一组已渲染条目替换整个 Transcript。"""
+        with self._lock:
+            self._transcript = [
+                TranscriptItem(kind=kind, title=title, ansi=ansi, raw=raw)
+                for kind, title, ansi, raw in entries
+            ]
+            self._follow_bottom = True
+            self._scroll_view_end_line = None
+            self._scroll_offset = 0
+            self._status.new_output = False
             self.transcript_control.invalidate_content()
             self.scrollbar_control.invalidate_content()
         self.invalidate()
@@ -553,14 +587,17 @@ class TuiApp:
             if getattr(item, "session_id", None) == current_session_id:
                 selected_index = index
                 break
+        # Session 很多时默认只露出前 10 个；继续向下移动时再逐批展开。
+        visible_count = min(SESSION_PICKER_BATCH_SIZE, len(items))
+        selected_index = min(selected_index, max(0, visible_count - 1))
         state = SessionPickerState(
             items=items,
             current_session_id=current_session_id,
             selected_index=selected_index,
+            visible_count=visible_count,
         )
         with self._lock:
             self._session_picker = state
-            self._session_picker_result_item = None
             self._follow_bottom = True
             self._scroll_view_end_line = None
             self._scroll_offset = 0
@@ -576,8 +613,6 @@ class TuiApp:
                 self._session_picker = None
             item = state.transcript_item
             result = state.result
-            if result:
-                self._session_picker_result_item = item
             self.transcript_control.invalidate_content()
             self.scrollbar_control.invalidate_content()
         if item is not None and not result:
@@ -588,21 +623,7 @@ class TuiApp:
                 raw=text,
             )
         self.invalidate()
-        return state.result
-
-    def replace_selected_session_picker(self, *, text: str) -> bool:
-        """恢复成功后把 session 选择器原地替换成结果提示。"""
-        with self._lock:
-            item = self._session_picker_result_item
-            self._session_picker_result_item = None
-        if item is None:
-            return False
-        self.update_item(
-            item,
-            ansi=render_text("session", text, width=self.render_width),
-            raw=text,
-        )
-        return True
+        return result
 
     def move_session_picker_selection(self, delta: int) -> bool:
         """移动 session 选择器高亮行。"""
@@ -610,10 +631,13 @@ class TuiApp:
             state = self._session_picker
             if state is None:
                 return False
-            state.selected_index = max(
-                0,
-                min(len(state.items) - 1, state.selected_index + delta),
-            )
+            next_index = max(0, min(len(state.items) - 1, state.selected_index + delta))
+            if next_index >= state.visible_count and state.visible_count < len(state.items):
+                state.visible_count = min(
+                    len(state.items),
+                    state.visible_count + SESSION_PICKER_BATCH_SIZE,
+                )
+            state.selected_index = next_index
         self._refresh_session_picker(state)
         return True
 
@@ -648,7 +672,7 @@ class TuiApp:
             first_row = max(0, self._transcript_viewport_height - len(picker_lines))
             local_row = row - first_row
             index = (local_row - 2) // 2
-            if index < 0 or index >= len(state.items):
+            if index < 0 or index >= min(state.visible_count, len(state.items)):
                 return False
             state.selected_index = index
         self._refresh_session_picker(state)
@@ -679,7 +703,12 @@ class TuiApp:
         with self._lock:
             self._status.cancellation_requested = True
             self._status.label = "cancellation requested"
+            self._cancel_event.set()
         self.invalidate()
+
+    def cancel_requested(self) -> bool:
+        """返回当前 worker 任务是否已收到用户取消请求。"""
+        return self._cancel_event.is_set()
 
     def invalidate(self) -> None:
         """Thread-safe redraw request."""
@@ -748,6 +777,10 @@ class TuiApp:
         with self._lock:
             selected = candidates[min(self._completion_selection_index, len(candidates) - 1)]
         current = self.composer.text
+        if selected == "/sessions":
+            self.composer.buffer.reset()
+            self.submit_text(selected)
+            return True
         replacement = self._completion_replacement(current, selected)
         if replacement == current:
             return False
@@ -864,7 +897,7 @@ class TuiApp:
         self.invalidate()
 
     def finish_transcript_selection(self, row: int, col: int) -> None:
-        """结束内容区拖选，只保留选区，等待 Ctrl-C 复制。"""
+        """结束内容区拖选，只保留选区，等待平台复制快捷键。"""
         with self._lock:
             draft = self._transcript_selection_draft
             if draft is not None:
@@ -887,14 +920,25 @@ class TuiApp:
             text = self._selected_transcript_text_locked(final_selection)
             if text.strip():
                 self._transcript_selection = final_selection
-                self._status.label = f"selected {len(text)} chars · Ctrl-C copy"
+                # macOS 的物理 Cmd-C 会被终端应用截获，无法传进 prompt_toolkit；
+                # 因此内部选区在鼠标松开时直接写入剪贴板，保持用户习惯的拖选复制。
+                if _auto_copy_transcript_selection():
+                    copied = self._copy_text_to_clipboard(text)
+                    self._last_copied_transcript_text = text
+                    self._status.label = (
+                        f"copied {len(text)} chars" if copied else f"selected {len(text)} chars · {_copy_shortcut_hint()}"
+                    )
+                else:
+                    self._status.label = (
+                        f"selected {len(text)} chars · {_copy_shortcut_hint()}"
+                    )
             else:
                 self._transcript_selection = None
             self.transcript_control.invalidate_content()
         self.invalidate()
 
     def copy_transcript_selection(self) -> bool:
-        """复制当前 transcript 选区；无选区时返回 False 让 Ctrl-C 走原逻辑。"""
+        """复制当前 transcript 选区；无选区时返回 False 让复制快捷键走原逻辑。"""
         with self._lock:
             selection = self._transcript_selection
             if selection is None:
@@ -915,7 +959,7 @@ class TuiApp:
         return True
 
     def _copy_text_to_clipboard(self, text: str) -> bool:
-        """把文本复制到系统剪贴板；单独封装便于测试 Ctrl-C 路径。"""
+        """把文本复制到系统剪贴板；单独封装便于测试复制快捷键路径。"""
         return _copy_text_to_clipboard(text, output=self.application.output)
 
     def _clear_transcript_selection_locked(self) -> None:
@@ -1017,9 +1061,11 @@ class TuiApp:
                 if item is None:
                     return
                 with self._lock:
+                    self._cancel_event.clear()
                     self._busy = True
                     self._status.queued = self._input_queue.qsize()
                     self._status.label = "working"
+                    self._status.cancellation_requested = False
                 self.invalidate()
                 exit_requested = self.process_input(item, self.ui)
                 if exit_requested:
@@ -1041,9 +1087,11 @@ class TuiApp:
             finally:
                 with self._lock:
                     self._busy = False
+                    self._cancel_event.clear()
                     self._status.queued = self._input_queue.qsize()
                     if self._status.label == "working":
                         self._status.label = "idle"
+                    self._status.cancellation_requested = False
                 self._input_queue.task_done()
                 self.invalidate()
 
@@ -1181,22 +1229,35 @@ class TuiApp:
 
     def _completion_menu_height(self) -> int:
         """候选列表按候选数量占高，避免空白区域挤压 transcript。"""
-        return max(1, len(self._completion_candidates()))
+        return max(1, len(self._completion_display_rows()))
 
     def _formatted_completion_menu(self) -> list[tuple[str, str]]:
         """把 slash completion 渲染成竖向列表，贴近 claw-code 的 list completion。"""
-        candidates = self._completion_candidates()
+        rows = self._completion_display_rows()
         with self._lock:
-            selected_index = min(self._completion_selection_index, max(0, len(candidates) - 1))
+            selected_index = self._completion_selection_index
         fragments: list[tuple[str, str]] = []
-        for index, candidate in enumerate(candidates):
-            selected = index == selected_index
+        candidate_index = 0
+        for row_index, row in enumerate(rows):
+            is_separator = row == COMPLETION_GROUP_SEPARATOR
+            selected = not is_separator and candidate_index == selected_index
             prefix = "› " if selected else "  "
-            style = "fg:#0b5cad bold" if selected else "fg:#24292f"
-            fragments.append((style, f"  {prefix}{candidate}"))
-            if index < len(candidates) - 1:
+            style = "fg:#0b5cad bold" if selected else "fg:#8c959f" if is_separator else "fg:#24292f"
+            fragments.append((style, f"  {prefix}{row}"))
+            if not is_separator:
+                candidate_index += 1
+            if row_index < len(rows) - 1:
                 fragments.append(("", "\n"))
         return fragments
+
+    def _completion_display_rows(self) -> list[str]:
+        """返回带系统/skill 分隔线的 completion 展示行。"""
+        candidates = self._completion_candidates()
+        system = [item for item in candidates if item in SYSTEM_SLASH_COMMANDS]
+        skills = [item for item in candidates if item not in SYSTEM_SLASH_COMMANDS]
+        if system and skills:
+            return [*system, COMPLETION_GROUP_SEPARATOR, *skills]
+        return candidates
 
     def _completion_candidates(self) -> list[str]:
         """返回当前 slash 输入的候选项，供竖向菜单和测试复用。"""
@@ -1208,14 +1269,10 @@ class TuiApp:
             completion.text
             for completion in completer.get_completions(Document(text), None)
         ]
-        core_commands = {"/bye", "/compact", "/sessions", "/skill", "/skills", "/unskill"}
-
         def sort_key(item: str) -> tuple[int, str]:
-            if item == "/skill":
-                return (0, item)
-            if item not in core_commands:
-                return (1, item)
-            return (2, item)
+            if item in SYSTEM_SLASH_COMMANDS:
+                return (0, SYSTEM_SLASH_COMMAND_ORDER.index(item))
+            return (1, item)
 
         candidates = sorted(candidates, key=sort_key)[:10]
         with self._lock:
@@ -1254,7 +1311,8 @@ class TuiApp:
             "\x1b[1;36mSessions\x1b[0m  ↑/↓ select · Enter/click resume · Esc cancel",
             "\x1b[2mCurrent workspace sessions\x1b[0m",
         ]
-        for index, item in enumerate(state.items):
+        visible_items = state.items[: state.visible_count]
+        for index, item in enumerate(visible_items):
             selected = index == state.selected_index
             current = "*" if getattr(item, "session_id", "") == state.current_session_id else " "
             session_id = str(getattr(item, "session_id", ""))
@@ -1275,13 +1333,21 @@ class TuiApp:
                 first = f"\x1b[7m{first}\x1b[0m"
                 second = f"\x1b[7m{second}\x1b[0m"
             lines.extend([first, second])
+        if state.visible_count < len(state.items):
+            remaining = len(state.items) - state.visible_count
+            lines.append(
+                "\x1b[2m"
+                f"Scroll down to load {min(SESSION_PICKER_BATCH_SIZE, remaining)} more "
+                f"({remaining} remaining)"
+                "\x1b[0m"
+            )
         return "\n".join(lines)
 
     @staticmethod
     def _raw_session_picker(state: SessionPickerState) -> str:
         """生成不含 ANSI 的 session 选择器文本，供测试和复制使用。"""
         lines = ["Sessions", "Current workspace sessions"]
-        for index, item in enumerate(state.items):
+        for index, item in enumerate(state.items[: state.visible_count]):
             marker = ">" if index == state.selected_index else " "
             current = "*" if getattr(item, "session_id", "") == state.current_session_id else " "
             lines.append(
@@ -1290,6 +1356,8 @@ class TuiApp:
                 f"{getattr(item, 'prompt_preview', '')}"
             )
             lines.append(f"      assistant: {getattr(item, 'assistant_preview', '')}")
+        if state.visible_count < len(state.items):
+            lines.append(f"Scroll down to load more ({len(state.items) - state.visible_count} remaining)")
         return "\n".join(lines)
 
     def _render_transcript_lines(self) -> list[str]:
@@ -1338,13 +1406,15 @@ class TuiApp:
             self.composer.buffer.reset()
             self.submit_text(text)
 
-        @bindings.add("c-j")
-        def _(event) -> None:  # type: ignore[no-untyped-def]
+        def insert_newline(event) -> None:  # type: ignore[no-untyped-def]
             event.app.current_buffer.insert_text("\n")
 
-        @bindings.add("c-v")
-        def _(event) -> None:  # type: ignore[no-untyped-def]
+        _bind_control_shortcut(bindings, "j", insert_newline)
+
+        def paste_clipboard_image(event) -> None:  # type: ignore[no-untyped-def]
             self.paste_clipboard_image()
+
+        _bind_control_shortcut(bindings, "v", paste_clipboard_image)
 
         @bindings.add("up")
         def _(event) -> None:  # type: ignore[no-untyped-def]
@@ -1377,8 +1447,7 @@ class TuiApp:
             if event.app.current_buffer.document.text_before_cursor == "/":
                 event.app.current_buffer.start_completion(select_first=False)
 
-        @bindings.add("c-c", eager=True)
-        def _(event) -> None:  # type: ignore[no-untyped-def]
+        def copy_or_cancel(event) -> None:  # type: ignore[no-untyped-def]
             if self.copy_transcript_selection():
                 return
             if self.cancel_session_picker():
@@ -1397,18 +1466,22 @@ class TuiApp:
             self.request_exit()
             event.app.exit()
 
-        @bindings.add("c-d", eager=True)
-        def _(event) -> None:  # type: ignore[no-untyped-def]
+        _bind_control_shortcut(bindings, "c", copy_or_cancel, eager=True)
+
+        def exit_app(event) -> None:  # type: ignore[no-untyped-def]
             self.request_exit()
             event.app.exit()
 
-        @bindings.add("c-y")
-        def _(event) -> None:  # type: ignore[no-untyped-def]
+        _bind_control_shortcut(bindings, "d", exit_app, eager=True)
+
+        def insert_last_assistant(event) -> None:  # type: ignore[no-untyped-def]
             if self._confirmation is not None:
                 return
             raw = self.get_last_assistant_raw()
             if raw is not None:
                 event.app.current_buffer.insert_text(raw)
+
+        _bind_control_shortcut(bindings, "y", insert_last_assistant)
 
         @bindings.add("escape")
         def _(event) -> None:  # type: ignore[no-untyped-def]
@@ -1571,25 +1644,70 @@ class TuiUI:
             raw=text,
         )
 
-    def show_session_restored(
+    def show_session_restored(self, result: SessionRestoreResult) -> None:
+        """切换到恢复 session 的 Transcript，而不是展示压缩摘要。"""
+        text = f"Restored session: {result.session.session_id}\nContext loaded. Continue typing."
+        entries = [
+            (
+                "system",
+                "session",
+                render_text("session", text, width=self.app.render_width),
+                text,
+            )
+        ]
+        entries.extend(self._restored_session_entries(result.session.messages))
+        self.app.replace_transcript(entries)
+
+    def _restored_session_entries(
         self,
-        session_id: str,
-        resume_command: str,
-        messages: Iterable[object] = (),
-    ) -> None:
-        """提示 TUI 已切换到指定 session。"""
-        text = f"Restored session: {session_id}\nContext loaded. Continue typing."
-        preview = session_transcript_preview(messages)
-        if preview:
-            text = f"{text}\n\n{preview}"
-        if self.app.replace_selected_session_picker(text=text):
-            return
-        self.app.append_item(
-            "system",
-            "session",
-            render_text("session", text, width=self.app.render_width),
-            raw=text,
-        )
+        messages: Iterable[object],
+    ) -> list[tuple[str, str, str, str]]:
+        """把恢复的 session messages 重建成 TUI Transcript 条目。"""
+        entries: list[tuple[str, str, str, str]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "")
+            if role == "user":
+                raw = session_message_text(message.get("content"))
+                if raw:
+                    entries.append((
+                        "user",
+                        "user",
+                        render_text("user", raw, width=self.app.render_width),
+                        raw,
+                    ))
+                continue
+            if role == "assistant":
+                reasoning = _normalize_model_text(str(message.get("reasoning_content") or ""))
+                if reasoning:
+                    entries.append((
+                        "thinking",
+                        "thinking",
+                        render_markdown(f"**thinking**\n\n{reasoning}", width=self.app.render_width),
+                        reasoning,
+                    ))
+                raw = _assistant_display_text(session_message_text(message.get("content")))
+                if raw:
+                    entries.append((
+                        "assistant",
+                        "assistant",
+                        render_markdown(f"**assistant**\n\n{raw}", width=self.app.render_width),
+                        raw,
+                    ))
+                continue
+            if role == "tool":
+                raw = session_message_text(message.get("content"))
+                if raw:
+                    title = str(message.get("name") or "tool")
+                    text = f"{title}: {raw}"
+                    entries.append((
+                        "tool_result",
+                        title,
+                        render_text(title, text, width=self.app.render_width),
+                        text,
+                    ))
+        return entries
 
     def show_loaded_skill(self, name: str, source: str, *, indent: str = "  ") -> None:
         self.app.append_item(
@@ -1690,6 +1808,10 @@ class TuiUI:
     def show_input_queued(self, *, pending: int) -> None:
         self.show_system_message(f"queued input ({pending} pending)")
 
+    def cancel_requested(self) -> bool:
+        """把 TUI 取消事件暴露给 CLI/LLM 调用链。"""
+        return self.app.cancel_requested()
+
     def show_user_message(self, text: str) -> None:
         self.app.append_item(
             "user",
@@ -1740,13 +1862,14 @@ class TuiUI:
         message: str,
         *,
         timeout_seconds: float | None = None,
-        cancel_hint: str = "Ctrl-C 取消当前任务",
+        cancel_hint: str | None = None,
     ) -> AbstractContextManager[None]:
+        resolved_cancel_hint = cancel_hint or _cancel_shortcut_hint()
         return _TuiWorkingStatus(
             self.app,
             message,
             timeout_seconds=timeout_seconds,
-            cancel_hint=cancel_hint,
+            cancel_hint=resolved_cancel_hint,
         )
 
     def stream_assistant_message(self) -> AbstractContextManager[Callable[[str], None]]:
@@ -1997,6 +2120,18 @@ def _selection_end_index(text: str, column: int) -> int:
 def _copy_text_to_clipboard(text: str, *, output=None) -> bool:  # type: ignore[no-untyped-def]
     """把 TUI 选中文本写入系统剪贴板；失败时返回 False 供状态栏提示。"""
     return _copy_text_with_system_tool(text) or _copy_text_with_osc52(text, output=output)
+
+
+def _auto_copy_transcript_selection() -> bool:
+    """macOS 终端不会把 Cmd-C 传给应用，内部选区需要在松开鼠标时自动复制。"""
+    return platform.system() == "Darwin"
+
+
+def _copy_shortcut_hint() -> str:
+    """展示 TUI 实际能接收到的复制快捷键。"""
+    if platform.system() == "Darwin":
+        return "Ctrl-C / Esc-C copy"
+    return f"{_shortcut_label('c')} copy"
 
 
 def _copy_text_with_system_tool(text: str) -> bool:

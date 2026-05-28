@@ -108,7 +108,7 @@ def _load_cv2():
     except ImportError as exc:
         raise OcrError(
             "缺少 OCR 运行依赖 opencv-python-headless；"
-            "请先执行：uv pip install onnxocr"
+            "请先执行：uv sync"
         ) from exc
     return cv2
 
@@ -119,7 +119,7 @@ def _onnxocr_model():
     try:
         from onnxocr.onnx_paddleocr import ONNXPaddleOcr  # type: ignore[import-not-found]
     except ImportError as exc:
-        raise OcrError("缺少 OnnxOCR；请先执行：uv pip install onnxocr") from exc
+        raise OcrError("缺少 OnnxOCR；请先执行：uv sync") from exc
 
     use_angle_cls = os.getenv("DONG_OCR_USE_ANGLE_CLS", "").lower() in {
         "1",
