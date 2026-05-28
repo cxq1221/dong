@@ -13,6 +13,7 @@ import pytest
 
 from dong import cli
 from dong.mcp import mcp_tool_name
+from dong.tui import TuiApp
 from dong.ui import TerminalUI
 from e2e.helpers import assistant_message as _assistant_message
 from e2e.helpers import tool_call as _tool_call
@@ -549,6 +550,35 @@ def test_contract_scorer_updates_scoreboard_and_session_lesson(tmp_path, monkeyp
     assert artifact["scorer_result"]["score"] == 58
 
 
+def test_contract_scorer_shows_working_status(tmp_path, monkeypatch) -> None:
+    """最终答复后的第三方审计也应暴露工作状态，避免长请求像卡死。"""
+    (tmp_path / "a.py").write_text("x", encoding="utf-8")
+    responses = iter([
+        _assistant_message(tool_calls=[
+            _tool_call("call-1", "edit", '{"filepath": "a.py", "old_string": "x", "new_string": "y"}')
+        ]),
+        _assistant_message(content="已修改 a.py。"),
+        _assistant_message(content='{"score": 58, "deductions": ["missing_verification"], "risk_flags": [], "lesson_for_session": "先运行测试。", "workspace_summary": "缺少验证"}'),
+    ])
+    ui = RecordingUI()
+
+    monkeypatch.setattr(
+        cli,
+        "chat",
+        lambda _messages, _tools, instructions="", **_kwargs: next(responses),
+    )
+
+    cli.run_loop(
+        cli.build_agent_prompt([], str(tmp_path)),
+        [{"role": "user", "content": "edit file"}],
+        str(tmp_path),
+        max_turns=3,
+        ui=ui,
+    )
+
+    assert ("正在进行交付审计...", 90) in ui.working_messages
+
+
 def test_contract_flow_logs_required_audit_events(tmp_path, monkeypatch) -> None:
     """契约签订和 scorer 成功路径必须留下可 grep 的审计事件。"""
     (tmp_path / "a.py").write_text("x", encoding="utf-8")
@@ -964,6 +994,36 @@ def test_run_loop_stops_working_status_before_streaming_text(
     )
 
     assert ui.delta_working_counts == [0]
+
+
+def test_run_loop_keeps_tui_working_status_during_streaming_text(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fullscreen TUI 的状态栏独立于正文，流式输出后仍应显示 AI 正在工作。"""
+    app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+    observed_status: list[str] = []
+
+    def fake_chat(_messages, _tools, instructions="", **kwargs):
+        assert instructions
+        on_text_delta = kwargs.get("on_text_delta")
+        if on_text_delta is not None:
+            on_text_delta("hello")
+            observed_status.append(app.status.label)
+        return _assistant_message(content="hello")
+
+    monkeypatch.setattr(cli, "chat", fake_chat)
+
+    cli.run_loop(
+        [{"role": "system", "content": "system"}],
+        [{"role": "user", "content": "say hi"}],
+        str(tmp_path),
+        max_turns=1,
+        ui=app.ui,
+    )
+
+    assert observed_status
+    assert "AI 正在思考" in observed_status[0]
 
 
 def test_run_loop_renders_final_panel_after_streamed_final_answer(

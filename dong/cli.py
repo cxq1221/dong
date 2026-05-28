@@ -61,7 +61,7 @@ from dong.ocr import (
     OcrError,
     build_ocr_prompt,
     expand_image_markers_to_ocr_prompt,
-    extract_text_from_image,
+    extract_text_from_attachment,
 )
 from dong.session import Session, SessionError, SessionStore
 from dong.session_recovery import (
@@ -891,6 +891,9 @@ def _chat_with_streaming_ui(messages, tool_defs, instructions: str, ui: Terminal
     working_status = ui.show_working("AI 正在思考...")
     working_active = True
     working_entered = False
+    preserve_working_status = bool(
+        getattr(ui, "preserve_working_status_during_streaming", False)
+    )
     reasoning_stream_factory = getattr(ui, "stream_reasoning_message", None)
 
     try:
@@ -910,7 +913,9 @@ def _chat_with_streaming_ui(messages, tool_defs, instructions: str, ui: Terminal
                 nonlocal working_active
                 if not delta:
                     return
-                if working_active and working_entered:
+                # 普通终端的动态 spinner 会和正文抢行；fullscreen TUI 的状态栏独立渲染，
+                # 长时间流式输出后仍应保留“正在思考”的耗时提示。
+                if not preserve_working_status and working_active and working_entered:
                     working_status.__exit__(None, None, None)
                     working_active = False
                 write_delta(delta)
@@ -1412,11 +1417,15 @@ def run_loop(
                             "contract_scorer_started",
                             session_id=evidence.session_id,
                         )
-                        scorer_result = _run_contract_scorer(
-                            workdir,
-                            evidence,
-                            signature,
-                        )
+                        with ui.show_working(
+                            "正在进行交付审计...",
+                            timeout_seconds=90,
+                        ):
+                            scorer_result = _run_contract_scorer(
+                                workdir,
+                                evidence,
+                                signature,
+                            )
                         update_contract_artifact_scorer_result(
                             artifact_path,
                             scorer_result,
@@ -1766,7 +1775,7 @@ def _handle_contract_command(
 
 
 def _handle_ocr_command(inp: str, *, ui: TerminalUI) -> ReplAction:
-    """处理 `/ocr <image-path> [question]`，把图片转成文本 prompt。"""
+    """处理 `/ocr <attachment-path> [question]`，把附件转成文本 prompt。"""
     try:
         parts = shlex.split(inp)
     except ValueError as exc:
@@ -1775,20 +1784,20 @@ def _handle_ocr_command(inp: str, *, ui: TerminalUI) -> ReplAction:
         return ReplAction(handled=True)
 
     if len(parts) < 2:
-        ui.err_console.print(Text("  Usage: /ocr <image-path> [question]"))
+        ui.err_console.print(Text("  Usage: /ocr <attachment-path> [question]"))
         return ReplAction(handled=True)
 
-    image_path = parts[1]
+    attachment_path = parts[1]
     question = " ".join(parts[2:])
     try:
-        result = extract_text_from_image(image_path)
+        result = extract_text_from_attachment(attachment_path)
     except OcrError as exc:
         ui.show_error(str(exc))
         log_event(
             LOGGER,
             logging.WARNING,
             "repl_ocr_failed",
-            image_path=image_path,
+            attachment_path=attachment_path,
             error=str(exc),
         )
         return ReplAction(handled=True)
@@ -2270,7 +2279,7 @@ def main():
     parser.add_argument(
         "--image",
         metavar="PATH",
-        help="Run local OCR on an image, then send recognized text with the prompt",
+        help="Extract text from an image/PDF/Office attachment, then send it with the prompt",
     )
     parser.add_argument(
         "--resume",
@@ -2349,7 +2358,7 @@ def main():
         user_prompt = " ".join(args.input)
         if args.image:
             try:
-                ocr_result = extract_text_from_image(args.image)
+                ocr_result = extract_text_from_attachment(args.image)
                 user_prompt = build_ocr_prompt(ocr_result, user_prompt)
                 log_event(
                     LOGGER,

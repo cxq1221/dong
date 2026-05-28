@@ -1,0 +1,7 @@
+{"type":"session_meta","version":1,"session_id":"session-1779953914685-1","created_at_ms":1779953914685,"updated_at_ms":1779953914685,"workspace_root":"/Users/joey/Desktop/dong","model":"deepseek-v4-pro","message_count":0}
+{"type":"prompt_history","timestamp_ms":1779953914689,"text":"用户上传了附件。下面是本地提取出的附件文字，供你理解内容；不要假装直接看到了原始文件。\n\n附件 1 提取文本：\nWord 文本\n\n用户输入：\n\n只回答附件里的文字，禁止解释。"}
+{"type":"session_meta","version":1,"session_id":"session-1779953914685-1","created_at_ms":1779953914685,"updated_at_ms":1779953914689,"workspace_root":"/Users/joey/Desktop/dong","model":"deepseek-v4-pro","message_count":0}
+{"type":"message","message":{"role":"user","content":"用户上传了附件。下面是本地提取出的附件文字，供你理解内容；不要假装直接看到了原始文件。\n\n附件 1 提取文本：\nWord 文本\n\n用户输入：\n\n只回答附件里的文字，禁止解释。"}}
+{"type":"session_meta","version":1,"session_id":"session-1779953914685-1","created_at_ms":1779953914685,"updated_at_ms":1779953914689,"workspace_root":"/Users/joey/Desktop/dong","model":"deepseek-v4-pro","message_count":1}
+{"type":"message","message":{"role":"assistant","content":"Word 文本","reasoning_content":"用户要求我只回答附件里的文字，禁止解释。附件提取文本显示：\n\n\"Word 文本\"\n\n所以我应该只回复这个。","_anthropic_content_blocks":[{"signature":"d9ca7dcf-a409-469f-8d4a-e3a97cfb16fd","thinking":"用户要求我只回答附件里的文字，禁止解释。附件提取文本显示：\n\n\"Word 文本\"\n\n所以我应该只回复这个。","type":"thinking"},{"text":"Word 文本","type":"text"}]}}
+{"type":"session_meta","version":1,"session_id":"session-1779953914685-1","created_at_ms":1779953914685,"updated_at_ms":1779953916834,"workspace_root":"/Users/joey/Desktop/dong","model":"deepseek-v4-pro","message_count":2}

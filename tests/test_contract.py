@@ -24,8 +24,8 @@ from dong.contract import (
 )
 
 
-def test_contract_controller_auto_triggers_for_complex_signals(tmp_path) -> None:
-    """发生写文件、验证命令或工具调用阈值时，应自动进入契约压力模式。"""
+def test_contract_controller_auto_triggers_for_delivery_signals(tmp_path) -> None:
+    """自动模式只有发生文件变更交付时才进入契约压力。"""
     controller = ContractController(workdir=str(tmp_path))
 
     assert controller.is_active() is False
@@ -41,6 +41,21 @@ def test_contract_controller_auto_triggers_for_complex_signals(tmp_path) -> None
     assert controller.is_active() is True
     assert TriggerReason.TOOL_THRESHOLD in controller.trigger_reasons
     assert TriggerReason.FILE_CHANGE in controller.trigger_reasons
+
+
+def test_contract_read_only_signals_do_not_activate_auto_mode(tmp_path) -> None:
+    """只读工具、验证命令和压缩可记录原因，但不能单独触发交付审计。"""
+    controller = ContractController(workdir=str(tmp_path))
+
+    for index in range(5):
+        controller.record_signal(ContractSignal.tool_call("read", f'{{"i": {index}}}'))
+    controller.record_signal(ContractSignal.tool_call("bash", "uv run pytest -q"))
+    controller.record_signal(ContractSignal.compaction("compact-1.md"))
+
+    assert controller.is_active() is False
+    assert TriggerReason.TOOL_THRESHOLD in controller.trigger_reasons
+    assert TriggerReason.VERIFY_COMMAND in controller.trigger_reasons
+    assert TriggerReason.COMPACTION in controller.trigger_reasons
 
 
 def test_contract_tool_threshold_ignores_result_records(tmp_path) -> None:
@@ -93,23 +108,23 @@ def test_contract_controller_file_change_path_triggers_file_change(tmp_path) -> 
     assert TriggerReason.FILE_CHANGE in controller.trigger_reasons
 
 
-def test_contract_controller_verify_bash_command_triggers_pressure(tmp_path) -> None:
-    """bash 执行验证命令时，应触发验证命令压力。"""
+def test_contract_controller_verify_bash_command_records_reason_only(tmp_path) -> None:
+    """bash 验证命令只记录原因，不应让只读任务进入交付审计。"""
     controller = ContractController(workdir=str(tmp_path))
 
     controller.record_signal(ContractSignal.tool_call("bash", "uv run pytest -q"))
 
-    assert controller.is_active() is True
+    assert controller.is_active() is False
     assert TriggerReason.VERIFY_COMMAND in controller.trigger_reasons
 
 
-def test_contract_controller_compaction_triggers_pressure(tmp_path) -> None:
-    """发生上下文压缩时，应触发压缩压力。"""
+def test_contract_controller_compaction_records_reason_only(tmp_path) -> None:
+    """上下文压缩只记录原因，不应让只读任务进入交付审计。"""
     controller = ContractController(workdir=str(tmp_path))
 
     controller.record_signal(ContractSignal.compaction("compact-1.md"))
 
-    assert controller.is_active() is True
+    assert controller.is_active() is False
     assert TriggerReason.COMPACTION in controller.trigger_reasons
 
 

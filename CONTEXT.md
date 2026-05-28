@@ -60,6 +60,22 @@ _Avoid_: CLI-owned session picker logic, UI-owned session storage rules, resume 
 The view model returned after a session is restored: restored session, copyable resume command, and recent Transcript preview data.
 _Avoid_: tuple of session id and command, UI-specific restore string
 
+**Agent Identity**:
+The cross-session career record for a dong agent, with personal scores, status, and retirement history separate from model choice.
+_Avoid_: model, provider, session, workspace reputation
+
+**Identity Score**:
+The personal scoring history attached to one **Agent Identity**.
+_Avoid_: workspace score, project reputation, global score
+
+**Workspace Reputation**:
+The project-level delivery history and recurring lessons that survive **Agent Identity** replacement.
+_Avoid_: identity score, session lesson
+
+**Death Reason Summary**:
+The short explanation shown to a new **Agent Identity** when the previous identity was retired for poor delivery quality.
+_Avoid_: full transcript, scorer dump, inherited score
+
 **First-Phase UI Dependencies**:
 The first fullscreen TUI phase uses Rich and prompt_toolkit.Application while keeping argparse and avoiding Textual.
 _Avoid_: Typer migration, Textual dependency
@@ -76,6 +92,10 @@ _Avoid_: Typer migration, Textual dependency
 - The **Context Compaction Module** protects the agent loop from context-window growth while preserving resumable intent and provider-valid tool history.
 - The **Session Recovery Module** protects the agent loop from session storage details while preserving resumable working context.
 - A **Session Restore Result** is consumed by the ordinary terminal adapter and the **TUI UI Adapter**.
+- An **Agent Identity** can span multiple sessions while using the same model/provider.
+- An **Identity Score** resets when a new **Agent Identity** is created.
+- **Workspace Reputation** survives **Agent Identity** replacement so project-level lessons are not erased.
+- A new **Agent Identity** may see the previous identity's **Death Reason Summary** without inheriting the previous **Identity Score**.
 - **First-Phase Prompt Input** belongs inside the **Terminal UI Module**.
 - **First-Phase Rich Rendering** belongs inside the **Terminal UI Module**.
 - **Behavior Compatibility Tests** verify a **Behavior-Compatible UI Phase**.
@@ -104,6 +124,10 @@ _Avoid_: Typer migration, Textual dependency
 > **Dev:** "Should `/sessions` restoration be assembled inside the CLI command handler?"
 > **Domain expert:** "No — use the **Session Recovery Module** to produce a **Session Restore Result**, then let each UI adapter render it."
 
+> **Dev:** "If an agent is retired for low-quality delivery, should the replacement use a different model?"
+> **Domain expert:** "No — replace the **Agent Identity**. The new identity gets a fresh **Identity Score** but still sees the prior **Death Reason Summary** and the workspace keeps its **Workspace Reputation**."
+
 ## Flagged ambiguities
 
 - "CLI UI" previously meant **Inline REPL** improvements; resolved now as the **Codex-like Fullscreen TUI Phase** for bare `dong`.
+- "换新 agent" means replacing the **Agent Identity**, not changing the model/provider or clearing workspace-level memory.

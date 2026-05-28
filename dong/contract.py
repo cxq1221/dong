@@ -237,13 +237,13 @@ class ContractController:
             self.trigger_reasons.add(TriggerReason.COMPACTION)
 
     def is_active(self) -> bool:
-        """判断当前是否应注入契约压力；OFF 永远关闭，ON 永远开启。"""
+        """判断当前是否应注入契约压力；自动模式只审计实际交付/写入。"""
 
         if self.mode is ContractMode.OFF:
             return False
         if self.mode is ContractMode.ON:
             return True
-        return bool(self.trigger_reasons)
+        return TriggerReason.FILE_CHANGE in self.trigger_reasons
 
     def contracts_dir(self) -> Path:
         """返回契约文件目录；本任务只定义路径，不创建或持久化文件。"""

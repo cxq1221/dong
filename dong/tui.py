@@ -1,13 +1,9 @@
-"""Fullscreen prompt_toolkit TUI for dong interactive mode."""
+"""dong 的 inline TUI：历史输出进入终端 scrollback，底部保留交互区。"""
 
 from __future__ import annotations
 
-import base64
 import json
 import os
-import platform
-import shutil
-import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -16,17 +12,15 @@ from dataclasses import dataclass, field
 from io import StringIO
 from queue import Empty, Queue
 
-from prompt_toolkit.application import Application
+from prompt_toolkit.application import Application, run_in_terminal
 from prompt_toolkit.completion import Completer
-from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, VSplit, Window
+from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
-from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
 from rich.console import Console
@@ -46,7 +40,6 @@ from dong.ui import (
     _bind_control_shortcut,
     _cancel_shortcut_hint,
     _normalize_model_text,
-    _shortcut_label,
 )
 from dong.session_recovery import SessionRestoreResult, session_message_text
 
@@ -55,17 +48,20 @@ SYSTEM_SLASH_COMMAND_ORDER = ["/compact", "/sessions", "/ocr", "/skill", "/skill
 SYSTEM_SLASH_COMMANDS = set(SYSTEM_SLASH_COMMAND_ORDER)
 COMPLETION_GROUP_SEPARATOR = "----------"
 SESSION_PICKER_BATCH_SIZE = 10
+SKILL_MENU_COMMANDS = ("/skill", "/skills")
+COMPLETION_MENU_MAX_CANDIDATES = 10
 
 
 @dataclass
 class TranscriptItem:
-    """A stable transcript entry rendered inside the fullscreen TUI."""
+    """Transcript 条目；committed 写入终端历史，streaming 只显示在 live 区。"""
 
     kind: str
     title: str
     raw: str
     ansi: str
     streaming: bool = False
+    committed: bool = False
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -75,7 +71,6 @@ class StatusState:
 
     label: str = "idle"
     queued: int = 0
-    new_output: bool = False
     cancellation_requested: bool = False
 
 
@@ -99,39 +94,9 @@ class ConfirmationRequest:
     result: bool | None = None
 
 
-@dataclass(frozen=True)
-class ScrollbarState:
-    """Transcript 滚动条的可视区和滑块位置。"""
-
-    visible: bool
-    track_height: int
-    thumb_top: int
-    thumb_height: int
-    max_scroll_offset: int
-
-
-@dataclass(frozen=True)
-class TranscriptSelection:
-    """Transcript 可视区里的鼠标拖选范围，坐标按当前可视行保存。"""
-
-    anchor_row: int
-    anchor_col: int
-    active_row: int
-    active_col: int
-
-
-@dataclass(frozen=True)
-class TranscriptSelectionDraft:
-    """Transcript 鼠标按下后的候选起点；只有拖动后才变成选区。"""
-
-    row: int
-    col: int
-    pending_origin: bool = False
-
-
 @dataclass
 class SessionPickerState:
-    """`/sessions` 会话选择器状态，供键盘和鼠标事件共享。"""
+    """`/sessions` 会话选择器状态，只通过键盘在 live 区交互。"""
 
     items: list[object]
     current_session_id: str | None
@@ -139,93 +104,23 @@ class SessionPickerState:
     visible_count: int = SESSION_PICKER_BATCH_SIZE
     done: threading.Event = field(default_factory=threading.Event)
     result: str | None = None
-    transcript_item: TranscriptItem | None = None
+    live_item: TranscriptItem | None = None
 
 
-class _TranscriptControl(FormattedTextControl):
-    """Transcript 专用 control：把鼠标滚轮映射到 dong 自己的历史视图。"""
+class _LiveTranscriptControl(FormattedTextControl):
+    """底部 live viewport，只展示 streaming 和临时选择器，不承载历史滚动。"""
 
     def __init__(self, app: TuiApp) -> None:
         self.app = app
         super().__init__(
-            app._formatted_transcript,
-            get_cursor_position=app._transcript_cursor_position,
+            app._formatted_live_transcript,
         )
 
     def invalidate_content(self) -> None:
-        """清理 prompt_toolkit 的片段缓存，确保滚动切片立即重算。"""
+        """清理 prompt_toolkit 的片段缓存，确保 live 内容立即重算。"""
         self.reset()
         self._fragment_cache.clear()
         self._content_cache.clear()
-
-    def create_content(self, width: int, height: int | None):  # type: ignore[no-untyped-def]
-        self.app.set_transcript_viewport_height(height or 1)
-        return super().create_content(width, height)
-
-    def mouse_handler(self, mouse_event: MouseEvent):  # type: ignore[no-untyped-def]
-        if mouse_event.event_type == MouseEventType.MOUSE_UP:
-            self.app.finish_transcript_selection(mouse_event.position.y, mouse_event.position.x)
-            self.app.stop_scrollbar_drag()
-            return None
-        if mouse_event.event_type == MouseEventType.MOUSE_DOWN and mouse_event.button == MouseButton.LEFT:
-            if self.app.handle_session_picker_mouse(mouse_event.position.y):
-                return None
-            self.app.start_transcript_selection(mouse_event.position.y, mouse_event.position.x)
-            return None
-        if mouse_event.event_type == MouseEventType.MOUSE_MOVE:
-            if mouse_event.button == MouseButton.LEFT:
-                self.app.drag_transcript_selection(mouse_event.position.y, mouse_event.position.x)
-            return None
-        if mouse_event.event_type == MouseEventType.SCROLL_UP:
-            if self.app.move_session_picker_selection(-1):
-                return None
-            self.app.scroll_transcript(3)
-            return None
-        if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
-            if self.app.move_session_picker_selection(1):
-                return None
-            self.app.scroll_transcript(-3)
-            return None
-        return super().mouse_handler(mouse_event)
-
-
-class _TranscriptScrollbarControl(FormattedTextControl):
-    """Transcript 右侧滚动条 control，支持点击轨道和拖动滑块。"""
-
-    def __init__(self, app: TuiApp) -> None:
-        self.app = app
-        super().__init__(app._formatted_scrollbar)
-
-    def invalidate_content(self) -> None:
-        """清理滚动条渲染缓存，确保高度和滑块位置立即刷新。"""
-        self.reset()
-        self._fragment_cache.clear()
-        self._content_cache.clear()
-
-    def create_content(self, width: int, height: int | None):  # type: ignore[no-untyped-def]
-        self.invalidate_content()
-        return super().create_content(width, height)
-
-    def mouse_handler(self, mouse_event: MouseEvent):  # type: ignore[no-untyped-def]
-        if mouse_event.event_type == MouseEventType.SCROLL_UP:
-            self.app.scroll_transcript(3)
-            return None
-        if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
-            self.app.scroll_transcript(-3)
-            return None
-        if mouse_event.event_type == MouseEventType.MOUSE_DOWN and mouse_event.button == MouseButton.LEFT:
-            self.app.start_scrollbar_drag(mouse_event.position.y)
-            return None
-        if mouse_event.event_type == MouseEventType.MOUSE_MOVE:
-            if mouse_event.button == MouseButton.LEFT:
-                self.app.drag_scrollbar(mouse_event.position.y)
-            else:
-                self.app.stop_scrollbar_drag()
-            return None
-        if mouse_event.event_type == MouseEventType.MOUSE_UP:
-            self.app.stop_scrollbar_drag()
-            return None
-        return super().mouse_handler(mouse_event)
 
 
 class _DynamicSlashCompleter(Completer):
@@ -255,7 +150,7 @@ class _TuiExitRequested(Exception):
 
 
 class TuiApp:
-    """Owns the fullscreen prompt_toolkit application and worker queue."""
+    """拥有 inline prompt_toolkit 交互区和 scrollback transcript 提交队列。"""
 
     def __init__(
         self,
@@ -283,22 +178,15 @@ class TuiApp:
             name="dong-tui-worker",
             daemon=False,
         )
+        # 终端输出必须串行化，避免后台 worker 和 prompt_toolkit 重绘交错。
+        self._terminal_write_lock = threading.Lock()
+        self._pending_scrollback_texts: list[str] = []
+        self._app_thread_id: int | None = None
         self._running = False
         self._shutdown_requested = False
         self._busy = False
-        self._follow_bottom = True
-        self._scroll_offset = 0
-        self._scroll_view_end_line: int | None = None
-        self._transcript_total_line_count = 1
-        self._transcript_cursor_line = 0
-        self._transcript_viewport_height = 1
-        self._transcript_visible_plain_lines: list[str] = []
-        self._transcript_selection: TranscriptSelection | None = None
-        self._transcript_selection_draft: TranscriptSelectionDraft | None = None
-        self._last_copied_transcript_text = ""
-        self._scrollbar_drag_offset: int | None = None
-        # 默认捕获鼠标：TUI 自己处理内容区拖选复制、滚轮和滚动条拖拽。
-        self._mouse_capture_enabled = True
+        # committed transcript 是 append-only 历史；live_items 只给底部临时视图。
+        self._live_items: list[TranscriptItem] = []
         self._last_ctrl_c = 0.0
         self._exit_resume_printed = False
         self._render_width_override: int | None = None
@@ -328,27 +216,18 @@ class TuiApp:
         )
         self.key_bindings = self._key_bindings()
         self.composer.control.key_bindings = self.key_bindings
-        self._default_composer_mouse_handler = self.composer.control.mouse_handler
-        self.composer.control.mouse_handler = self._composer_mouse_handler
-        self.transcript_control = _TranscriptControl(self)
-        self.scrollbar_control = _TranscriptScrollbarControl(self)
+        self.live_control = _LiveTranscriptControl(self)
         self.status_control = FormattedTextControl(self._formatted_status)
         self.completion_control = FormattedTextControl(self._formatted_completion_menu)
         self.application = Application(
             layout=Layout(
                 HSplit([
-                    VSplit([
-                        Window(
-                            content=self.transcript_control,
-                            wrap_lines=True,
-                            always_hide_cursor=True,
-                        ),
-                        Window(
-                            content=self.scrollbar_control,
-                            width=1,
-                            always_hide_cursor=True,
-                        ),
-                    ]),
+                    Window(
+                        content=self.live_control,
+                        height=6,
+                        wrap_lines=True,
+                        always_hide_cursor=True,
+                    ),
                     Window(
                         content=self.status_control,
                         height=1,
@@ -369,10 +248,8 @@ class TuiApp:
                 focused_element=self.composer,
             ),
             key_bindings=self.key_bindings,
-            full_screen=True,
-            mouse_support=Condition(
-                lambda: self._mouse_capture_enabled or self._session_picker is not None
-            ),
+            full_screen=False,
+            mouse_support=False,
         )
 
     @property
@@ -388,7 +265,6 @@ class TuiApp:
             return StatusState(
                 label=self._status.label,
                 queued=self._status.queued,
-                new_output=self._status.new_output,
                 cancellation_requested=self._status.cancellation_requested,
             )
 
@@ -404,14 +280,16 @@ class TuiApp:
         return max(20, columns - 3)
 
     def run(self) -> None:
-        """Run the fullscreen TUI until the user exits."""
+        """运行 inline TUI；历史输出保留在普通终端 scrollback。"""
         self._running = True
         self._shutdown_requested = False
+        self._app_thread_id = threading.get_ident()
         self._worker_thread.start()
         try:
-            self.application.run()
+            self.application.run(pre_run=self._flush_pending_scrollback_texts)
         finally:
             self._running = False
+            self._app_thread_id = None
             self.request_exit()
             self._discard_pending_inputs()
             self._input_queue.put(None)
@@ -420,18 +298,14 @@ class TuiApp:
                 raise self._worker_errors[0]
 
     def print_exit_resume_command(self) -> None:
-        """退出全屏界面前在普通终端区域打印恢复命令。"""
+        """退出交互区前在普通终端区域打印恢复命令。"""
         with self._lock:
             if self._exit_resume_printed or self.resume_command_provider is None:
                 return
             self._exit_resume_printed = True
         command = self.resume_command_provider()
         text = f"\r\n  Resume this session:\r\n    {command}\r\n"
-        try:
-            self.application.output.write_raw(text)
-            self.application.output.flush()
-        except Exception:
-            os.write(1, text.encode("utf-8"))
+        self._write_scrollback_text(text)
 
     def request_exit(self) -> None:
         """Request TUI shutdown and unblock any synchronous confirmation prompt."""
@@ -454,13 +328,6 @@ class TuiApp:
             self._record_input_history_locked(text)
             self._input_queue.put(text)
             self._status.queued = self._input_queue.qsize()
-            self._status.new_output = False
-            self._follow_bottom = True
-            self._scroll_view_end_line = None
-            self._scroll_offset = 0
-            self._clear_transcript_selection_locked()
-            self.transcript_control.invalidate_content()
-            self.scrollbar_control.invalidate_content()
         self.invalidate()
 
     def paste_clipboard_image(self) -> None:
@@ -482,46 +349,145 @@ class TuiApp:
         self.ui.show_system_message(f"attached image: {path}")
 
     def append_item(self, kind: str, title: str, ansi: str, raw: str | None = None) -> TranscriptItem:
-        """Append a rendered item to the transcript."""
-        item = TranscriptItem(kind=kind, title=title, raw=raw if raw is not None else ansi, ansi=ansi)
+        """追加稳定 transcript 条目，并写入终端原生 scrollback。"""
+        item = TranscriptItem(
+            kind=kind,
+            title=title,
+            raw=raw if raw is not None else ansi,
+            ansi=ansi,
+            committed=True,
+        )
         with self._lock:
             self._transcript.append(item)
-            if not self._follow_bottom:
-                self._status.new_output = True
-            self.transcript_control.invalidate_content()
-            self.scrollbar_control.invalidate_content()
+        self._commit_item_to_scrollback(item)
         self.invalidate()
         return item
 
     def update_item(self, item: TranscriptItem, *, ansi: str, raw: str | None = None) -> None:
-        """Update an existing transcript item in place."""
+        """更新 live 条目；已提交历史不可修改，差异会作为新块追加。"""
         with self._lock:
+            was_committed = item.committed
             item.ansi = ansi
             if raw is not None:
                 item.raw = raw
-            if not self._follow_bottom:
-                self._status.new_output = True
-            self.transcript_control.invalidate_content()
-            self.scrollbar_control.invalidate_content()
+            if not was_committed:
+                self.live_control.invalidate_content()
+        if was_committed:
+            self.append_item(item.kind, item.title, ansi, raw=item.raw)
         self.invalidate()
 
     def replace_transcript(
         self,
         entries: list[tuple[str, str, str, str]],
     ) -> None:
-        """用一组已渲染条目替换整个 Transcript。"""
+        """用恢复出的完整上下文替换内存 transcript，并一次性提交到 scrollback。"""
+        items = [
+            TranscriptItem(kind=kind, title=title, ansi=ansi, raw=raw, committed=True)
+            for kind, title, ansi, raw in entries
+        ]
         with self._lock:
-            self._transcript = [
-                TranscriptItem(kind=kind, title=title, ansi=ansi, raw=raw)
-                for kind, title, ansi, raw in entries
-            ]
-            self._follow_bottom = True
-            self._scroll_view_end_line = None
-            self._scroll_offset = 0
-            self._status.new_output = False
-            self.transcript_control.invalidate_content()
-            self.scrollbar_control.invalidate_content()
+            self._transcript = items
+            self._live_items.clear()
+            self.live_control.invalidate_content()
+        for item in items:
+            self._commit_item_to_scrollback(item)
         self.invalidate()
+
+    def start_live_item(self, kind: str, title: str, ansi: str, raw: str | None = None) -> TranscriptItem:
+        """创建底部 live 条目；内容完成前不写入 scrollback。"""
+        item = TranscriptItem(
+            kind=kind,
+            title=title,
+            raw=raw if raw is not None else ansi,
+            ansi=ansi,
+            streaming=True,
+            committed=False,
+        )
+        with self._lock:
+            self._live_items.append(item)
+            self.live_control.invalidate_content()
+        self.invalidate()
+        return item
+
+    def commit_live_item(self, item: TranscriptItem) -> None:
+        """把 live 条目转成不可变历史块并提交到终端 scrollback。"""
+        should_commit = False
+        with self._lock:
+            if not item.committed:
+                item.streaming = False
+                item.committed = True
+                self._remove_live_item_locked(item)
+                self._transcript.append(item)
+                should_commit = True
+            self.live_control.invalidate_content()
+        if should_commit:
+            self._commit_item_to_scrollback(item)
+        self.invalidate()
+
+    def _remove_live_item_locked(self, item: TranscriptItem) -> None:
+        """从 live viewport 移除临时条目；调用方持有锁。"""
+        self._live_items = [existing for existing in self._live_items if existing is not item]
+
+    def _commit_item_to_scrollback(self, item: TranscriptItem) -> None:
+        """把一个稳定 transcript 块输出到普通终端历史。"""
+        if not item.ansi.strip():
+            return
+        text = f"\r\n{item.ansi.rstrip()}\r\n"
+        self._write_scrollback_text(text)
+
+    def _write_scrollback_text(self, text: str) -> None:
+        """通过 prompt_toolkit 安全通道写 scrollback，失败时退回 stdout。"""
+        if not text:
+            return
+
+        if not self._running:
+            with self._lock:
+                self._pending_scrollback_texts.append(text)
+            return
+
+        def write() -> None:
+            with self._terminal_write_lock:
+                try:
+                    self.application.output.write_raw(text)
+                    self.application.output.flush()
+                except Exception:
+                    os.write(1, text.encode("utf-8", errors="replace"))
+
+        loop = getattr(self.application, "loop", None)
+        if self._running and loop is not None:
+            if threading.get_ident() == self._app_thread_id:
+                try:
+                    run_in_terminal(write, render_cli_done=False)
+                    return
+                except Exception:
+                    write()
+                    return
+
+            done = threading.Event()
+
+            def schedule() -> None:
+                try:
+                    future = run_in_terminal(write, render_cli_done=False)
+                    future.add_done_callback(lambda _future: done.set())
+                except Exception:
+                    write()
+                    done.set()
+
+            try:
+                loop.call_soon_threadsafe(schedule)
+                done.wait(timeout=2.0)
+                return
+            except Exception:
+                pass
+        write()
+
+    def _flush_pending_scrollback_texts(self) -> None:
+        """应用启动后刷新 run() 前积累的 startup transcript。"""
+        with self._lock:
+            pending = self._pending_scrollback_texts
+            self._pending_scrollback_texts = []
+        for text in pending:
+            self._write_scrollback_text(text)
 
     def update_status(self, label: str) -> None:
         """Update the status bar text."""
@@ -598,10 +564,7 @@ class TuiApp:
         )
         with self._lock:
             self._session_picker = state
-            self._follow_bottom = True
-            self._scroll_view_end_line = None
-            self._scroll_offset = 0
-        state.transcript_item = self.append_item(
+        state.live_item = self.start_live_item(
             "sessions",
             "sessions",
             self._render_session_picker(state),
@@ -611,17 +574,12 @@ class TuiApp:
         with self._lock:
             if self._session_picker is state:
                 self._session_picker = None
-            item = state.transcript_item
             result = state.result
-            self.transcript_control.invalidate_content()
-            self.scrollbar_control.invalidate_content()
-        if item is not None and not result:
-            text = "Session selection cancelled"
-            self.update_item(
-                item,
-                ansi=render_text("sessions", text, width=self.render_width),
-                raw=text,
-            )
+            if state.live_item is not None:
+                self._remove_live_item_locked(state.live_item)
+            self.live_control.invalidate_content()
+            if not result:
+                self._status.label = "Session selection cancelled"
         self.invalidate()
         return result
 
@@ -662,25 +620,8 @@ class TuiApp:
             state.done.set()
         return True
 
-    def handle_session_picker_mouse(self, row: int) -> bool:
-        """处理 session 选择器里的鼠标点击；点击某行即恢复该 session。"""
-        with self._lock:
-            state = self._session_picker
-            if state is None:
-                return False
-            picker_lines = self._render_session_picker(state).splitlines()
-            first_row = max(0, self._transcript_viewport_height - len(picker_lines))
-            local_row = row - first_row
-            index = (local_row - 2) // 2
-            if index < 0 or index >= min(state.visible_count, len(state.items)):
-                return False
-            state.selected_index = index
-        self._refresh_session_picker(state)
-        self.accept_session_picker()
-        return True
-
     def _refresh_session_picker(self, state: SessionPickerState) -> None:
-        item = state.transcript_item
+        item = state.live_item
         if item is None:
             return
         self.update_item(
@@ -762,10 +703,10 @@ class TuiApp:
         if not candidates:
             return False
         with self._lock:
-            self._completion_selection_index = max(
-                0,
-                min(len(candidates) - 1, self._completion_selection_index + delta),
-            )
+            # 菜单选择和 Codex 的 `$` mention popup 一样循环移动，长按方向键不会卡在边界。
+            self._completion_selection_index = (
+                self._completion_selection_index + delta
+            ) % len(candidates)
         self.invalidate()
         return True
 
@@ -794,265 +735,21 @@ class TuiApp:
     @staticmethod
     def _completion_replacement(current: str, selected: str) -> str:
         """根据当前 slash 子命令生成候选项写回输入框的文本。"""
-        if current.startswith("/skill "):
+        if TuiApp._skill_menu_prefix(current) is not None:
             return f"/skill {selected}"
         if current.startswith("/unskill "):
             return f"/unskill {selected}"
         return selected
 
     def scroll_transcript(self, lines: int) -> None:
-        """Scroll transcript history; positive lines move to older output."""
-        if lines == 0:
-            return
-        with self._lock:
-            view_end = self._current_view_end_locked()
-            self._set_manual_view_end_locked(view_end - lines)
-            self.transcript_control.invalidate_content()
-            self.scrollbar_control.invalidate_content()
-        self.invalidate()
-
-    def set_transcript_viewport_height(self, height: int) -> None:
-        """记录 transcript 可视高度，供滚动条和滚动边界计算使用。"""
-        with self._lock:
-            self._transcript_viewport_height = max(1, height)
-            if self._follow_bottom:
-                self._scroll_offset = 0
-                self._scroll_view_end_line = None
-            else:
-                self._set_manual_view_end_locked(self._current_view_end_locked())
-            if self._max_scroll_offset_locked() == 0:
-                self._follow_bottom = True
-                self._scroll_offset = 0
-                self._scroll_view_end_line = None
-
-    def start_scrollbar_drag(self, row: int) -> None:
-        """处理滚动条鼠标按下：滑块内开始拖动，轨道上直接跳转。"""
-        with self._lock:
-            state = self._scrollbar_state_locked()
-            if not state.visible:
-                return
-            if state.thumb_top <= row < state.thumb_top + state.thumb_height:
-                self._scrollbar_drag_offset = row - state.thumb_top
-            else:
-                self._scrollbar_drag_offset = state.thumb_height // 2
-                self._scrollbar_scroll_to_row_locked(row)
-            self.transcript_control.invalidate_content()
-            self.scrollbar_control.invalidate_content()
-        self.invalidate()
-
-    def drag_scrollbar(self, row: int) -> None:
-        """拖动滚动条滑块并实时更新 transcript 视图。"""
-        with self._lock:
-            if self._scrollbar_drag_offset is None:
-                return
-            self._scrollbar_scroll_to_row_locked(row)
-            self.transcript_control.invalidate_content()
-            self.scrollbar_control.invalidate_content()
-        self.invalidate()
-
-    def stop_scrollbar_drag(self) -> None:
-        """结束滚动条拖动状态。"""
-        with self._lock:
-            self._scrollbar_drag_offset = None
-        self.invalidate()
-
-    def start_transcript_selection(self, row: int, col: int) -> None:
-        """记录内容区候选拖选起点；单击只清除旧选区。"""
-        with self._lock:
-            self._transcript_selection_draft = TranscriptSelectionDraft(
-                row,
-                col,
-                pending_origin=row == 0 and col == 0,
-            )
-            self._transcript_selection = None
-            self.transcript_control.invalidate_content()
-        self.invalidate()
-
-    def drag_transcript_selection(self, row: int, col: int) -> None:
-        """更新内容区拖选终点。"""
-        with self._lock:
-            draft = self._transcript_selection_draft
-            selection = self._transcript_selection
-            if draft is not None:
-                if draft.pending_origin and row != 0:
-                    self._clear_transcript_selection_locked()
-                    self.transcript_control.invalidate_content()
-                    return
-                if row == draft.row and col == draft.col:
-                    return
-                selection = TranscriptSelection(draft.row, draft.col, draft.row, draft.col)
-                self._transcript_selection = selection
-                self._transcript_selection_draft = None
-            elif selection is None:
-                return
-            if self._is_transcript_mouse_fallback_locked(row, col, selection):
-                return
-            self._transcript_selection = TranscriptSelection(
-                selection.anchor_row,
-                selection.anchor_col,
-                row,
-                col,
-            )
-            self.transcript_control.invalidate_content()
-        self.invalidate()
-
-    def finish_transcript_selection(self, row: int, col: int) -> None:
-        """结束内容区拖选，只保留选区，等待平台复制快捷键。"""
-        with self._lock:
-            draft = self._transcript_selection_draft
-            if draft is not None:
-                self._clear_transcript_selection_locked()
-                self.transcript_control.invalidate_content()
-                self.invalidate()
-                return
-            selection = self._transcript_selection
-            if selection is None:
-                return
-            if self._is_transcript_mouse_fallback_locked(row, col, selection):
-                row = selection.active_row
-                col = selection.active_col
-            final_selection = TranscriptSelection(
-                selection.anchor_row,
-                selection.anchor_col,
-                row,
-                col,
-            )
-            text = self._selected_transcript_text_locked(final_selection)
-            if text.strip():
-                self._transcript_selection = final_selection
-                # macOS 的物理 Cmd-C 会被终端应用截获，无法传进 prompt_toolkit；
-                # 因此内部选区在鼠标松开时直接写入剪贴板，保持用户习惯的拖选复制。
-                if _auto_copy_transcript_selection():
-                    copied = self._copy_text_to_clipboard(text)
-                    self._last_copied_transcript_text = text
-                    self._status.label = (
-                        f"copied {len(text)} chars" if copied else f"selected {len(text)} chars · {_copy_shortcut_hint()}"
-                    )
-                else:
-                    self._status.label = (
-                        f"selected {len(text)} chars · {_copy_shortcut_hint()}"
-                    )
-            else:
-                self._transcript_selection = None
-            self.transcript_control.invalidate_content()
-        self.invalidate()
-
-    def copy_transcript_selection(self) -> bool:
-        """复制当前 transcript 选区；无选区时返回 False 让复制快捷键走原逻辑。"""
-        with self._lock:
-            selection = self._transcript_selection
-            if selection is None:
-                return False
-            text = self._selected_transcript_text_locked(selection)
-            if not text.strip():
-                self._transcript_selection = None
-                self.transcript_control.invalidate_content()
-                return False
-
-        copied = self._copy_text_to_clipboard(text)
-        with self._lock:
-            self._last_copied_transcript_text = text
-            self._status.label = (
-                f"copied {len(text)} chars" if copied else "copy unavailable"
-            )
-        self.invalidate()
-        return True
-
-    def _copy_text_to_clipboard(self, text: str) -> bool:
-        """把文本复制到系统剪贴板；单独封装便于测试复制快捷键路径。"""
-        return _copy_text_to_clipboard(text, output=self.application.output)
-
-    def _clear_transcript_selection_locked(self) -> None:
-        """清除 transcript 选区；用于点击、滚动、提交等改变上下文的操作。"""
-        self._transcript_selection = None
-        self._transcript_selection_draft = None
-        if self._status.label.startswith("selected "):
-            self._status.label = "idle" if not self._busy else "working"
+        """历史滚动交给终端 scrollback；保留方法是为了兼容键位和测试入口。"""
+        return
 
     def _record_input_history_locked(self, text: str) -> None:
         """记录用户已提交输入，并结束当前历史浏览状态。"""
         self._input_history.append(text)
         self._input_history_index = None
         self._input_history_draft = ""
-
-    def _composer_mouse_handler(self, mouse_event: MouseEvent):  # type: ignore[no-untyped-def]
-        """输入框滚轮统一滚动 transcript，点击和拖动仍交给 TextArea 原逻辑。"""
-        if mouse_event.event_type == MouseEventType.SCROLL_UP:
-            self.scroll_transcript(3)
-            return None
-        if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
-            self.scroll_transcript(-3)
-            return None
-        if mouse_event.event_type == MouseEventType.MOUSE_DOWN and mouse_event.button == MouseButton.LEFT:
-            with self._lock:
-                self._clear_transcript_selection_locked()
-                self.transcript_control.invalidate_content()
-            self.invalidate()
-        return self._default_composer_mouse_handler(mouse_event)
-
-    def toggle_mouse_capture(self) -> bool:
-        """切换鼠标捕获；关闭时终端可以直接拖选 transcript 文本复制。"""
-        with self._lock:
-            self._mouse_capture_enabled = not self._mouse_capture_enabled
-            enabled = self._mouse_capture_enabled
-            self._scrollbar_drag_offset = None
-        self.invalidate()
-        return enabled
-
-    def _max_scroll_offset_locked(self) -> int:
-        return max(0, self._transcript_total_line_count - self._transcript_viewport_height)
-
-    def _current_view_end_locked(self) -> int:
-        """返回当前 transcript 视口底部对应的绝对行号。"""
-        total = max(1, self._transcript_total_line_count)
-        if self._follow_bottom:
-            return total
-        if self._scroll_view_end_line is not None:
-            return max(1, min(total, self._scroll_view_end_line))
-        return max(1, min(total, total - min(self._scroll_offset, self._max_scroll_offset_locked())))
-
-    def _set_manual_view_end_locked(self, end_line: int) -> None:
-        """设置手动滚动视口底部行；到底部时恢复自动跟随。"""
-        total = max(1, self._transcript_total_line_count)
-        viewport_height = max(1, self._transcript_viewport_height)
-        if total <= viewport_height or end_line >= total:
-            self._follow_bottom = True
-            self._scroll_view_end_line = None
-            self._scroll_offset = 0
-            self._status.new_output = False
-            return
-
-        clamped_end = max(viewport_height, min(total, end_line))
-        self._follow_bottom = False
-        self._scroll_view_end_line = clamped_end
-        self._scroll_offset = max(0, total - clamped_end)
-
-    def _scrollbar_state_locked(self) -> ScrollbarState:
-        track_height = max(1, self._transcript_viewport_height)
-        max_offset = self._max_scroll_offset_locked()
-        if max_offset <= 0:
-            return ScrollbarState(False, track_height, 0, track_height, 0)
-        visible_ratio = self._transcript_viewport_height / self._transcript_total_line_count
-        thumb_height = max(1, min(track_height, int(track_height * visible_ratio)))
-        max_thumb_top = max(0, track_height - thumb_height)
-        view_end = self._current_view_end_locked()
-        top_line = max(0, min(max_offset, view_end - self._transcript_viewport_height))
-        thumb_top = 0 if max_offset == 0 else round(max_thumb_top * top_line / max_offset)
-        return ScrollbarState(True, track_height, thumb_top, thumb_height, max_offset)
-
-    def _scrollbar_scroll_to_row_locked(self, row: int) -> None:
-        state = self._scrollbar_state_locked()
-        if not state.visible:
-            self._follow_bottom = True
-            self._scroll_offset = 0
-            return
-        max_thumb_top = max(0, state.track_height - state.thumb_height)
-        desired_top = max(0, min(max_thumb_top, row - (self._scrollbar_drag_offset or 0)))
-        if max_thumb_top == 0:
-            top_line = 0
-        else:
-            top_line = round(state.max_scroll_offset * desired_top / max_thumb_top)
-        self._set_manual_view_end_locked(top_line + self._transcript_viewport_height)
 
     def _worker(self) -> None:
         while True:
@@ -1103,50 +800,13 @@ class TuiApp:
                 return
             self._input_queue.task_done()
 
-    def _formatted_transcript(self) -> ANSI:
+    def _formatted_live_transcript(self) -> ANSI:
+        """渲染固定高度 live viewport，历史内容不在这里重画。"""
         with self._lock:
-            lines = self._render_transcript_lines()
-            self._transcript_visible_plain_lines = [_plain_ansi_text(line) for line in lines]
-            if lines:
-                self._transcript_cursor_line = max(0, len(lines) - 1)
-                return _format_transcript_fragments(
-                    lines,
-                    selection=self._transcript_selection,
-                )
-            else:
-                text = f"\x1b[36m{self.title}\x1b[0m"
-                self._transcript_total_line_count = 1
-                self._transcript_cursor_line = 0
-                self._transcript_visible_plain_lines = [self.title]
+            text = "\n\n".join(item.ansi.rstrip() for item in self._live_items if item.ansi.strip())
+        if not text:
+            text = f"\x1b[36m{self.title}\x1b[0m"
         return ANSI(text)
-
-    def _formatted_scrollbar(self) -> list[tuple[str, str]]:
-        """渲染 light 风格的 1 列 transcript 滚动条。"""
-        with self._lock:
-            state = self._scrollbar_state_locked()
-        if not state.visible:
-            fragments: list[tuple[str, str]] = []
-            for row in range(state.track_height):
-                fragments.append(("", " "))
-                if row < state.track_height - 1:
-                    fragments.append(("", "\n"))
-            return fragments
-
-        fragments = []
-        for row in range(state.track_height):
-            in_thumb = state.thumb_top <= row < state.thumb_top + state.thumb_height
-            if in_thumb:
-                fragments.append(("fg:#6b7280", "█"))
-            else:
-                fragments.append(("fg:#d1d5db", "│"))
-            if row < state.track_height - 1:
-                fragments.append(("", "\n"))
-        return fragments
-
-    def _transcript_cursor_position(self) -> Point:
-        """Keep prompt_toolkit's window anchored to the bottom of the current transcript slice."""
-        with self._lock:
-            return Point(x=0, y=max(0, self._transcript_cursor_line))
 
     def _formatted_status(self) -> ANSI:
         with self._lock:
@@ -1158,53 +818,12 @@ class TuiApp:
                 parts.append("working")
             if self._status.queued:
                 parts.append(f"queued {self._status.queued}")
-            if self._status.new_output:
-                parts.append("new output")
             if self._status.cancellation_requested:
                 parts.append("cancel requested")
             if self._confirmation is not None:
                 parts.append("confirm y/N")
-            parts.append("mouse" if self._mouse_capture_enabled else "copy")
+            parts.append("native copy")
         return ANSI("  " + _fit_to_width(" · ".join(parts), self.render_width))
-
-    def _selected_transcript_text_locked(self, selection: TranscriptSelection) -> str:
-        """按拖选行列提取当前可视 transcript 文本。"""
-        lines = self._transcript_visible_plain_lines
-        if not lines:
-            return ""
-        start_row, start_col, end_row, end_col = _normalized_selection(selection)
-        start_row = max(0, min(len(lines) - 1, start_row))
-        end_row = max(0, min(len(lines) - 1, end_row))
-        selected: list[str] = []
-        for row in range(start_row, end_row + 1):
-            line = lines[row]
-            if row == start_row == end_row:
-                left = _text_index(line, start_col)
-                right = _selection_end_index(line, end_col)
-            elif row == start_row:
-                left = _text_index(line, start_col)
-                right = len(line)
-            elif row == end_row:
-                left = 0
-                right = _selection_end_index(line, end_col)
-            else:
-                left = 0
-                right = len(line)
-            selected.append(line[left:right])
-        return "\n".join(selected)
-
-    def _is_transcript_mouse_fallback_locked(
-        self,
-        row: int,
-        col: int,
-        selection: TranscriptSelection,
-    ) -> bool:
-        """识别 prompt_toolkit 在无文本区域给出的 (0, 0) 鼠标兜底坐标。"""
-        if row != 0 or col != 0:
-            return False
-        if selection.anchor_row == 0 and selection.anchor_col == 0:
-            return False
-        return selection.active_row != 0 or selection.active_col != 0
 
     def _formatted_context_usage_locked(self) -> str:
         """把上下文 token 预算压缩成 status bar 的短文本。"""
@@ -1234,47 +853,62 @@ class TuiApp:
     def _formatted_completion_menu(self) -> list[tuple[str, str]]:
         """把 slash completion 渲染成竖向列表，贴近 claw-code 的 list completion。"""
         rows = self._completion_display_rows()
+        candidates = self._completion_candidates()
         with self._lock:
             selected_index = self._completion_selection_index
+        selected_candidate = candidates[selected_index] if candidates else None
         fragments: list[tuple[str, str]] = []
-        candidate_index = 0
         for row_index, row in enumerate(rows):
             is_separator = row == COMPLETION_GROUP_SEPARATOR
-            selected = not is_separator and candidate_index == selected_index
+            selected = not is_separator and row == selected_candidate
             prefix = "› " if selected else "  "
             style = "fg:#0b5cad bold" if selected else "fg:#8c959f" if is_separator else "fg:#24292f"
             fragments.append((style, f"  {prefix}{row}"))
-            if not is_separator:
-                candidate_index += 1
             if row_index < len(rows) - 1:
                 fragments.append(("", "\n"))
         return fragments
 
     def _completion_display_rows(self) -> list[str]:
         """返回带系统/skill 分隔线的 completion 展示行。"""
-        candidates = self._completion_candidates()
+        candidates = self._visible_completion_candidates()
         system = [item for item in candidates if item in SYSTEM_SLASH_COMMANDS]
         skills = [item for item in candidates if item not in SYSTEM_SLASH_COMMANDS]
         if system and skills:
             return [*system, COMPLETION_GROUP_SEPARATOR, *skills]
         return candidates
 
+    def _visible_completion_candidates(self) -> list[str]:
+        """只渲染围绕当前选择的小窗口；完整候选集仍可用上下键遍历。"""
+        candidates = self._completion_candidates()
+        if len(candidates) <= COMPLETION_MENU_MAX_CANDIDATES:
+            return candidates
+        with self._lock:
+            selected_index = self._completion_selection_index
+        half_window = COMPLETION_MENU_MAX_CANDIDATES // 2
+        start = max(0, selected_index - half_window)
+        start = min(start, len(candidates) - COMPLETION_MENU_MAX_CANDIDATES)
+        end = start + COMPLETION_MENU_MAX_CANDIDATES
+        return candidates[start:end]
+
     def _completion_candidates(self) -> list[str]:
         """返回当前 slash 输入的候选项，供竖向菜单和测试复用。"""
         text = self.composer.text
         if self._confirmation is not None or not text.startswith("/"):
             return []
-        completer = _SlashAwareCompleter(self._completion_words())
-        candidates = [
-            completion.text
-            for completion in completer.get_completions(Document(text), None)
-        ]
+        if self._skill_menu_prefix(text) is not None:
+            candidates = self._skill_name_completion_candidates(text)
+        else:
+            completer = _SlashAwareCompleter(self._completion_words())
+            candidates = [
+                completion.text
+                for completion in completer.get_completions(Document(text), None)
+            ]
         def sort_key(item: str) -> tuple[int, str]:
             if item in SYSTEM_SLASH_COMMANDS:
                 return (0, SYSTEM_SLASH_COMMAND_ORDER.index(item))
             return (1, item)
 
-        candidates = sorted(candidates, key=sort_key)[:10]
+        candidates = sorted(candidates, key=sort_key)
         with self._lock:
             if text != self._completion_selection_text:
                 self._completion_selection_text = text
@@ -1287,6 +921,29 @@ class TuiApp:
             else:
                 self._completion_selection_index = 0
         return candidates
+
+    def _skill_name_completion_candidates(self, text: str) -> list[str]:
+        """`/skill` 和 `/skills` 精确输入时直接展示 skill 名，行为对齐 Codex 的 `$` 菜单。"""
+        prefix = self._skill_menu_prefix(text) or ""
+        names = sorted({
+            item.removeprefix("/skill ").strip()
+            for item in self._completion_words()
+            if item.startswith("/skill ") and item.removeprefix("/skill ").strip()
+        })
+        if prefix:
+            names = [name for name in names if name.lower().startswith(prefix.lower())]
+        return names
+
+    @staticmethod
+    def _skill_menu_prefix(text: str) -> str | None:
+        """返回 `/skill[s]` 菜单后的过滤前缀；None 表示不是 skill 菜单上下文。"""
+        for command in SKILL_MENU_COMMANDS:
+            if text == command:
+                return ""
+            command_prefix = f"{command} "
+            if text.startswith(command_prefix):
+                return text.removeprefix(command_prefix).strip()
+        return None
 
     def _completion_words(self) -> list[str]:
         """Return completion words with a short cache to avoid redraw-time filesystem scans."""
@@ -1360,36 +1017,6 @@ class TuiApp:
             lines.append(f"Scroll down to load more ({len(state.items) - state.visible_count} remaining)")
         return "\n".join(lines)
 
-    def _render_transcript_lines(self) -> list[str]:
-        """按当前滚动状态生成 transcript 可视切片，避免 prompt_toolkit 再次滚动。"""
-        text = "\n\n".join(item.ansi.rstrip() for item in self._transcript if item.ansi.strip())
-        lines = text.splitlines()
-        self._transcript_total_line_count = max(1, len(lines))
-        viewport_height = max(1, self._transcript_viewport_height)
-        max_offset = self._max_scroll_offset_locked()
-        if max_offset == 0:
-            self._follow_bottom = True
-            self._scroll_offset = 0
-            self._scroll_view_end_line = None
-        if self._follow_bottom:
-            self._scroll_offset = 0
-            self._scroll_view_end_line = None
-            end = len(lines)
-            return lines[max(0, end - viewport_height):end]
-
-        end = self._current_view_end_locked()
-        if end >= len(lines):
-            self._follow_bottom = True
-            self._scroll_offset = 0
-            self._scroll_view_end_line = None
-            self._status.new_output = False
-            end = len(lines)
-            return lines[max(0, end - viewport_height):end]
-
-        self._scroll_view_end_line = end
-        self._scroll_offset = max(0, self._transcript_total_line_count - end)
-        return lines[max(0, end - viewport_height):end]
-
     def _key_bindings(self) -> KeyBindings:
         bindings = KeyBindings()
 
@@ -1448,8 +1075,6 @@ class TuiApp:
                 event.app.current_buffer.start_completion(select_first=False)
 
         def copy_or_cancel(event) -> None:  # type: ignore[no-untyped-def]
-            if self.copy_transcript_selection():
-                return
             if self.cancel_session_picker():
                 return
             if self._confirmation is not None:
@@ -1506,40 +1131,31 @@ class TuiApp:
 
         @bindings.add("pageup")
         def _(event) -> None:  # type: ignore[no-untyped-def]
-            self.scroll_transcript(20)
+            return
 
         @bindings.add("pagedown")
         def _(event) -> None:  # type: ignore[no-untyped-def]
-            self.scroll_transcript(-20)
+            return
 
         @bindings.add("home")
         def _(event) -> None:  # type: ignore[no-untyped-def]
-            with self._lock:
-                self._set_manual_view_end_locked(self._transcript_viewport_height)
-                self.transcript_control.invalidate_content()
-                self.scrollbar_control.invalidate_content()
-            self.invalidate()
+            return
 
         @bindings.add("end")
         def _(event) -> None:  # type: ignore[no-untyped-def]
-            with self._lock:
-                self._follow_bottom = True
-                self._scroll_offset = 0
-                self._scroll_view_end_line = None
-                self._status.new_output = False
-                self.transcript_control.invalidate_content()
-                self.scrollbar_control.invalidate_content()
-            self.invalidate()
+            return
 
         @bindings.add("f2")
         def _(event) -> None:  # type: ignore[no-untyped-def]
-            self.toggle_mouse_capture()
+            return
 
         return bindings
 
 
 class TuiUI:
     """Adapter that exposes TerminalUI-like methods to the agent loop."""
+
+    preserve_working_status_during_streaming = True
 
     def __init__(self, app: TuiApp) -> None:
         self.app = app
@@ -1885,8 +1501,10 @@ class TuiUI:
         item = self._active_assistant_item
         ansi = render_markdown(f"**assistant**\n\n{normalized}", width=self.app.render_width)
         if item is not None:
-            self.app.update_item(item, ansi=ansi, raw=normalized)
             self._active_assistant_item = None
+            if item.raw.strip() == normalized.strip():
+                return
+            self.app.append_item("assistant_update", "assistant update", ansi, raw=normalized)
         else:
             self.app.append_item("assistant", "assistant", ansi, raw=normalized)
 
@@ -1897,8 +1515,10 @@ class TuiUI:
         item = self._active_reasoning_item
         ansi = render_markdown(f"**thinking**\n\n{normalized}", width=self.app.render_width)
         if item is not None:
-            self.app.update_item(item, ansi=ansi, raw=normalized)
             self._active_reasoning_item = None
+            if item.raw.strip() == normalized.strip():
+                return
+            self.app.append_item("thinking_update", "thinking update", ansi, raw=normalized)
         else:
             self.app.append_item("thinking", "thinking", ansi, raw=normalized)
 
@@ -1952,13 +1572,6 @@ class _TuiWorkingStatus(AbstractContextManager[None]):
 
     def __enter__(self) -> None:
         self.started = time.monotonic()
-        if self.message.startswith("正在执行工具："):
-            self.app.append_item(
-                "tool_start",
-                "running",
-                render_text("running", self.message, width=self.app.render_width),
-                raw=f"running {self.message}",
-            )
         self._update()
         self.thread = threading.Thread(target=self._refresh, name="dong-tui-status", daemon=True)
         self.thread.start()
@@ -2003,7 +1616,7 @@ class _StreamingTranscriptContext(AbstractContextManager[Callable[[str], None]])
     def __exit__(self, exc_type, exc, traceback) -> bool:
         self._render(force=True)
         if self.item is not None:
-            self.item.streaming = False
+            self.app.commit_live_item(self.item)
         return False
 
     def write(self, delta: str) -> None:
@@ -2022,169 +1635,13 @@ class _StreamingTranscriptContext(AbstractContextManager[Callable[[str], None]])
             return
         ansi = render_markdown(f"**{self.title}**\n\n{raw}", width=self.app.render_width)
         if self.item is None:
-            self.item = self.app.append_item(self.kind, self.title, ansi, raw=raw)
-            self.item.streaming = True
+            self.item = self.app.start_live_item(self.kind, self.title, ansi, raw=raw)
             if self.kind == "assistant":
                 self.ui._active_assistant_item = self.item
             elif self.kind == "thinking":
                 self.ui._active_reasoning_item = self.item
         else:
             self.app.update_item(self.item, ansi=ansi, raw=raw)
-
-
-def _format_transcript_fragments(
-    lines: list[str],
-    *,
-    selection: TranscriptSelection | None,
-) -> list[tuple[str, str]]:
-    """把 ANSI transcript 行转成 prompt_toolkit 片段，并叠加拖选高亮。"""
-    fragments: list[tuple[str, str]] = []
-    normalized = _normalized_selection(selection) if selection is not None else None
-    for row, line in enumerate(lines):
-        plain_index = 0
-        start_col = end_col = None
-        if normalized is not None:
-            start_row, raw_start_col, end_row, raw_end_col = normalized
-            if start_row <= row <= end_row:
-                if row == start_row == end_row:
-                    start_col = max(0, raw_start_col)
-                    end_col = _selection_end_index(_plain_ansi_text(line), raw_end_col)
-                elif row == start_row:
-                    start_col = max(0, raw_start_col)
-                    end_col = None
-                elif row == end_row:
-                    start_col = 0
-                    end_col = _selection_end_index(_plain_ansi_text(line), raw_end_col)
-                else:
-                    start_col = 0
-                    end_col = None
-
-        for style, text in ANSI(line).__pt_formatted_text__():
-            if style == "[ZeroWidthEscape]":
-                fragments.append((style, text))
-                continue
-            for char in text:
-                selected = (
-                    start_col is not None
-                    and start_col <= plain_index
-                    and (end_col is None or plain_index < end_col)
-                )
-                fragments.append((_selected_style(style) if selected else style, char))
-                plain_index += 1
-        if row < len(lines) - 1:
-            fragments.append(("", "\n"))
-    return fragments
-
-
-def _normalized_selection(
-    selection: TranscriptSelection | None,
-) -> tuple[int, int, int, int]:
-    """把拖选起止点归一化成从上到下、从左到右的范围。"""
-    if selection is None:
-        return (0, 0, 0, 0)
-    start = (selection.anchor_row, selection.anchor_col)
-    end = (selection.active_row, selection.active_col)
-    if end < start:
-        start, end = end, start
-    return (start[0], start[1], end[0], end[1])
-
-
-def _selected_style(style: str) -> str:
-    """保留原样式并追加反色，显示 transcript 鼠标选区。"""
-    return f"{style} reverse".strip()
-
-
-def _plain_ansi_text(text: str) -> str:
-    """去掉 ANSI 样式，保留可复制的纯文本。"""
-    return "".join(
-        part
-        for style, part in ANSI(text).__pt_formatted_text__()
-        if style != "[ZeroWidthEscape]"
-    )
-
-
-def _text_index(text: str, column: int) -> int:
-    """把 prompt_toolkit 内容列限制到文本下标范围。"""
-    if column <= 0:
-        return 0
-    return min(len(text), column)
-
-
-def _selection_end_index(text: str, column: int) -> int:
-    """把选区结束列转换为半开区间下标，行尾附近包含最后一个字符。"""
-    if column >= len(text) - 1:
-        return len(text)
-    return _text_index(text, column)
-
-
-def _copy_text_to_clipboard(text: str, *, output=None) -> bool:  # type: ignore[no-untyped-def]
-    """把 TUI 选中文本写入系统剪贴板；失败时返回 False 供状态栏提示。"""
-    return _copy_text_with_system_tool(text) or _copy_text_with_osc52(text, output=output)
-
-
-def _auto_copy_transcript_selection() -> bool:
-    """macOS 终端不会把 Cmd-C 传给应用，内部选区需要在松开鼠标时自动复制。"""
-    return platform.system() == "Darwin"
-
-
-def _copy_shortcut_hint() -> str:
-    """展示 TUI 实际能接收到的复制快捷键。"""
-    if platform.system() == "Darwin":
-        return "Ctrl-C / Esc-C copy"
-    return f"{_shortcut_label('c')} copy"
-
-
-def _copy_text_with_system_tool(text: str) -> bool:
-    """优先使用本机剪贴板工具，避免终端不支持 OSC52 时复制失败。"""
-    system = platform.system()
-    if system == "Darwin" and shutil.which("pbcopy"):
-        return _run_clipboard_command(["pbcopy"], text)
-    if system == "Windows":
-        executable = shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
-        if executable:
-            return _run_clipboard_command(
-                [executable, "-NoProfile", "-Command", "Set-Clipboard"],
-                text,
-            )
-    if shutil.which("wl-copy"):
-        return _run_clipboard_command(["wl-copy"], text)
-    if shutil.which("xclip"):
-        return _run_clipboard_command(["xclip", "-selection", "clipboard"], text)
-    if shutil.which("xsel"):
-        return _run_clipboard_command(["xsel", "--clipboard", "--input"], text)
-    return False
-
-
-def _run_clipboard_command(command: list[str], text: str) -> bool:
-    """执行剪贴板命令并写入 UTF-8 文本。"""
-    try:
-        result = subprocess.run(
-            command,
-            input=text,
-            text=True,
-            timeout=2,
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
-
-
-def _copy_text_with_osc52(text: str, *, output=None) -> bool:  # type: ignore[no-untyped-def]
-    """用 OSC52 作为终端剪贴板兜底，兼容 SSH/远程终端场景。"""
-    try:
-        payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
-        sequence = f"\033]52;c;{payload}\a"
-        if output is not None:
-            output.write_raw(sequence)
-            output.flush()
-        else:
-            print(sequence, end="", flush=True)
-    except Exception:
-        return False
-    return True
 
 
 def render_markdown(text: str, *, width: int = 100) -> str:

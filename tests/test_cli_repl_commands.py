@@ -122,7 +122,7 @@ def test_ocr_command_builds_prompt_from_image_text(tmp_path, monkeypatch) -> Non
             lines=(OcrLine("错误日志第一行", 0.99), OcrLine("错误日志第二行", 0.98)),
         )
 
-    monkeypatch.setattr(cli, "extract_text_from_image", fake_extract)
+    monkeypatch.setattr(cli, "extract_text_from_attachment", fake_extract)
 
     action = handle_repl_command(
         f'/ocr "{image_path}" 这是什么问题',
@@ -134,7 +134,7 @@ def test_ocr_command_builds_prompt_from_image_text(tmp_path, monkeypatch) -> Non
 
     assert action.handled is True
     assert action.prompt is not None
-    assert "不要假装直接看到了原图" in action.prompt
+    assert "不要假装直接看到了原始文件" in action.prompt
     assert "错误日志第一行" in action.prompt
     assert "用户输入" in action.prompt
     assert "这是什么问题" in action.prompt
@@ -154,7 +154,7 @@ def test_ocr_command_reports_usage_without_image_path(tmp_path) -> None:
 
     assert action.handled is True
     assert action.prompt is None
-    assert "Usage: /ocr <image-path> [question]" in err.getvalue()
+    assert "Usage: /ocr <attachment-path> [question]" in err.getvalue()
 
 
 def test_repl_image_marker_expands_to_ocr_prompt(tmp_path, monkeypatch) -> None:
@@ -174,7 +174,7 @@ def test_repl_image_marker_expands_to_ocr_prompt(tmp_path, monkeypatch) -> None:
     def fake_run_loop(base_sys, working, _workdir, *, max_turns, ui, enable_mcp):  # type: ignore[no-untyped-def]
         working.append({"role": "assistant", "content": "ok"})
 
-    monkeypatch.setattr("dong.ocr.extract_text_from_image", fake_extract)
+    monkeypatch.setattr("dong.ocr.extract_text_from_attachment", fake_extract)
     monkeypatch.setattr(cli, "run_loop", fake_run_loop)
 
     cli._process_repl_input(

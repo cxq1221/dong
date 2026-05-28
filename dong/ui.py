@@ -67,7 +67,7 @@ SLASH_COMMAND_LINES = [
     "  /skill              list/load skills",
     "  /sessions           list current workspace sessions",
     "  /contract [cmd]     show or set contract pressure mode",
-    "  /ocr <image> [ask]  recognize image text locally, then ask the model",
+    "  /ocr <file> [ask]   extract attachment text locally, then ask the model",
 ]
 
 

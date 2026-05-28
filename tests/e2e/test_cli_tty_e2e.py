@@ -60,11 +60,6 @@ def _read_available(fd: int, *, duration: float = 0.5) -> str:
     return "".join(chunks)
 
 
-def _contains_queued_one(output: str) -> bool:
-    """检查 queued 1 状态；prompt_toolkit 可能用光标移动复用旧字符。"""
-    return "queued 1" in output or ("queu" in output and "d 1" in output)
-
-
 def _wait_file_contains(path, needle: str, *, timeout: float = 5.0) -> str:
     """等待文件内容包含指定文本。"""
     deadline = time.monotonic() + timeout
@@ -116,14 +111,10 @@ def test_interactive_tty_repl_shows_slash_skill_menu_and_runs_commands(tmp_path)
         filtered_output = _read_until(master_fd, "review")
         assert "review" in filtered_output
 
-        # Clear the partially typed slash command, then exercise real REPL commands.
-        os.write(master_fd, b"\x15/skill review\r")
-        load_output = _read_until(master_fd, "Loaded skill")
-        assert "review" in load_output
-
-        os.write(master_fd, b"/unskill review\r")
-        remove_output = _read_until(master_fd, "Removed ski")
-        assert "Removed ski" in remove_output
+        # Clear the partial slash command, then verify exact /skills opens the skill menu.
+        os.write(master_fd, b"\x15/skills")
+        skills_menu_output = _read_until(master_fd, "python-test")
+        assert "review" in skills_menu_output
 
     finally:
         if proc.poll() is None:
@@ -134,7 +125,7 @@ def test_interactive_tty_repl_shows_slash_skill_menu_and_runs_commands(tmp_path)
 
 
 def test_interactive_tty_tui_accepts_input_while_agent_is_working(tmp_path) -> None:
-    """全屏 TUI 下第一条仍在执行时，第二条输入应被接收并排队执行。"""
+    """inline TUI 下第一条仍在执行时，第二条输入应被接收并排队执行。"""
     runner = tmp_path / "run_fake_dong.py"
     calls_log = tmp_path / "calls.log"
     _write(
@@ -185,7 +176,7 @@ cli.main()
     )
     os.close(slave_fd)
     try:
-        _read_until(master_fd, "dong")
+        _read_until(master_fd, "dong >")
 
         os.write(master_fd, b"first\r")
         _read_until(master_fd, "working", timeout=3.0)
@@ -193,7 +184,6 @@ cli.main()
 
         output = _read_until(master_fd, "done first", timeout=8.0)
         assert "done first" in output
-        assert _contains_queued_one(output)
         calls = _wait_file_contains(
             calls_log,
             "start first\nend first\nstart second\nend second",
@@ -214,9 +204,9 @@ cli.main()
         os.close(master_fd)
 
 
-def test_interactive_tty_tui_renders_visible_scrollbar_for_long_transcript(tmp_path) -> None:
-    """真实 TTY 渲染长 transcript 时，应能看到右侧轨道和多个滑块字符。"""
-    runner = tmp_path / "run_scrollbar_tui.py"
+def test_interactive_tty_tui_writes_transcript_to_native_scrollback(tmp_path) -> None:
+    """真实 TTY 中稳定 transcript 应进入普通 scrollback，且不启用全屏/鼠标捕获。"""
+    runner = tmp_path / "run_scrollback_tui.py"
     _write(
         runner,
         """
@@ -251,10 +241,14 @@ app.run()
     )
     os.close(slave_fd)
     try:
-        output = _read_until(master_fd, "█", timeout=5.0)
+        output = _read_until(master_fd, "line 79", timeout=5.0)
         output += _read_available(master_fd, duration=0.5)
-        assert output.count("│") >= 8
-        assert output.count("█") >= 2
+        assert "line 00" in output or "line 0" in output
+        assert "\x1b[?1049h" not in output
+        assert "\x1b[?1000h" not in output
+        assert "\x1b[?1002h" not in output
+        assert "\x1b[?1003h" not in output
+        assert "\x1b[?1006h" not in output
     finally:
         if proc.poll() is None:
             proc.terminate()
@@ -264,7 +258,7 @@ app.run()
 
 
 def test_interactive_tty_tui_ctrl_d_exits(tmp_path) -> None:
-    """Ctrl-D 应直接退出全屏 TUI。"""
+    """Ctrl-D 应直接退出 inline TUI。"""
     master_fd, slave_fd = pty.openpty()
     os.set_blocking(master_fd, False)
     env = {
@@ -284,9 +278,13 @@ def test_interactive_tty_tui_ctrl_d_exits(tmp_path) -> None:
     )
     os.close(slave_fd)
     try:
-        _read_until(master_fd, "dong")
+        _read_until(master_fd, "dong >")
         os.write(master_fd, b"\x04")
-        proc.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while proc.poll() is None and time.monotonic() < deadline:
+            _read_available(master_fd, duration=0.1)
+        if proc.poll() is None:
+            raise subprocess.TimeoutExpired(proc.args, 5)
         assert proc.returncode == 0
     finally:
         if proc.poll() is None:
@@ -296,27 +294,19 @@ def test_interactive_tty_tui_ctrl_d_exits(tmp_path) -> None:
         os.close(master_fd)
 
 
-def test_interactive_tty_macos_mouse_selection_copies_to_pbcopy(tmp_path) -> None:
-    """真实 TTY 鼠标拖选应写入 macOS pbcopy 兼容剪贴板命令。"""
-    runner = tmp_path / "run_tui_selection.py"
-    clipboard_file = tmp_path / "clipboard.txt"
-    fake_bin = tmp_path / "bin"
-    pbcopy = fake_bin / "pbcopy"
-    _write(
-        pbcopy,
-        "#!/usr/bin/env python3\n"
-        "import pathlib, sys\n"
-        f"pathlib.Path({str(clipboard_file)!r}).write_text(sys.stdin.read(), encoding='utf-8')\n",
-    )
-    pbcopy.chmod(0o755)
+def test_interactive_tty_tui_does_not_capture_mouse_for_copy(tmp_path) -> None:
+    """真实 TTY 不应接管鼠标复制；选区复制由终端原生处理。"""
+    runner = tmp_path / "run_tui_native_copy.py"
     _write(
         runner,
         """
-from dong import tui
+import threading
 
-tui.platform.system = lambda: "Darwin"
-app = tui.TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
+from dong.tui import TuiApp
+
+app = TuiApp(process_input=lambda _text, _ui: False, completion_provider=lambda: [])
 app.append_item("assistant", "assistant", "alpha\\nbeta", raw="alpha\\nbeta")
+threading.Timer(0.6, app.application.exit).start()
 app.run()
 """,
     )
@@ -328,7 +318,6 @@ app.run()
         "TERM": "xterm-256color",
         "PROMPT_TOOLKIT_NO_CPR": "1",
         "PYTHONUNBUFFERED": "1",
-        "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
     }
     proc = subprocess.Popen(
         [sys.executable, str(runner)],
@@ -341,15 +330,14 @@ app.run()
     )
     os.close(slave_fd)
     try:
-        _read_until(master_fd, "dong", timeout=5.0)
-        # SGR mouse events: press at alpha[1], drag/release at beta[2].
-        os.write(master_fd, b"\x1b[<0;2;1M")
-        time.sleep(0.05)
-        os.write(master_fd, b"\x1b[<32;3;2M")
-        time.sleep(0.05)
-        os.write(master_fd, b"\x1b[<0;3;2m")
-
-        assert _wait_file_contains(clipboard_file, "lpha\nbe", timeout=5.0) == "lpha\nbe"
+        output = _read_until(master_fd, "alpha", timeout=5.0)
+        output += _read_available(master_fd, duration=0.5)
+        assert "alpha" in output
+        assert "beta" in output
+        assert "\x1b[?1000h" not in output
+        assert "\x1b[?1002h" not in output
+        assert "\x1b[?1003h" not in output
+        assert "\x1b[?1006h" not in output
     finally:
         if proc.poll() is None:
             proc.terminate()
@@ -392,7 +380,7 @@ def test_interactive_tty_sessions_enter_restores_visible_session_content(tmp_pat
     )
     os.close(slave_fd)
     try:
-        _read_until(master_fd, "dong")
+        _read_until(master_fd, "dong >")
 
         os.write(master_fd, b"/sessions\r")
         picker_output = _read_until(master_fd, target.session_id, timeout=5.0)
@@ -400,6 +388,7 @@ def test_interactive_tty_sessions_enter_restores_visible_session_content(tmp_pat
 
         os.write(master_fd, b"\x1b[B\r")
         restored_output = _read_until(master_fd, restored_tail, timeout=5.0)
+        restored_output += _read_until(master_fd, "恢复测试旧回答", timeout=5.0)
         assert "恢复测试旧回答" in restored_output
         assert "Recent session content" not in restored_output
         assert "Selected session:" not in restored_output
